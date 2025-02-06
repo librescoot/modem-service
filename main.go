@@ -17,11 +17,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
-	ModemStateDefault    = "unknown"
+	ModemStateDefault    = "UNKNOWN"
 	AccessTechDefault    = "UNKNOWN"
 	SignalQualityDefault = 255
 )
