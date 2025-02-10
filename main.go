@@ -26,9 +26,18 @@ const (
 	SignalQualityDefault = 255
 )
 
+const (
+	MaxRecoveryAttempts = 2
+	RecoveryWaitTime    = 30 * time.Second
+
+	StateNormal             = "normal"
+	StateRecovering         = "recovering"
+	StateRecoveryFailedWait = "recovery-failed-waiting-reboot"
+	StatePermanentFailure   = "permanent-failure-needs-replacement"
+)
+
 type Config struct {
-	redisHost         string
-	redisPort         int
+	redisURL          string
 	pollingTime       time.Duration
 	internetCheckTime time.Duration
 	interface_        string
@@ -45,21 +54,36 @@ type ModemState struct {
 	iccid         string
 }
 
+type ModemHealth struct {
+	recoveryAttempts int
+	lastRecoveryTime time.Time
+	state            string
+}
+
 type ModemService struct {
 	cfg            Config
 	redis          *redis.Client
 	logger         *log.Logger
 	lastModemState ModemState
+	health         *ModemHealth
+}
+
+func NewModemHealth() *ModemHealth {
+	return &ModemHealth{
+		state: StateNormal,
+	}
 }
 
 func NewModemService(cfg Config) *ModemService {
-	redis := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", cfg.redisHost, cfg.redisPort),
-	})
+	opt, err := redis.ParseURL(cfg.redisURL)
+	if err != nil {
+		// Since this is during initialization, we should probably just panic
+		panic(fmt.Sprintf("invalid redis URL: %v", err))
+	}
 
 	return &ModemService{
 		cfg:    cfg,
-		redis:  redis,
+		redis:  redis.NewClient(opt),
 		logger: log.New(os.Stdout, "rescoot-modem: ", log.LstdFlags),
 		lastModemState: ModemState{
 			status:        ModemStateDefault,
@@ -69,6 +93,7 @@ func NewModemService(cfg Config) *ModemService {
 			ifIpAddr:      "UNKNOWN",
 			registration:  "",
 		},
+		health: NewModemHealth(),
 	}
 }
 
@@ -215,6 +240,128 @@ func (m *ModemService) publishModemState(currentState ModemState) error {
 	return nil
 }
 
+func (m *ModemService) checkHealth() error {
+	// Skip health check if we're in a terminal state
+	if m.health.state == StateRecoveryFailedWait || m.health.state == StatePermanentFailure {
+		return fmt.Errorf("modem in terminal state: %s", m.health.state)
+	}
+
+	modemId, err := m.findModemId()
+	if err != nil {
+		return m.handleModemFailure("no_modem_found")
+	}
+
+	// Check primary port
+	if err := m.checkPrimaryPort(modemId); err != nil {
+		return m.handleModemFailure("wrong_primary_port")
+	}
+
+	// Check power state
+	if err := m.checkPowerState(modemId); err != nil {
+		return m.handleModemFailure("wrong_power_state")
+	}
+
+	// If we get here, modem is healthy
+	m.health.state = StateNormal
+	return nil
+}
+
+func (m *ModemService) checkPrimaryPort(modemId string) error {
+	out, err := exec.Command("mmcli", "-m", modemId, "--simple-status").Output()
+	if err != nil {
+		return fmt.Errorf("failed to get modem status: %v", err)
+	}
+
+	// Check if primary port is cdc-wdm0
+	if !strings.Contains(string(out), "cdc-wdm0") {
+		return fmt.Errorf("wrong primary port")
+	}
+	return nil
+}
+
+func (m *ModemService) checkPowerState(modemId string) error {
+	out, err := exec.Command("mmcli", "-m", modemId).Output()
+	if err != nil {
+		return fmt.Errorf("failed to get modem info: %v", err)
+	}
+
+	// Check power state
+	if !strings.Contains(string(out), "power state: 'on'") {
+		return fmt.Errorf("modem not powered on")
+	}
+	return nil
+}
+
+func (m *ModemService) handleModemFailure(reason string) error {
+	m.logger.Printf("Modem failure detected: %s", reason)
+
+	// If we're already recovering, wait for recovery to complete
+	if m.health.state == StateRecovering {
+		return fmt.Errorf("recovery in progress")
+	}
+
+	// Check if we should attempt recovery
+	if m.health.recoveryAttempts >= MaxRecoveryAttempts {
+		if m.health.recoveryAttempts == MaxRecoveryAttempts {
+			m.health.state = StateRecoveryFailedWait
+		} else {
+			m.health.state = StatePermanentFailure
+		}
+		m.publishHealthState()
+		return fmt.Errorf("max recovery attempts reached")
+	}
+
+	// Start recovery process
+	return m.attemptRecovery()
+}
+
+func (m *ModemService) attemptRecovery() error {
+	m.health.state = StateRecovering
+	m.health.recoveryAttempts++
+	m.health.lastRecoveryTime = time.Now()
+
+	m.logger.Printf("Attempting modem recovery (attempt %d/%d)",
+		m.health.recoveryAttempts, MaxRecoveryAttempts)
+
+	// Publish recovery state
+	m.publishHealthState()
+
+	// Find modem ID first
+	modemId, err := m.findModemId()
+	if err == nil {
+		// Try mmcli reset
+		if err := exec.Command("mmcli", "-m", modemId, "--reset").Run(); err != nil {
+			m.logger.Printf("Failed to reset modem: %v", err)
+		}
+	}
+
+	// Wait for recovery
+	time.Sleep(RecoveryWaitTime)
+
+	// Check if recovery was successful
+	if err := m.checkHealth(); err != nil {
+		m.logger.Printf("Recovery failed: %v", err)
+		return err
+	}
+
+	// Recovery successful
+	m.logger.Printf("Modem recovery successful")
+	m.health.state = StateNormal
+	m.publishHealthState()
+	return nil
+}
+
+func (m *ModemService) publishHealthState() error {
+	ctx := context.Background()
+	pipe := m.redis.Pipeline()
+
+	pipe.HSet(ctx, "internet", "modem-health", m.health.state)
+	pipe.Publish(ctx, "internet", "modem-health")
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 func (m *ModemService) getPublicIP() (string, error) {
 	client := http.Client{
 		Timeout: 10 * time.Second,
@@ -265,6 +412,11 @@ func (m *ModemService) monitorStatus(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if err := m.checkHealth(); err != nil {
+				m.logger.Printf("Health check failed: %v", err)
+				continue
+			}
+
 			currentState, err := m.getModemInfo()
 			if err != nil {
 				m.logger.Printf("Failed to get modem info: %v", err)
@@ -298,8 +450,7 @@ func (m *ModemService) Run(ctx context.Context) error {
 
 func main() {
 	cfg := Config{}
-	flag.StringVar(&cfg.redisHost, "redis-host", "localhost", "Redis host")
-	flag.IntVar(&cfg.redisPort, "redis-port", 6379, "Redis port")
+	flag.StringVar(&cfg.redisURL, "redis-url", "redis://127.0.0.1:6379", "Redis URL")
 	flag.DurationVar(&cfg.pollingTime, "polling-time", 5*time.Second, "Polling interval")
 	flag.DurationVar(&cfg.internetCheckTime, "internet-check-time", 30*time.Second, "Internet check interval")
 	flag.StringVar(&cfg.interface_, "interface", "wwan0", "Network interface to monitor")
