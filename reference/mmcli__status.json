@@ -1,0 +1,136 @@
+{
+  "modem": {
+    "3gpp": {
+      "enabled-locks": [],
+      "eps": {
+        "initial-bearer": {
+          "dbus-path": "--",
+          "settings": {
+            "apn": "--",
+            "ip-type": "--",
+            "password": "--",
+            "user": "--"
+          }
+        },
+        "ue-mode-operation": "csps-2"
+      },
+      "imei": "8668020xxxxxxxx",
+      "operator-code": "26201",
+      "operator-name": "TDG",
+      "pco": "--",
+      "registration-state": "home"
+    },
+    "cdma": {
+      "activation-state": "--",
+      "cdma1x-registration-state": "--",
+      "esn": "--",
+      "evdo-registration-state": "--",
+      "meid": "--",
+      "nid": "--",
+      "sid": "--"
+    },
+    "dbus-path": "/org/freedesktop/ModemManager1/Modem/3",
+    "generic": {
+      "access-technologies": [
+        "gsm"
+      ],
+      "bearers": [
+        "/org/freedesktop/ModemManager1/Bearer/11"
+      ],
+      "carrier-configuration": "--",
+      "carrier-configuration-revision": "--",
+      "current-bands": [
+        "egsm",
+        "dcs",
+        "utran-1",
+        "utran-8",
+        "eutran-1",
+        "eutran-3",
+        "eutran-7",
+        "eutran-8",
+        "eutran-20",
+        "eutran-38",
+        "eutran-40"
+      ],
+      "current-capabilities": [
+        "gsm-umts, lte"
+      ],
+      "current-modes": "allowed: 2g, 3g, 4g; preferred: 4g",
+      "device": "/sys/devices/soc0/soc/2100000.aips-bus/2184200.usb/ci_hdrc.1/usb1/1-1",
+      "device-identifier": "cbe9aa15078d3137dc8d3a2a1bxxxxxxxxxxxxxx",
+      "drivers": [
+        "option1",
+        "qmi_wwan"
+      ],
+      "equipment-identifier": "8668020xxxxxxxx",
+      "hardware-revision": "30000",
+      "manufacturer": "QUALCOMM INCORPORATED",
+      "model": "SIMCOM_SIM7100E",
+      "own-numbers": [],
+      "plugin": "SimTech",
+      "ports": [
+        "cdc-wdm0 (qmi)",
+        "ttyUSB0 (qcdm)",
+        "ttyUSB2 (at)",
+        "wwan0 (net)",
+        "ttyUSB4 (audio)",
+        "ttyUSB1 (gps)",
+        "ttyUSB3 (at)"
+      ],
+      "power-state": "on",
+      "primary-port": "cdc-wdm0",
+      "revision": "M9615A-CETWTBZM-6.0.15255  1  [May 13 2016 01:00:00]",
+      "signal-quality": {
+        "recent": "yes",
+        "value": "91"
+      },
+      "sim": "/org/freedesktop/ModemManager1/SIM/3",
+      "state": "connected",
+      "state-failed-reason": "--",
+      "supported-bands": [
+        "egsm",
+        "dcs",
+        "utran-1",
+        "utran-3",
+        "utran-5",
+        "utran-8",
+        "eutran-1",
+        "eutran-3",
+        "eutran-7",
+        "eutran-8",
+        "eutran-20",
+        "eutran-38",
+        "eutran-40"
+      ],
+      "supported-capabilities": [
+        "gsm-umts, lte"
+      ],
+      "supported-ip-families": [
+        "ipv4",
+        "ipv6",
+        "ipv4v6"
+      ],
+      "supported-modes": [
+        "allowed: 2g; preferred: none",
+        "allowed: 3g; preferred: none",
+        "allowed: 4g; preferred: none",
+        "allowed: 2g, 3g; preferred: 3g",
+        "allowed: 2g, 3g; preferred: 2g",
+        "allowed: 2g, 4g; preferred: 4g",
+        "allowed: 2g, 4g; preferred: 2g",
+        "allowed: 3g, 4g; preferred: 3g",
+        "allowed: 3g, 4g; preferred: 4g",
+        "allowed: 2g, 3g, 4g; preferred: 4g",
+        "allowed: 2g, 3g, 4g; preferred: 3g",
+        "allowed: 2g, 3g, 4g; preferred: 2g"
+      ],
+      "unlock-required": "sim-pin2",
+      "unlock-retries": [
+        "sim-pin (3)",
+        "sim-puk (10)",
+        "sim-pin2 (3)",
+        "sim-puk2 (10)"
+      ]
+    }
+  }
+}

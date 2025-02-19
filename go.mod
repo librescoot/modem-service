@@ -2,7 +2,10 @@ module modem-service
 
 go 1.22.12
 
-require github.com/redis/go-redis/v9 v9.7.0
+require (
+	github.com/redis/go-redis/v9 v9.7.0
+	github.com/rescoot/go-mmcli v0.0.0-20250210134157-9442eca56350
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect

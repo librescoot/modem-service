@@ -1,0 +1,24 @@
+{
+  "modem": {
+    "location": {
+      "3gpp": {
+        "cid": "0000EE93",
+        "lac": "3724",
+        "mcc": "262",
+        "mnc": "1",
+        "tac": "0000"
+      },
+      "cdma-bs": {
+        "latitude": "--",
+        "longitude": "--"
+      },
+      "gps": {
+        "altitude": "--",
+        "latitude": "--",
+        "longitude": "--",
+        "nmea": [],
+        "utc": "--"
+      }
+    }
+  }
+}

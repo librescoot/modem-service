@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/rescoot/go-mmcli"
 )
 
 const (
@@ -26,6 +28,7 @@ const (
 	SignalQualityDefault = 255
 )
 
+// Modem Health
 const (
 	MaxRecoveryAttempts = 2
 	RecoveryWaitTime    = 30 * time.Second
@@ -36,11 +39,38 @@ const (
 	StatePermanentFailure   = "permanent-failure-needs-replacement"
 )
 
+// GPS
+const (
+	GPSUpdateInterval = 1 * time.Second
+	GPSTimeout        = 10 * time.Minute
+	MaxGPSRetries     = 10
+	GPSRetryInterval  = 5 * time.Second
+)
+
 type Config struct {
 	redisURL          string
 	pollingTime       time.Duration
 	internetCheckTime time.Duration
 	interface_        string
+}
+
+type ModemJSON struct {
+	Modem struct {
+		Generic struct {
+			SignalQuality struct {
+				Value string `json:"value"`
+			} `json:"signal-quality"`
+			State       string   `json:"state"`
+			PowerState  string   `json:"power-state"`
+			PrimaryPort string   `json:"primary-port"`
+			EquipmentID string   `json:"equipment-identifier"`
+			AccessTech  []string `json:"access-technologies"`
+		} `json:"generic"`
+		ThreeGPP struct {
+			IMEI string `json:"imei"`
+		} `json:"3gpp"`
+		DBusPath string `json:"dbus-path"`
+	} `json:"modem"`
 }
 
 type ModemState struct {
@@ -66,6 +96,32 @@ type ModemService struct {
 	logger         *log.Logger
 	lastModemState ModemState
 	health         *ModemHealth
+	location       *LocationService
+}
+
+type GPSConfig struct {
+	suplServer     string
+	refreshRate    time.Duration
+	accuracyThresh float64
+	antennaVoltage float64
+}
+
+type Location struct {
+	Latitude  float64   `json:"latitude"`
+	Longitude float64   `json:"longitude"`
+	Altitude  float64   `json:"altitude"`
+	Speed     float64   `json:"speed"`
+	Course    float64   `json:"course"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type LocationService struct {
+	modemId  string
+	config   GPSConfig
+	lastFix  time.Time
+	location Location
+	enabled  bool
+	logger   *log.Logger
 }
 
 func NewModemHealth() *ModemHealth {
@@ -81,10 +137,12 @@ func NewModemService(cfg Config) *ModemService {
 		panic(fmt.Sprintf("invalid redis URL: %v", err))
 	}
 
+	logger := log.New(os.Stdout, "rescoot-modem: ", log.LstdFlags)
+
 	return &ModemService{
 		cfg:    cfg,
 		redis:  redis.NewClient(opt),
-		logger: log.New(os.Stdout, "rescoot-modem: ", log.LstdFlags),
+		logger: logger,
 		lastModemState: ModemState{
 			status:        ModemStateDefault,
 			accessTech:    AccessTechDefault,
@@ -93,23 +151,46 @@ func NewModemService(cfg Config) *ModemService {
 			ifIpAddr:      "UNKNOWN",
 			registration:  "",
 		},
-		health: NewModemHealth(),
+		health:   NewModemHealth(),
+		location: NewLocationService(logger),
 	}
 }
 
 func (m *ModemService) findModemId() (string, error) {
-	out, err := exec.Command("mmcli", "-L").Output()
+	out, err := exec.Command("mmcli", "-J", "-L").Output()
 	if err != nil {
-		return "", fmt.Errorf("mmcli -L failed: %v", err)
+		return "", fmt.Errorf("mmcli list error: %v", err)
 	}
 
-	re := regexp.MustCompile(`/org/freedesktop/ModemManager1/Modem/(\d+)`)
-	match := re.FindStringSubmatch(string(out))
-	if len(match) < 2 {
+	var mmcli struct {
+		ModemList []string `json:"modem-list"`
+	}
+
+	if err := json.Unmarshal(out, &mmcli); err != nil {
+		return "", fmt.Errorf("failed to parse modem list: %v", err)
+	}
+
+	if len(mmcli.ModemList) == 0 {
 		return "", fmt.Errorf("no modem found")
 	}
 
-	return match[1], nil
+	// Extract ID from DBus path
+	modemPath := mmcli.ModemList[0]
+	return strings.Split(modemPath, "/")[5], nil
+}
+
+func (m *ModemService) getModemStatus(modemId string) (*mmcli.ModemManager, error) {
+	out, err := exec.Command("mmcli", "-J", "-m", modemId).Output()
+	if err != nil {
+		return nil, fmt.Errorf("mmcli error: %v", err)
+	}
+
+	mm, err := mmcli.Parse(out)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse modem info: %v", err)
+	}
+
+	return mm, nil
 }
 
 func (m *ModemService) getModemInfo() (ModemState, error) {
@@ -124,55 +205,36 @@ func (m *ModemService) getModemInfo() (ModemState, error) {
 		return state, err
 	}
 
-	out, err := exec.Command("mmcli", "-m", modemId).Output()
+	mm, err := m.getModemStatus(modemId)
 	if err != nil {
-		return state, fmt.Errorf("mmcli error: %v", err)
+		return state, err
 	}
 
-	output := string(out)
-	lines := strings.Split(output, "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		switch {
-		case strings.Contains(line, "access tech:"):
-			state.accessTech = strings.TrimSpace(strings.Split(line, ":")[1])
-
-		case strings.Contains(line, "signal quality:"):
-			parts := strings.Split(line, ":")
-			if len(parts) > 1 {
-				qualStr := strings.TrimSpace(strings.Split(parts[1], "%")[0])
-				if qual, err := strconv.Atoi(qualStr); err == nil {
-					state.signalQuality = uint8(qual)
-				}
-			}
-
-		case strings.Contains(line, "equipment id:"):
-			state.imei = strings.TrimSpace(strings.Split(line, ":")[1])
-		}
+	if quality, err := mm.SignalStrength(); err == nil {
+		state.signalQuality = uint8(quality)
 	}
 
-	// Get sim info
-	simOut, err := exec.Command("mmcli", "-i", modemId).Output()
-	if err == nil {
-		simInfo := string(simOut)
-		for _, line := range strings.Split(simInfo, "\n") {
-			if strings.Contains(line, "iccid:") {
-				state.iccid = strings.TrimSpace(strings.Split(line, ":")[1])
-			}
-		}
-	}
+	state.accessTech = mm.GetCurrentAccessTechnology()
+	state.imei = mm.Modem.ThreeGPP.IMEI
 
-	if ifIP, err := m.getInterfaceIP(); err == nil {
-		state.ifIpAddr = ifIP
-		state.status = "connected"
-
-		if pubIP, err := m.getPublicIP(); err == nil {
-			state.ipAddr = pubIP
-		}
-	} else {
+	switch {
+	case mm.Modem.Generic.PowerState != "on":
 		state.status = "off"
+	case mm.IsConnected():
+		state.status = "connected"
+	default:
+		state.status = "disconnected"
+	}
+
+	if state.status == "connected" {
+		if ifIP, err := m.getInterfaceIP(); err == nil {
+			state.ifIpAddr = ifIP
+			if pubIP, err := m.getPublicIP(); err == nil {
+				state.ipAddr = pubIP
+			}
+		} else {
+			state.status = "disconnected"
+		}
 	}
 
 	return state, nil
@@ -240,6 +302,25 @@ func (m *ModemService) publishModemState(currentState ModemState) error {
 	return nil
 }
 
+func (m *ModemService) publishLocationState(loc Location) error {
+	pipe := m.redis.Pipeline()
+	ctx := context.Background()
+
+	pipe.HSet(ctx, "gps", map[string]interface{}{
+		"latitude":  fmt.Sprintf("%.6f", loc.Latitude),
+		"longitude": fmt.Sprintf("%.6f", loc.Longitude),
+		"altitude":  fmt.Sprintf("%.6f", loc.Altitude),
+		"speed":     fmt.Sprintf("%.6f", loc.Speed),
+		"course":    fmt.Sprintf("%.6f", loc.Course),
+		"timestamp": loc.Timestamp.Format(time.RFC3339),
+	})
+
+	pipe.Publish(ctx, "gps", "location-update")
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 func (m *ModemService) checkHealth() error {
 	// Skip health check if we're in a terminal state
 	if m.health.state == StateRecoveryFailedWait || m.health.state == StatePermanentFailure {
@@ -248,17 +329,17 @@ func (m *ModemService) checkHealth() error {
 
 	modemId, err := m.findModemId()
 	if err != nil {
-		return m.handleModemFailure("no_modem_found")
+		return m.handleModemFailure(fmt.Sprintf("no_modem_found: %v", err))
 	}
 
 	// Check primary port
 	if err := m.checkPrimaryPort(modemId); err != nil {
-		return m.handleModemFailure("wrong_primary_port")
+		return m.handleModemFailure(fmt.Sprintf("wrong_primary_port: %v", err))
 	}
 
 	// Check power state
 	if err := m.checkPowerState(modemId); err != nil {
-		return m.handleModemFailure("wrong_power_state")
+		return m.handleModemFailure(fmt.Sprintf("wrong_power_state: %v", err))
 	}
 
 	// If we get here, modem is healthy
@@ -267,27 +348,25 @@ func (m *ModemService) checkHealth() error {
 }
 
 func (m *ModemService) checkPrimaryPort(modemId string) error {
-	out, err := exec.Command("mmcli", "-m", modemId, "--simple-status").Output()
+	mm, err := m.getModemStatus(modemId)
 	if err != nil {
-		return fmt.Errorf("failed to get modem status: %v", err)
+		return err
 	}
 
-	// Check if primary port is cdc-wdm0
-	if !strings.Contains(string(out), "cdc-wdm0") {
-		return fmt.Errorf("wrong primary port")
+	if mm.Modem.Generic.PrimaryPort != "cdc-wdm0" {
+		return fmt.Errorf("wrong primary port: %s", mm.Modem.Generic.PrimaryPort)
 	}
 	return nil
 }
 
 func (m *ModemService) checkPowerState(modemId string) error {
-	out, err := exec.Command("mmcli", "-m", modemId).Output()
+	mm, err := m.getModemStatus(modemId)
 	if err != nil {
-		return fmt.Errorf("failed to get modem info: %v", err)
+		return err
 	}
 
-	// Check power state
-	if !strings.Contains(string(out), "power state: 'on'") {
-		return fmt.Errorf("modem not powered on")
+	if mm.Modem.Generic.PowerState != "on" {
+		return fmt.Errorf("modem not powered on: %s", mm.Modem.Generic.PowerState)
 	}
 	return nil
 }
@@ -330,6 +409,7 @@ func (m *ModemService) attemptRecovery() error {
 	modemId, err := m.findModemId()
 	if err == nil {
 		// Try mmcli reset
+		m.logger.Printf("attempting to reset the modem")
 		if err := exec.Command("mmcli", "-m", modemId, "--reset").Run(); err != nil {
 			m.logger.Printf("Failed to reset modem: %v", err)
 		}
@@ -340,6 +420,7 @@ func (m *ModemService) attemptRecovery() error {
 
 	// Check if recovery was successful
 	if err := m.checkHealth(); err != nil {
+		// TODO: try power cycling the modem to hard reset it? Does that do more than --reset?
 		m.logger.Printf("Recovery failed: %v", err)
 		return err
 	}
@@ -405,7 +486,9 @@ func (m *ModemService) getInterfaceIP() (string, error) {
 
 func (m *ModemService) monitorStatus(ctx context.Context) {
 	ticker := time.NewTicker(m.cfg.internetCheckTime)
+	gpsTimer := time.NewTicker(GPSUpdateInterval)
 	defer ticker.Stop()
+	defer gpsTimer.Stop()
 
 	for {
 		select {
@@ -432,6 +515,34 @@ func (m *ModemService) monitorStatus(ctx context.Context) {
 			if err := m.publishModemState(currentState); err != nil {
 				m.logger.Printf("Failed to publish state: %v", err)
 			}
+
+			m.publishHealthState()
+		case <-gpsTimer.C:
+			if m.health.state == StateNormal {
+				modemId, err := m.findModemId()
+				if err != nil {
+					continue
+				}
+
+				// Ensure GPS is enabled
+				if !m.location.enabled {
+					if err := m.location.enableGPS(modemId); err != nil {
+						m.logger.Printf("Failed to enable GPS: %v", err)
+						continue
+					}
+				}
+
+				// Update location
+				if err := m.location.updateLocation(); err != nil {
+					m.logger.Printf("Failed to update location: %v", err)
+					continue
+				}
+
+				// Publish to Redis
+				if err := m.publishLocationState(m.location.location); err != nil {
+					m.logger.Printf("Failed to publish location: %v", err)
+				}
+			}
 		}
 	}
 }
@@ -446,6 +557,122 @@ func (m *ModemService) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 	return nil
+}
+
+func NewLocationService(logger *log.Logger) *LocationService {
+	return &LocationService{
+		config: GPSConfig{
+			suplServer:     "supl.google.com:7275",
+			refreshRate:    GPSUpdateInterval,
+			accuracyThresh: 50.0,
+			antennaVoltage: 3.05,
+		},
+		logger: logger,
+	}
+}
+
+func (l *LocationService) enableGPS(modemId string) error {
+	l.modemId = modemId
+
+	// Try configuration multiple times
+	for attempt := 0; attempt < MaxGPSRetries; attempt++ {
+		if err := l.configureGPS(); err != nil {
+			l.logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
+			time.Sleep(GPSRetryInterval)
+			continue
+		}
+		l.enabled = true
+		return nil
+	}
+
+	return fmt.Errorf("failed to configure GPS after %d attempts", MaxGPSRetries)
+}
+
+func (l *LocationService) configureGPS() error {
+	// Stop any existing GPS session
+	exec.Command("mmcli", "-m", l.modemId, "--location-disable-3gpp --location-disable-agps-msa --location-disable-agps-msb --location-disable-gps-nmea --location-disable-gps-raw --location-disable-cdma-bs --location-disable-gps-unmanaged").Run()
+
+	// Configure SUPL
+	if err := exec.Command("mmcli", "-m", l.modemId,
+		"--location-set-supl-server", l.config.suplServer).Run(); err != nil {
+		return fmt.Errorf("failed to set SUPL server: %v", err)
+	}
+
+	// Enable 3GPP location services
+	if err := exec.Command("mmcli", "-m", l.modemId,
+		"--location-enable-3gpp").Run(); err != nil {
+		return fmt.Errorf("failed to enable 3GPP location services: %v", err)
+	}
+
+	// Enable GPS with A-GPS
+	if err := exec.Command("mmcli", "-m", l.modemId,
+		"--location-enable-agps-msb").Run(); err != nil {
+		return fmt.Errorf("failed to enable A-GPS: %v", err)
+	}
+
+	// Enable GPS
+	if err := exec.Command("mmcli", "-m", l.modemId,
+		"--location-enable-gps-raw").Run(); err != nil {
+		return fmt.Errorf("failed to enable raw GPS: %v", err)
+	}
+
+	// Enable NMEA
+	if err := exec.Command("mmcli", "-m", l.modemId,
+		"--location-enable-gps-nmea").Run(); err != nil {
+		return fmt.Errorf("failed to enable NMEA GPS: %v", err)
+	}
+
+	return nil
+}
+
+// TODO also use mmcli -J here instead of parsing NMEA
+func (l *LocationService) updateLocation() error {
+	if !l.enabled {
+		return fmt.Errorf("GPS not enabled")
+	}
+
+	// Get raw NMEA data
+	out, err := exec.Command("mmcli", "-m", l.modemId, "--location-get").Output()
+	if err != nil {
+		return fmt.Errorf("failed to get location: %v", err)
+	}
+
+	location, err := l.parseLocationData(string(out))
+	if err != nil {
+		return err
+	}
+
+	l.location = *location
+	l.lastFix = time.Now()
+	return nil
+}
+
+func (l *LocationService) parseLocationData(data string) (*Location, error) {
+	// Example NMEA parsing - we'll need to handle multiple sentence types
+	location := &Location{}
+
+	// Parse latitude
+	latMatch := regexp.MustCompile(`latitude:\s*([-+]?\d*\.\d+)`).FindStringSubmatch(data)
+	if len(latMatch) > 1 {
+		lat, err := strconv.ParseFloat(latMatch[1], 64)
+		if err == nil {
+			location.Latitude = lat
+		}
+	}
+
+	// Parse longitude
+	lonMatch := regexp.MustCompile(`longitude:\s*([-+]?\d*\.\d+)`).FindStringSubmatch(data)
+	if len(lonMatch) > 1 {
+		lon, err := strconv.ParseFloat(lonMatch[1], 64)
+		if err == nil {
+			location.Longitude = lon
+		}
+	}
+
+	// Add timestamp
+	location.Timestamp = time.Now()
+
+	return location, nil
 }
 
 func main() {

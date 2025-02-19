@@ -1,0 +1,13 @@
+[Unit]
+Description=rescoot modem service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/rootdirs/home/root/rescoot
+ExecStart=/var/rootdirs/home/root/rescoot/rescoot-modem-arm-dist
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
