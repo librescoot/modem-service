@@ -137,7 +137,7 @@ func NewModemService(cfg Config, version string) *ModemService {
 		panic(fmt.Sprintf("invalid redis URL: %v", err))
 	}
 
-	logger := log.New(os.Stdout, "rescoot-modem", log.LstdFlags)
+	logger := log.New(os.Stdout, "", log.LstdFlags)
 
 	service := &ModemService{
 		cfg:    cfg,
@@ -249,49 +249,49 @@ func (m *ModemService) publishModemState(currentState ModemState) error {
 	ctx := context.Background()
 
 	if m.lastModemState.status != currentState.status {
-		m.logger.Printf("internet modem-state : %s", currentState.status)
+		m.logger.Printf("internet modem-state: %s", currentState.status)
 		pipe.HSet(ctx, "internet", "modem-state", currentState.status)
 		pipe.Publish(ctx, "internet", "modem-state")
 		m.lastModemState.status = currentState.status
 	}
 
 	if m.lastModemState.ipAddr != currentState.ipAddr {
-		m.logger.Printf("internet ip-address : %s", currentState.ipAddr)
+		m.logger.Printf("internet ip-address: %s", currentState.ipAddr)
 		pipe.HSet(ctx, "internet", "ip-address", currentState.ipAddr)
 		pipe.Publish(ctx, "internet", "ip-address")
 		m.lastModemState.ipAddr = currentState.ipAddr
 	}
 
 	if m.lastModemState.ifIpAddr != currentState.ifIpAddr {
-		m.logger.Printf("interface ip-address : %s", currentState.ifIpAddr)
+		m.logger.Printf("interface ip-address: %s", currentState.ifIpAddr)
 		pipe.HSet(ctx, "internet", "if-ip-address", currentState.ifIpAddr)
 		pipe.Publish(ctx, "internet", "if-ip-address")
 		m.lastModemState.ifIpAddr = currentState.ifIpAddr
 	}
 
 	if m.lastModemState.accessTech != currentState.accessTech {
-		m.logger.Printf("internet access-tech : %s", currentState.accessTech)
+		m.logger.Printf("internet access-tech: %s", currentState.accessTech)
 		pipe.HSet(ctx, "internet", "access-tech", currentState.accessTech)
 		pipe.Publish(ctx, "internet", "access-tech")
 		m.lastModemState.accessTech = currentState.accessTech
 	}
 
 	if m.lastModemState.signalQuality != currentState.signalQuality {
-		m.logger.Printf("internet signal-quality : %d", currentState.signalQuality)
+		m.logger.Printf("internet signal-quality: %d", currentState.signalQuality)
 		pipe.HSet(ctx, "internet", "signal-quality", currentState.signalQuality)
 		pipe.Publish(ctx, "internet", "signal-quality")
 		m.lastModemState.signalQuality = currentState.signalQuality
 	}
 
 	if m.lastModemState.imei != currentState.imei {
-		m.logger.Printf("IMEI : %s", currentState.imei)
+		m.logger.Printf("IMEI: %s", currentState.imei)
 		pipe.HSet(ctx, "internet", "sim-imei", currentState.imei)
 		pipe.Publish(ctx, "internet", "sim-imei")
 		m.lastModemState.imei = currentState.imei
 	}
 
 	if m.lastModemState.iccid != currentState.iccid {
-		m.logger.Printf("ICCID : %s", currentState.iccid)
+		m.logger.Printf("ICCID: %s", currentState.iccid)
 		pipe.HSet(ctx, "internet", "sim-iccid", currentState.iccid)
 		pipe.Publish(ctx, "internet", "sim-iccid")
 		m.lastModemState.iccid = currentState.iccid
