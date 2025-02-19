@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/var/rootdirs/home/root/rescoot
-ExecStart=/var/rootdirs/home/root/rescoot/rescoot-modem-arm-dist
+WorkingDirectory=/etc/rescoot
+ExecStart=/usr/bin/rescoot-modem
 Restart=always
 RestartSec=30
 

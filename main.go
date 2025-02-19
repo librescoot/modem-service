@@ -130,16 +130,16 @@ func NewModemHealth() *ModemHealth {
 	}
 }
 
-func NewModemService(cfg Config) *ModemService {
+func NewModemService(cfg Config, version string) *ModemService {
 	opt, err := redis.ParseURL(cfg.redisURL)
 	if err != nil {
 		// Since this is during initialization, we should probably just panic
 		panic(fmt.Sprintf("invalid redis URL: %v", err))
 	}
 
-	logger := log.New(os.Stdout, "rescoot-modem: ", log.LstdFlags)
+	logger := log.New(os.Stdout, "rescoot-modem", log.LstdFlags)
 
-	return &ModemService{
+	service := &ModemService{
 		cfg:    cfg,
 		redis:  redis.NewClient(opt),
 		logger: logger,
@@ -154,6 +154,10 @@ func NewModemService(cfg Config) *ModemService {
 		health:   NewModemHealth(),
 		location: NewLocationService(logger),
 	}
+
+	service.logger.Printf("rescoot-modem v%s", version)
+
+	return service
 }
 
 func (m *ModemService) findModemId() (string, error) {
@@ -675,6 +679,8 @@ func (l *LocationService) parseLocationData(data string) (*Location, error) {
 	return location, nil
 }
 
+var version string
+
 func main() {
 	cfg := Config{}
 	flag.StringVar(&cfg.redisURL, "redis-url", "redis://127.0.0.1:6379", "Redis URL")
@@ -686,7 +692,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	service := NewModemService(cfg)
+	service := NewModemService(cfg, version)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
