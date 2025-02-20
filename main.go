@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -137,7 +136,7 @@ func NewModemService(cfg Config, version string) *ModemService {
 		panic(fmt.Sprintf("invalid redis URL: %v", err))
 	}
 
-	logger := log.New(os.Stdout, "", log.LstdFlags)
+	logger := log.New(os.Stdout, "", 0)
 
 	service := &ModemService{
 		cfg:    cfg,
@@ -161,37 +160,24 @@ func NewModemService(cfg Config, version string) *ModemService {
 }
 
 func (m *ModemService) findModemId() (string, error) {
-	out, err := exec.Command("mmcli", "-J", "-L").Output()
+	modemList, err := mmcli.ListModems()
 	if err != nil {
-		return "", fmt.Errorf("mmcli list error: %v", err)
+		return "", fmt.Errorf("mmcli ListModems error: %v", err)
 	}
 
-	var mmcli struct {
-		ModemList []string `json:"modem-list"`
-	}
-
-	if err := json.Unmarshal(out, &mmcli); err != nil {
-		return "", fmt.Errorf("failed to parse modem list: %v", err)
-	}
-
-	if len(mmcli.ModemList) == 0 {
+	if len(modemList) == 0 {
 		return "", fmt.Errorf("no modem found")
 	}
 
 	// Extract ID from DBus path
-	modemPath := mmcli.ModemList[0]
+	modemPath := modemList[0]
 	return strings.Split(modemPath, "/")[5], nil
 }
 
 func (m *ModemService) getModemStatus(modemId string) (*mmcli.ModemManager, error) {
-	out, err := exec.Command("mmcli", "-J", "-m", modemId).Output()
+	mm, err := mmcli.GetModemDetails(modemId)
 	if err != nil {
-		return nil, fmt.Errorf("mmcli error: %v", err)
-	}
-
-	mm, err := mmcli.Parse(out)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse modem info: %v", err)
+		return nil, fmt.Errorf("mmcli GetModemDetails error: %v", err)
 	}
 
 	return mm, nil
@@ -233,10 +219,11 @@ func (m *ModemService) getModemInfo() (ModemState, error) {
 	if state.status == "connected" {
 		if ifIP, err := m.getInterfaceIP(); err == nil {
 			state.ifIpAddr = ifIP
-			if pubIP, err := m.getPublicIP(); err == nil {
-				state.ipAddr = pubIP
-			}
+			// if pubIP, err := m.getPublicIP(); err == nil {
+			// 	state.ipAddr = pubIP
+			// }
 		} else {
+			m.logger.Printf("Error getting interface IP: %v", err)
 			state.status = "disconnected"
 		}
 	}
@@ -481,11 +468,40 @@ func (m *ModemService) getInterfaceIP() (string, error) {
 
 	for _, addr := range addrs {
 		ipNet, ok := addr.(*net.IPNet)
-		if ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+		if ok && ipNet.IP.IsGlobalUnicast() && ipNet.IP.To4() != nil {
 			return ipNet.IP.String(), nil
 		}
 	}
-	return "", fmt.Errorf("no IPv4 address found for interface %s", m.cfg.interface_)
+	return "", fmt.Errorf("no global unicast IPv4 address found for interface %s", m.cfg.interface_)
+}
+
+func (m *ModemService) checkAndPublishModemStatus() error {
+	// Check modem health
+	if err := m.checkHealth(); err != nil {
+		m.logger.Printf("Health check failed: %v", err)
+		return err
+	}
+
+	// Get modem info
+	currentState, err := m.getModemInfo()
+	if err != nil {
+		m.logger.Printf("Failed to get modem info: %v", err)
+		currentState.status = "off"
+	}
+
+	// Publish modem state
+	if err := m.publishModemState(currentState); err != nil {
+		m.logger.Printf("Failed to publish state: %v", err)
+		return err
+	}
+
+	// Publish health state
+	if err := m.publishHealthState(); err != nil {
+		m.logger.Printf("Failed to publish health state: %v", err)
+		return err
+	}
+
+	return nil
 }
 
 func (m *ModemService) monitorStatus(ctx context.Context) {
@@ -494,33 +510,18 @@ func (m *ModemService) monitorStatus(ctx context.Context) {
 	defer ticker.Stop()
 	defer gpsTimer.Stop()
 
+	if err := m.checkAndPublishModemStatus(); err != nil {
+		m.logger.Printf("Initial modem status check failed: %v", err)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := m.checkHealth(); err != nil {
-				m.logger.Printf("Health check failed: %v", err)
-				continue
+			if err := m.checkAndPublishModemStatus(); err != nil {
+				m.logger.Printf("Periodic modem status check failed: %v", err)
 			}
-
-			currentState, err := m.getModemInfo()
-			if err != nil {
-				m.logger.Printf("Failed to get modem info: %v", err)
-				currentState.status = "off"
-			}
-
-			if currentState.status == "connected" {
-				if _, err := m.getPublicIP(); err != nil {
-					currentState.status = "disconnected"
-				}
-			}
-
-			if err := m.publishModemState(currentState); err != nil {
-				m.logger.Printf("Failed to publish state: %v", err)
-			}
-
-			m.publishHealthState()
 		case <-gpsTimer.C:
 			if m.health.state == StateNormal {
 				modemId, err := m.findModemId()
@@ -688,6 +689,11 @@ func main() {
 	flag.DurationVar(&cfg.internetCheckTime, "internet-check-time", 30*time.Second, "Internet check interval")
 	flag.StringVar(&cfg.interface_, "interface", "wwan0", "Network interface to monitor")
 	flag.Parse()
+
+	_, err := net.InterfaceByName(cfg.interface_)
+	if err != nil {
+		log.Fatalf("Specified interface %s does not exist: %v", cfg.interface_, err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

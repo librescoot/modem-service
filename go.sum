@@ -8,5 +8,5 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/redis/go-redis/v9 v9.7.0 h1:HhLSs+B6O021gwzl+locl0zEDnyNkxMtf/Z3NNBMa9E=
 github.com/redis/go-redis/v9 v9.7.0/go.mod h1:f6zhXITC7JUJIlPEiBOTXxJgPLdZcA93GewI7inzyWw=
-github.com/rescoot/go-mmcli v0.0.0-20250210134157-9442eca56350 h1:e32KxkJ9UGZcNwU+a8+rgY+Ha7k560qyZfpA6dnrjDA=
-github.com/rescoot/go-mmcli v0.0.0-20250210134157-9442eca56350/go.mod h1:lWCT3FrdeNYVoHvkO5QrFGEe9u4ezo+g3Q+lqFagHe8=
+github.com/rescoot/go-mmcli v0.2.0 h1:S/qP8GbBU3Sv7o/Fl5Jp3JLDn52kJMjQGqaEuriQydM=
+github.com/rescoot/go-mmcli v0.2.0/go.mod h1:lWCT3FrdeNYVoHvkO5QrFGEe9u4ezo+g3Q+lqFagHe8=
