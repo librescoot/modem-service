@@ -80,6 +80,7 @@ type ModemState struct {
 	ifIpAddr      string
 	registration  string
 	imei          string
+	imsi          string
 	iccid         string
 }
 
@@ -198,6 +199,14 @@ func (m *ModemService) getModemInfo() (ModemState, error) {
 		return state, err
 	}
 
+	simInfo, err := mmcli.GetSIMInfo(strings.Split(mm.Modem.Generic.SIM, "/")[5])
+	if err != nil {
+		return state, err
+	}
+
+	state.imsi = simInfo.Properties.IMSI
+	state.iccid = simInfo.Properties.ICCID
+
 	if quality, err := mm.SignalStrength(); err == nil {
 		state.signalQuality = uint8(quality)
 	}
@@ -240,19 +249,26 @@ func (m *ModemService) publishModemState(currentState ModemState) error {
 		m.lastModemState.status = currentState.status
 	}
 
-	if m.lastModemState.ipAddr != currentState.ipAddr {
-		m.logger.Printf("internet ip-address: %s", currentState.ipAddr)
-		pipe.HSet(ctx, "internet", "ip-address", currentState.ipAddr)
-		pipe.Publish(ctx, "internet", "ip-address")
-		m.lastModemState.ipAddr = currentState.ipAddr
-	}
-
 	if m.lastModemState.ifIpAddr != currentState.ifIpAddr {
-		m.logger.Printf("interface ip-address: %s", currentState.ifIpAddr)
-		pipe.HSet(ctx, "internet", "if-ip-address", currentState.ifIpAddr)
-		pipe.Publish(ctx, "internet", "if-ip-address")
+		m.logger.Printf("internet ip-address: %s", currentState.ifIpAddr)
+		pipe.HSet(ctx, "internet", "ip-address", currentState.ifIpAddr)
+		pipe.Publish(ctx, "internet", "ip-address")
 		m.lastModemState.ifIpAddr = currentState.ifIpAddr
 	}
+
+	// if m.lastModemState.ipAddr != currentState.ipAddr {
+	// 	m.logger.Printf("internet ip-address: %s", currentState.ipAddr)
+	// 	pipe.HSet(ctx, "internet", "ip-address", currentState.ipAddr)
+	// 	pipe.Publish(ctx, "internet", "ip-address")
+	// 	m.lastModemState.ipAddr = currentState.ipAddr
+	// }
+
+	// if m.lastModemState.ifIpAddr != currentState.ifIpAddr {
+	// 	m.logger.Printf("interface ip-address: %s", currentState.ifIpAddr)
+	// 	pipe.HSet(ctx, "internet", "if-ip-address", currentState.ifIpAddr)
+	// 	pipe.Publish(ctx, "internet", "if-ip-address")
+	// 	m.lastModemState.ifIpAddr = currentState.ifIpAddr
+	// }
 
 	if m.lastModemState.accessTech != currentState.accessTech {
 		m.logger.Printf("internet access-tech: %s", currentState.accessTech)
@@ -269,14 +285,21 @@ func (m *ModemService) publishModemState(currentState ModemState) error {
 	}
 
 	if m.lastModemState.imei != currentState.imei {
-		m.logger.Printf("IMEI: %s", currentState.imei)
+		m.logger.Printf("modem IMEI: %s", currentState.imei)
 		pipe.HSet(ctx, "internet", "sim-imei", currentState.imei)
 		pipe.Publish(ctx, "internet", "sim-imei")
 		m.lastModemState.imei = currentState.imei
 	}
 
+	if m.lastModemState.imsi != currentState.imsi {
+		m.logger.Printf("SIM IMSI: %s", currentState.imsi)
+		pipe.HSet(ctx, "internet", "sim-imsi", currentState.imsi)
+		pipe.Publish(ctx, "internet", "sim-imsi")
+		m.lastModemState.imsi = currentState.imsi
+	}
+
 	if m.lastModemState.iccid != currentState.iccid {
-		m.logger.Printf("ICCID: %s", currentState.iccid)
+		m.logger.Printf("SIM ICCID: %s", currentState.iccid)
 		pipe.HSet(ctx, "internet", "sim-iccid", currentState.iccid)
 		pipe.Publish(ctx, "internet", "sim-iccid")
 		m.lastModemState.iccid = currentState.iccid

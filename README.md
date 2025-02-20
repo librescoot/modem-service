@@ -34,11 +34,11 @@ The service supports the following command-line flags:
 
 | Flag               | Default Value | Description                             |
 |--------------------|---------------|-----------------------------------------|
-| `--redis-host`     | `localhost`   | Redis server hostname                   |
-| `--redis-port`     | `6379`        | Redis server port                       |
-| `--polling-time`   | `5s`          | Polling interval for modem checks       |
-| `--internet-check-time` | `30s`    | Interval for internet connectivity checks |
-| `--interface`      | `wwan0`       | Network interface to monitor            |
+| `-redis-host`      | `localhost`   | Redis server hostname                   |
+| `-redis-port`      | `6379`        | Redis server port                       |
+| `-polling-time`    | `5s`          | Polling interval for modem checks       |
+| `-internet-check-time` | `30s`     | Interval for internet connectivity checks |
+| `-interface`       | `wwan0`       | Network interface to monitor            |
 
 ## Modem State Tracking
 
@@ -63,7 +63,6 @@ The service uses Redis to:
 The service maintains a Redis hash `internet` with the following keys:
 - `modem-state` (`off`, `disconnected`, `connected`, or `UNKNOWN`)
 - `ip-address` (external IPv4 address or `UNKNOWN`)
-- `if-ip-address` (interface assigned IPv4 address, e.g. carrier NAT)
 - `access-tech` (access tech, depending on modem & SIM support)
      - `"UNKNOWN"`
      - `"2G"` / `"GSM"`
@@ -71,7 +70,8 @@ The service maintains a Redis hash `internet` with the following keys:
      - `"4G"` / `"LTE"`
      - `"5G"`
 - `signal-quality` (0-100, in %, or 255 if UNKNOWN)
-- `sim-imei` IMEI (unique hardware identifier)
+- `sim-imei` IMEI (unique hardware identifier) (this actually identifies the modem, but the name is kept for backward compatibility)
+- `sim-imsi` IMSI (unique subscriber identity)
 - `sim-iccid` ICCID (unique SIM card identifier)
 
 ## Usage

@@ -1,0 +1,14 @@
+{
+  "sim": {
+    "dbus-path": "/org/freedesktop/ModemManager1/SIM/1",
+    "properties": {
+      "active": "yes",
+      "eid": "--",
+      "emergency-numbers": [],
+      "iccid": "8944501210xxxxxxxxx",
+      "imsi": "2345021xxxxxxxx",
+      "operator-code": "23450",
+      "operator-name": "JT"
+    }
+  }
+}

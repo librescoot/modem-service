@@ -4,7 +4,7 @@ go 1.22.12
 
 require (
 	github.com/redis/go-redis/v9 v9.7.0
-	github.com/rescoot/go-mmcli v0.2.0
+	github.com/rescoot/go-mmcli v0.2.2
 )
 
 require (
