@@ -29,13 +29,20 @@ const (
 
 // Modem Health
 const (
-	MaxRecoveryAttempts = 2
-	RecoveryWaitTime    = 30 * time.Second
+	MaxRecoveryAttempts = 5
+	RecoveryWaitTime    = 60 * time.Second
 
 	StateNormal             = "normal"
 	StateRecovering         = "recovering"
 	StateRecoveryFailedWait = "recovery-failed-waiting-reboot"
 	StatePermanentFailure   = "permanent-failure-needs-replacement"
+)
+
+// GPIO Control
+const (
+	ModemGPIOPin        = 110
+	ModemCheckInterval  = 5 * time.Second
+	MaxModemStartChecks = 60 // 5 minutes (60 * 5 seconds)
 )
 
 // GPS
@@ -417,28 +424,52 @@ func (m *ModemService) attemptRecovery() error {
 	// Publish recovery state
 	m.publishHealthState()
 
-	// Find modem ID first
+	// Try software reset first if modem is present
 	modemId, err := m.findModemId()
 	if err == nil {
 		// Try mmcli reset
-		m.logger.Printf("attempting to reset the modem")
+		m.logger.Printf("Attempting to reset the modem via mmcli")
 		if err := exec.Command("mmcli", "-m", modemId, "--reset").Run(); err != nil {
-			m.logger.Printf("Failed to reset modem: %v", err)
+			m.logger.Printf("Failed to reset modem via mmcli: %v", err)
+		} else {
+			// Wait for software reset to complete
+			time.Sleep(RecoveryWaitTime)
+
+			// Check if software reset was successful
+			if err := m.checkHealth(); err == nil {
+				m.logger.Printf("Modem recovery successful via mmcli reset")
+				m.health.state = StateNormal
+				m.publishHealthState()
+				return nil
+			}
 		}
 	}
 
-	// Wait for recovery
-	time.Sleep(RecoveryWaitTime)
+	// If software reset failed or modem not found, try hardware reset via GPIO
+	m.logger.Printf("Attempting to restart modem via GPIO pin %d", ModemGPIOPin)
+	if err := restartModem(); err != nil {
+		m.logger.Printf("Failed to restart modem via GPIO: %v", err)
+		return err
+	}
+
+	// Create a context with timeout for waiting for the modem
+	ctx, cancel := context.WithTimeout(context.Background(), RecoveryWaitTime)
+	defer cancel()
+
+	// Wait for modem to come up after GPIO restart
+	if err := m.waitForModem(ctx); err != nil {
+		m.logger.Printf("Modem did not come up after GPIO restart: %v", err)
+		return err
+	}
 
 	// Check if recovery was successful
 	if err := m.checkHealth(); err != nil {
-		// TODO: try power cycling the modem to hard reset it? Does that do more than --reset?
-		m.logger.Printf("Recovery failed: %v", err)
+		m.logger.Printf("Recovery failed after GPIO restart: %v", err)
 		return err
 	}
 
 	// Recovery successful
-	m.logger.Printf("Modem recovery successful")
+	m.logger.Printf("Modem recovery successful via GPIO restart")
 	m.health.state = StateNormal
 	m.publishHealthState()
 	return nil
@@ -573,9 +604,165 @@ func (m *ModemService) monitorStatus(ctx context.Context) {
 	}
 }
 
+func startModem() error {
+	if err := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", ModemGPIOPin)), 0644); err != nil {
+		return fmt.Errorf("failed to export GPIO pin: %v", err)
+	}
+
+	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/direction", ModemGPIOPin), []byte("out"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO direction: %v", err)
+	}
+
+	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", ModemGPIOPin), []byte("1"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value high: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", ModemGPIOPin), []byte("0"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value low: %v", err)
+	}
+
+	return nil
+}
+
+func restartModem() error {
+	if err := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", ModemGPIOPin)), 0644); err != nil {
+		return fmt.Errorf("failed to export GPIO pin: %v", err)
+	}
+
+	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/direction", ModemGPIOPin), []byte("out"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO direction: %v", err)
+	}
+
+	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", ModemGPIOPin), []byte("1"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value high: %v", err)
+	}
+
+	time.Sleep(3500 * time.Millisecond)
+
+	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", ModemGPIOPin), []byte("0"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value low: %v", err)
+	}
+
+	return nil
+}
+
+func (m *ModemService) isModemInterfacePresent() bool {
+	_, err := net.InterfaceByName(m.cfg.interface_)
+	return err == nil
+}
+
+func (m *ModemService) isModemDBusPresent() bool {
+	_, err := m.findModemId()
+	return err == nil
+}
+
+func (m *ModemService) waitForModem(ctx context.Context) error {
+	m.logger.Printf("Waiting for modem to come up...")
+
+	ticker := time.NewTicker(ModemCheckInterval)
+	defer ticker.Stop()
+
+	count := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if m.isModemInterfacePresent() {
+				m.logger.Printf("Modem interface %s is now present", m.cfg.interface_)
+				return nil
+			}
+
+			if m.isModemDBusPresent() {
+				m.logger.Printf("Modem is now present via mmcli/dbus")
+				return nil
+			}
+
+			count++
+			if count >= MaxModemStartChecks {
+				return fmt.Errorf("modem did not come up after %d checks", MaxModemStartChecks)
+			}
+		}
+	}
+}
+
+func (m *ModemService) ensureModemEnabled(ctx context.Context) error {
+	if m.isModemInterfacePresent() {
+		m.logger.Printf("Modem interface %s is already present", m.cfg.interface_)
+		return nil
+	}
+
+	if m.isModemDBusPresent() {
+		m.logger.Printf("Modem is already present via mmcli/dbus")
+		return nil
+	}
+
+	m.logger.Printf("Modem not detected, will attempt to enable via GPIO pin %d", ModemGPIOPin)
+
+	// Try multiple times with increasing wait times
+	for attempt := range MaxRecoveryAttempts {
+		// Calculate wait time for this attempt - increases with each attempt
+		waitTime := min(time.Duration(60*(attempt+1))*time.Second, 300*time.Second)
+
+		m.logger.Printf("Modem start attempt %d/%d with %v wait time",
+			attempt+1, MaxRecoveryAttempts, waitTime)
+
+		// Try to start the modem
+		if err := startModem(); err != nil {
+			m.logger.Printf("Failed to start modem: %v", err)
+			continue
+		}
+
+		// Create context with timeout for this attempt
+		attemptCtx, cancel := context.WithTimeout(ctx, waitTime)
+
+		// Wait for modem to come up
+		err := m.waitForModem(attemptCtx)
+		cancel()
+
+		if err == nil {
+			m.logger.Printf("Modem successfully enabled on attempt %d", attempt+1)
+			return nil
+		}
+
+		m.logger.Printf("Modem did not come up after attempt %d: %v", attempt+1, err)
+
+		// If context was canceled, exit retry loop
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			// Continue to next attempt
+		}
+	}
+
+	// If we get here, all attempts failed
+	m.logger.Printf("SEVERE ERROR: Modem failed to come up after %d attempts with up to 5 minute wait times",
+		MaxRecoveryAttempts)
+
+	// Mark modem as potentially defective in Redis
+	m.health.state = StatePermanentFailure
+	m.publishHealthState()
+
+	return fmt.Errorf("modem failed to come up after multiple attempts, marked as potentially defective")
+}
+
 func (m *ModemService) Run(ctx context.Context) error {
 	if err := m.redis.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("redis connection failed: %v", err)
+	}
+
+	// Try to enable the modem if it's not present
+	if err := m.ensureModemEnabled(ctx); err != nil {
+		m.logger.Printf("SEVERE ERROR: Failed to ensure modem is enabled: %v", err)
+
+		// If the modem interface is still not present, we cannot continue
+		if !m.isModemInterfacePresent() && !m.isModemDBusPresent() {
+			m.logger.Printf("Cannot continue without modem interface or dbus presence")
+			return fmt.Errorf("modem not available: %v", err)
+		}
 	}
 
 	m.logger.Printf("Starting modem service on interface %s", m.cfg.interface_)
@@ -601,7 +788,7 @@ func (l *LocationService) enableGPS(modemId string) error {
 	l.modemId = modemId
 
 	// Try configuration multiple times
-	for attempt := 0; attempt < MaxGPSRetries; attempt++ {
+	for attempt := range MaxGPSRetries {
 		if err := l.configureGPS(); err != nil {
 			l.logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
 			time.Sleep(GPSRetryInterval)
@@ -674,7 +861,6 @@ func (l *LocationService) updateLocation() error {
 }
 
 func (l *LocationService) parseLocationData(data string) (*Location, error) {
-	// Example NMEA parsing - we'll need to handle multiple sentence types
 	location := &Location{}
 
 	// Parse latitude
@@ -710,11 +896,6 @@ func main() {
 	flag.DurationVar(&cfg.internetCheckTime, "internet-check-time", 30*time.Second, "Internet check interval")
 	flag.StringVar(&cfg.interface_, "interface", "wwan0", "Network interface to monitor")
 	flag.Parse()
-
-	_, err := net.InterfaceByName(cfg.interface_)
-	if err != nil {
-		log.Fatalf("Specified interface %s does not exist: %v", cfg.interface_, err)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
