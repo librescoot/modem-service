@@ -1,6 +1,6 @@
 module modem-service
 
-go 1.22.12
+go 1.22.2
 
 require (
 	github.com/redis/go-redis/v9 v9.7.0
