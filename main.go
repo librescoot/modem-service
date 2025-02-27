@@ -817,22 +817,28 @@ func (l *LocationService) configureGPS() error {
 		return fmt.Errorf("failed to enable 3GPP location services: %v", err)
 	}
 
-	// Enable GPS with A-GPS
-	if err := exec.Command("mmcli", "-m", l.modemId,
-		"--location-enable-agps-msb").Run(); err != nil {
-		return fmt.Errorf("failed to enable A-GPS: %v", err)
-	}
+	// // Enable GPS with A-GPS
+	// if err := exec.Command("mmcli", "-m", l.modemId,
+	// 	"--location-enable-agps-msb").Run(); err != nil {
+	// 	return fmt.Errorf("failed to enable A-GPS: %v", err)
+	// }
 
-	// Enable GPS
-	if err := exec.Command("mmcli", "-m", l.modemId,
-		"--location-enable-gps-raw").Run(); err != nil {
-		return fmt.Errorf("failed to enable raw GPS: %v", err)
-	}
+	// // Enable GPS
+	// if err := exec.Command("mmcli", "-m", l.modemId,
+	// 	"--location-enable-gps-raw").Run(); err != nil {
+	// 	return fmt.Errorf("failed to enable raw GPS: %v", err)
+	// }
 
-	// Enable NMEA
+	// // Enable NMEA
+	// if err := exec.Command("mmcli", "-m", l.modemId,
+	// 	"--location-enable-gps-nmea").Run(); err != nil {
+	// 	return fmt.Errorf("failed to enable NMEA GPS: %v", err)
+	// }
+
+	// Enable GPS unmanaged
 	if err := exec.Command("mmcli", "-m", l.modemId,
-		"--location-enable-gps-nmea").Run(); err != nil {
-		return fmt.Errorf("failed to enable NMEA GPS: %v", err)
+		"--location-enable-gps-unmanaged").Run(); err != nil {
+		return fmt.Errorf("failed to enable GPS unmanaged: %v", err)
 	}
 
 	return nil
