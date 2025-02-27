@@ -11,14 +11,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"regexp"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/rescoot/go-mmcli"
+	"github.com/stratoberry/go-gpsd"
 )
 
 const (
@@ -129,6 +128,8 @@ type LocationService struct {
 	location Location
 	enabled  bool
 	logger   *log.Logger
+	gpsdConn *gpsd.Session
+	done     chan bool
 }
 
 func NewModemHealth() *ModemHealth {
@@ -325,7 +326,7 @@ func (m *ModemService) publishLocationState(loc Location) error {
 	pipe := m.redis.Pipeline()
 	ctx := context.Background()
 
-	pipe.HSet(ctx, "gps", map[string]interface{}{
+	pipe.HSet(ctx, "gps", map[string]any{
 		"latitude":  fmt.Sprintf("%.6f", loc.Latitude),
 		"longitude": fmt.Sprintf("%.6f", loc.Longitude),
 		"altitude":  fmt.Sprintf("%.6f", loc.Altitude),
@@ -333,6 +334,9 @@ func (m *ModemService) publishLocationState(loc Location) error {
 		"course":    fmt.Sprintf("%.6f", loc.Course),
 		"timestamp": loc.Timestamp.Format(time.RFC3339),
 	})
+
+	m.logger.Printf("Published location to redis: latitude=%.6f longitude=%.6f altitude=%.6f speed=%.6f course=%.6f timestamp=%s",
+		loc.Latitude, loc.Longitude, loc.Altitude, loc.Speed, loc.Course, loc.Timestamp.Format(time.RFC3339))
 
 	pipe.Publish(ctx, "gps", "location-update")
 
@@ -589,12 +593,6 @@ func (m *ModemService) monitorStatus(ctx context.Context) {
 					}
 				}
 
-				// Update location
-				if err := m.location.updateLocation(); err != nil {
-					m.logger.Printf("Failed to update location: %v", err)
-					continue
-				}
-
 				// Publish to Redis
 				if err := m.publishLocationState(m.location.location); err != nil {
 					m.logger.Printf("Failed to publish location: %v", err)
@@ -769,6 +767,9 @@ func (m *ModemService) Run(ctx context.Context) error {
 	go m.monitorStatus(ctx)
 
 	<-ctx.Done()
+
+	m.location.Close()
+
 	return nil
 }
 
@@ -781,6 +782,7 @@ func NewLocationService(logger *log.Logger) *LocationService {
 			antennaVoltage: 3.05,
 		},
 		logger: logger,
+		done:   make(chan bool), // Initialize the done channel
 	}
 }
 
@@ -794,6 +796,11 @@ func (l *LocationService) enableGPS(modemId string) error {
 			time.Sleep(GPSRetryInterval)
 			continue
 		}
+		if err := l.connectToGPSD(); err != nil {
+			l.logger.Printf("Failed to connect to gpsd: %v", err)
+			time.Sleep(GPSRetryInterval)
+			continue
+		}
 		l.enabled = true
 		return nil
 	}
@@ -803,7 +810,14 @@ func (l *LocationService) enableGPS(modemId string) error {
 
 func (l *LocationService) configureGPS() error {
 	// Stop any existing GPS session
-	exec.Command("mmcli", "-m", l.modemId, "--location-disable-3gpp --location-disable-agps-msa --location-disable-agps-msb --location-disable-gps-nmea --location-disable-gps-raw --location-disable-cdma-bs --location-disable-gps-unmanaged").Run()
+	exec.Command("mmcli", "-m", l.modemId,
+		"--location-disable-3gpp",
+		"--location-disable-agps-msa",
+		"--location-disable-agps-msb",
+		"--location-disable-gps-nmea",
+		"--location-disable-gps-raw",
+		"--location-disable-cdma-bs",
+		"--location-disable-gps-unmanaged").Run()
 
 	// Configure SUPL
 	if err := exec.Command("mmcli", "-m", l.modemId,
@@ -811,29 +825,20 @@ func (l *LocationService) configureGPS() error {
 		return fmt.Errorf("failed to set SUPL server: %v", err)
 	}
 
+	// First phase: Enable 3gpp, agps, and gps-unmanaged
+	l.logger.Printf("Enabling 3gpp, agps, and gps-unmanaged location sources")
+
 	// Enable 3GPP location services
 	if err := exec.Command("mmcli", "-m", l.modemId,
 		"--location-enable-3gpp").Run(); err != nil {
 		return fmt.Errorf("failed to enable 3GPP location services: %v", err)
 	}
 
-	// // Enable GPS with A-GPS
-	// if err := exec.Command("mmcli", "-m", l.modemId,
-	// 	"--location-enable-agps-msb").Run(); err != nil {
-	// 	return fmt.Errorf("failed to enable A-GPS: %v", err)
-	// }
-
-	// // Enable GPS
-	// if err := exec.Command("mmcli", "-m", l.modemId,
-	// 	"--location-enable-gps-raw").Run(); err != nil {
-	// 	return fmt.Errorf("failed to enable raw GPS: %v", err)
-	// }
-
-	// // Enable NMEA
-	// if err := exec.Command("mmcli", "-m", l.modemId,
-	// 	"--location-enable-gps-nmea").Run(); err != nil {
-	// 	return fmt.Errorf("failed to enable NMEA GPS: %v", err)
-	// }
+	// Enable GPS with A-GPS
+	if err := exec.Command("mmcli", "-m", l.modemId,
+		"--location-enable-agps-msb").Run(); err != nil {
+		return fmt.Errorf("failed to enable A-GPS: %v", err)
+	}
 
 	// Enable GPS unmanaged
 	if err := exec.Command("mmcli", "-m", l.modemId,
@@ -844,53 +849,69 @@ func (l *LocationService) configureGPS() error {
 	return nil
 }
 
-// TODO also use mmcli -J here instead of parsing NMEA
-func (l *LocationService) updateLocation() error {
-	if !l.enabled {
-		return fmt.Errorf("GPS not enabled")
+func (l *LocationService) connectToGPSD() error {
+	if l.gpsdConn != nil {
+		return nil
 	}
 
-	// Get raw NMEA data
-	out, err := exec.Command("mmcli", "-m", l.modemId, "--location-get").Output()
+	l.logger.Printf("Connecting to gpsd on localhost:2947")
+	conn, err := gpsd.Dial("localhost:2947")
 	if err != nil {
-		return fmt.Errorf("failed to get location: %v", err)
+		panic(err)
+	}
+	if conn == nil {
+		return fmt.Errorf("failed to connect to gpsd")
 	}
 
-	location, err := l.parseLocationData(string(out))
-	if err != nil {
-		return err
-	}
+	l.gpsdConn = conn
 
-	l.location = *location
-	l.lastFix = time.Now()
+	// Add filter for TPV reports (Time-Position-Velocity)
+	l.gpsdConn.AddFilter("TPV", func(r interface{}) {
+		report, ok := r.(*gpsd.TPVReport)
+		if !ok {
+			l.logger.Printf("Error: Could not cast TPV report")
+			return
+		}
+
+		if report.Mode == 1 || report.Mode == 0 {
+			return
+		}
+
+		// Update location from TPV report
+		l.location.Latitude = report.Lat
+		l.location.Longitude = report.Lon
+
+		// These fields are optional
+		if report.Alt != 0 {
+			l.location.Altitude = report.Alt
+		}
+		if report.Speed != 0 {
+			l.location.Speed = report.Speed
+		}
+		if report.Track != 0 {
+			l.location.Course = report.Track
+		}
+
+		// Update timestamp if available
+		if !report.Time.IsZero() {
+			l.location.Timestamp = report.Time
+		} else {
+			l.location.Timestamp = time.Now()
+		}
+
+		l.lastFix = time.Now()
+	})
+
+	l.done = l.gpsdConn.Watch()
+
 	return nil
 }
 
-func (l *LocationService) parseLocationData(data string) (*Location, error) {
-	location := &Location{}
-
-	// Parse latitude
-	latMatch := regexp.MustCompile(`latitude:\s*([-+]?\d*\.\d+)`).FindStringSubmatch(data)
-	if len(latMatch) > 1 {
-		lat, err := strconv.ParseFloat(latMatch[1], 64)
-		if err == nil {
-			location.Latitude = lat
-		}
+func (l *LocationService) Close() {
+	if l.gpsdConn != nil {
+		l.gpsdConn.Close()
+		l.gpsdConn = nil
 	}
-
-	// Parse longitude
-	lonMatch := regexp.MustCompile(`longitude:\s*([-+]?\d*\.\d+)`).FindStringSubmatch(data)
-	if len(lonMatch) > 1 {
-		lon, err := strconv.ParseFloat(lonMatch[1], 64)
-		if err == nil {
-			location.Longitude = lon
-		}
-	}
-
-	// Add timestamp
-	location.Timestamp = time.Now()
-
-	return location, nil
 }
 
 var version string
