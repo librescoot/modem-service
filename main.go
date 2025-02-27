@@ -122,14 +122,15 @@ type Location struct {
 }
 
 type LocationService struct {
-	modemId  string
-	config   GPSConfig
-	lastFix  time.Time
-	location Location
-	enabled  bool
-	logger   *log.Logger
-	gpsdConn *gpsd.Session
-	done     chan bool
+	modemId     string
+	config      GPSConfig
+	lastFix     time.Time
+	location    Location
+	enabled     bool
+	logger      *log.Logger
+	gpsdConn    *gpsd.Session
+	done        chan bool
+	hasValidFix bool
 }
 
 func NewModemHealth() *ModemHealth {
@@ -593,9 +594,13 @@ func (m *ModemService) monitorStatus(ctx context.Context) {
 					}
 				}
 
-				// Publish to Redis
-				if err := m.publishLocationState(m.location.location); err != nil {
-					m.logger.Printf("Failed to publish location: %v", err)
+				// Only publish to Redis if we have a valid fix
+				if m.location.hasValidFix {
+					if err := m.publishLocationState(m.location.location); err != nil {
+						m.logger.Printf("Failed to publish location: %v", err)
+					}
+				} else {
+					m.logger.Printf("Waiting for valid GPS fix...")
 				}
 			}
 		}
@@ -781,8 +786,9 @@ func NewLocationService(logger *log.Logger) *LocationService {
 			accuracyThresh: 50.0,
 			antennaVoltage: 3.05,
 		},
-		logger: logger,
-		done:   make(chan bool), // Initialize the done channel
+		logger:      logger,
+		done:        make(chan bool), // Initialize the done channel
+		hasValidFix: false,           // Initialize to false until we get a valid GPS fix
 	}
 }
 
@@ -874,6 +880,7 @@ func (l *LocationService) connectToGPSD() error {
 		}
 
 		if report.Mode == 1 || report.Mode == 0 {
+			// 0=unknown, 1=no fix
 			return
 		}
 
@@ -900,6 +907,9 @@ func (l *LocationService) connectToGPSD() error {
 		}
 
 		l.lastFix = time.Now()
+		l.hasValidFix = true
+		l.logger.Printf("Received valid GPS fix: latitude=%.6f longitude=%.6f mode=%d",
+			l.location.Latitude, l.location.Longitude, report.Mode)
 	})
 
 	l.done = l.gpsdConn.Watch()
