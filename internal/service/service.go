@@ -13,7 +13,6 @@ import (
 	redisClient "modem-service/internal/redis"
 )
 
-// Service represents the modem service
 type Service struct {
 	Config              *config.Config
 	Redis               *redisClient.Client
@@ -24,7 +23,6 @@ type Service struct {
 	WaitingForGPSLogged bool // Tracks if we've already logged the waiting for GPS message
 }
 
-// New creates a new service
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
 	redis, err := redisClient.New(cfg.RedisURL, logger)
 	if err != nil {
@@ -36,7 +34,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		Redis:               redis,
 		Logger:              logger,
 		Health:              health.New(),
-		Location:            location.NewService(logger),
+		Location:            location.NewService(logger, cfg.GpsdServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
 	}
@@ -46,7 +44,6 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	return service, nil
 }
 
-// Run runs the service
 func (s *Service) Run(ctx context.Context) error {
 	if err := s.Redis.Ping(ctx); err != nil {
 		return fmt.Errorf("redis connection failed: %v", err)
@@ -73,7 +70,6 @@ func (s *Service) Run(ctx context.Context) error {
 	return nil
 }
 
-// ensureModemEnabled ensures the modem is enabled
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	if modem.IsInterfacePresent(s.Config.Interface) {
 		s.Logger.Printf("Modem interface %s is already present", s.Config.Interface)
@@ -89,22 +85,18 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 
 	// Try multiple times with increasing wait times
 	for attempt := range health.MaxRecoveryAttempts {
-		// Calculate wait time for this attempt - increases with each attempt
 		waitTime := min(time.Duration(60*(attempt+1))*time.Second, 300*time.Second)
 
 		s.Logger.Printf("Modem start attempt %d/%d with %v wait time",
 			attempt+1, health.MaxRecoveryAttempts, waitTime)
 
-		// Try to start the modem
 		if err := modem.StartModem(); err != nil {
 			s.Logger.Printf("Failed to start modem: %v", err)
 			continue
 		}
 
-		// Create context with timeout for this attempt
 		attemptCtx, cancel := context.WithTimeout(ctx, waitTime)
 
-		// Wait for modem to come up
 		err := modem.WaitForModem(attemptCtx, s.Config.Interface, s.Logger)
 		cancel()
 
@@ -115,7 +107,6 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 
 		s.Logger.Printf("Modem did not come up after attempt %d: %v", attempt+1, err)
 
-		// If context was canceled, exit retry loop
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -135,7 +126,6 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	return fmt.Errorf("modem failed to come up after multiple attempts, marked as potentially defective")
 }
 
-// checkHealth checks the health of the modem
 func (s *Service) checkHealth() error {
 	// Skip health check if we're in a terminal state
 	if s.Health.IsTerminal() {
@@ -147,49 +137,40 @@ func (s *Service) checkHealth() error {
 		return s.handleModemFailure(fmt.Sprintf("no_modem_found: %v", err))
 	}
 
-	// Check primary port
 	if err := modem.CheckPrimaryPort(modemID); err != nil {
 		return s.handleModemFailure(fmt.Sprintf("wrong_primary_port: %v", err))
 	}
 
-	// Check power state
 	if err := modem.CheckPowerState(modemID); err != nil {
 		return s.handleModemFailure(fmt.Sprintf("wrong_power_state: %v", err))
 	}
 
-	// If we get here, modem is healthy
 	s.Health.MarkNormal()
 	return nil
 }
 
-// handleModemFailure handles modem failure
 func (s *Service) handleModemFailure(reason string) error {
 	s.Logger.Printf("Modem failure detected: %s", reason)
 
-	// If we're already recovering, wait for recovery to complete
 	if s.Health.IsRecovering() {
 		return fmt.Errorf("recovery in progress")
 	}
 
-	// Check if we should attempt recovery
 	if !s.Health.CanRecover() {
 		s.Health.MarkRecoveryFailed()
 		s.publishHealthState(context.Background())
 		return fmt.Errorf("max recovery attempts reached")
 	}
 
-	// Start recovery process
 	return s.attemptRecovery()
 }
 
-// attemptRecovery attempts to recover the modem
 func (s *Service) attemptRecovery() error {
 	s.Health.StartRecovery()
 
 	s.Logger.Printf("Attempting modem recovery (attempt %d/%d)",
 		s.Health.RecoveryAttempts, health.MaxRecoveryAttempts)
 
-	// Publish recovery state
 	s.publishHealthState(context.Background())
 
 	// Try software reset first if modem is present
@@ -200,10 +181,8 @@ func (s *Service) attemptRecovery() error {
 		if err := modem.ResetModem(modemID); err != nil {
 			s.Logger.Printf("Failed to reset modem via mmcli: %v", err)
 		} else {
-			// Wait for software reset to complete
 			time.Sleep(health.RecoveryWaitTime)
 
-			// Check if software reset was successful
 			if err := s.checkHealth(); err == nil {
 				s.Logger.Printf("Modem recovery successful via mmcli reset")
 				s.Health.MarkNormal()
@@ -220,35 +199,29 @@ func (s *Service) attemptRecovery() error {
 		return err
 	}
 
-	// Create a context with timeout for waiting for the modem
 	ctx, cancel := context.WithTimeout(context.Background(), health.RecoveryWaitTime)
 	defer cancel()
 
-	// Wait for modem to come up after GPIO restart
 	if err := modem.WaitForModem(ctx, s.Config.Interface, s.Logger); err != nil {
 		s.Logger.Printf("Modem did not come up after GPIO restart: %v", err)
 		return err
 	}
 
-	// Check if recovery was successful
 	if err := s.checkHealth(); err != nil {
 		s.Logger.Printf("Recovery failed after GPIO restart: %v", err)
 		return err
 	}
 
-	// Recovery successful
 	s.Logger.Printf("Modem recovery successful via GPIO restart")
 	s.Health.MarkNormal()
 	s.publishHealthState(context.Background())
 	return nil
 }
 
-// publishHealthState publishes the health state to Redis
 func (s *Service) publishHealthState(ctx context.Context) error {
 	return s.Redis.PublishModemState(ctx, "internet", "modem-health", s.Health.State)
 }
 
-// publishModemState publishes the modem state to Redis
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State) error {
 	if s.LastState.Status != currentState.Status {
 		s.Logger.Printf("internet modem-state: %s", currentState.Status)
@@ -309,7 +282,6 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	return nil
 }
 
-// publishLocationState publishes the location state to Redis
 func (s *Service) publishLocationState(ctx context.Context, loc location.Location) error {
 	data := map[string]interface{}{
 		"latitude":  fmt.Sprintf("%.6f", loc.Latitude),
@@ -326,28 +298,23 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 	return s.Redis.PublishLocationState(ctx, data)
 }
 
-// checkAndPublishModemStatus checks and publishes the modem status
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
-	// Check modem health
 	if err := s.checkHealth(); err != nil {
 		s.Logger.Printf("Health check failed: %v", err)
 		return err
 	}
 
-	// Get modem info
 	currentState, err := modem.GetModemInfo(s.Config.Interface, s.Logger)
 	if err != nil {
 		s.Logger.Printf("Failed to get modem info: %v", err)
 		currentState.Status = "off"
 	}
 
-	// Publish modem state
 	if err := s.publishModemState(ctx, currentState); err != nil {
 		s.Logger.Printf("Failed to publish state: %v", err)
 		return err
 	}
 
-	// Publish health state
 	if err := s.publishHealthState(ctx); err != nil {
 		s.Logger.Printf("Failed to publish health state: %v", err)
 		return err
@@ -356,7 +323,6 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	return nil
 }
 
-// monitorStatus monitors the modem status
 func (s *Service) monitorStatus(ctx context.Context) {
 	ticker := time.NewTicker(s.Config.InternetCheckTime)
 	gpsTimer := time.NewTicker(location.GPSUpdateInterval)
@@ -382,7 +348,6 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					continue
 				}
 
-				// Ensure GPS is enabled
 				if !s.Location.Enabled {
 					if err := s.Location.EnableGPS(modemID); err != nil {
 						s.Logger.Printf("Failed to enable GPS: %v", err)
@@ -402,9 +367,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.Logger.Printf("Failed to publish location: %v", err)
 					}
 				} else {
-					// No valid fix
 					if !s.WaitingForGPSLogged {
-						// Only log once that we're waiting
 						s.Logger.Printf("Waiting for valid GPS fix...")
 						s.WaitingForGPSLogged = true
 					}

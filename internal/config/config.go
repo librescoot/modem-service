@@ -5,15 +5,14 @@ import (
 	"time"
 )
 
-// Config holds the application configuration
 type Config struct {
 	RedisURL          string
 	PollingTime       time.Duration
 	InternetCheckTime time.Duration
 	Interface         string
+	GpsdServer        string
 }
 
-// New creates a new Config with values from command line flags
 func New() *Config {
 	cfg := &Config{}
 
@@ -21,11 +20,11 @@ func New() *Config {
 	flag.DurationVar(&cfg.PollingTime, "polling-time", 5*time.Second, "Polling interval")
 	flag.DurationVar(&cfg.InternetCheckTime, "internet-check-time", 30*time.Second, "Internet check interval")
 	flag.StringVar(&cfg.Interface, "interface", "wwan0", "Network interface to monitor")
+	flag.StringVar(&cfg.GpsdServer, "gpsd-server", "localhost:2947", "GPSD server address")
 
 	return cfg
 }
 
-// Parse parses the command line flags
 func (c *Config) Parse() {
 	flag.Parse()
 }

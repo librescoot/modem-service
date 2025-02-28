@@ -18,6 +18,7 @@ It is a free and open replacement for the `unu-modem` service on unu's Scooter P
 
 - ModemManager (`mmcli`)
 - Redis
+- gpsd
 
 ## Building / Installing
 
@@ -34,8 +35,8 @@ The service supports the following command-line flags:
 
 | Flag               | Default Value | Description                             |
 |--------------------|---------------|-----------------------------------------|
-| `-redis-host`      | `localhost`   | Redis server hostname                   |
-| `-redis-port`      | `6379`        | Redis server port                       |
+| `-redis-url`       | `redis://127.0.0.1:6379` | Redis URL                    |
+| `-gpsd-server`     | `localhost:2947` | GPSD server address                  |
 | `-polling-time`    | `5s`          | Polling interval for modem checks       |
 | `-internet-check-time` | `30s`     | Interval for internet connectivity checks |
 | `-interface`       | `wwan0`       | Network interface to monitor            |
@@ -78,10 +79,10 @@ The service maintains a Redis hash `internet` with the following keys:
 
 ```bash
 rescoot-modem \
-  --redis-host=redis.example.com \
-  --redis-port=6379 \
-  --interface=wwan0 \
-  --internet-check-time=45s
+  -redis-url redis://redis.example.com:6379 \
+  -interface wwan0 \
+  -internet-check-time 45s \
+  -gpsd-server localhost:2947
 ```
 
 ## Error Handling
