@@ -11,7 +11,7 @@ import (
 	"modem-service/internal/service"
 )
 
-var version string
+var version = "0.2.0" // Default version, can be overridden during build
 
 func main() {
 	// Create logger

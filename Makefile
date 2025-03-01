@@ -1,6 +1,10 @@
 BIN := rescoot-modem
-VERSION := $(shell git describe --always --dirty=-$(shell hostname)-$(shell date -u +%Y%m%d-%H%M%S))
-LDFLAGS := -X main.version=$(VERSION)
+GIT_REV := $(shell git describe --always 2>/dev/null)
+ifdef GIT_REV
+LDFLAGS := -X main.version=$(GIT_REV)
+else
+LDFLAGS :=
+endif
 BUILDFLAGS := -tags netgo,osusergo
 MAIN := ./cmd/modem-service
 
