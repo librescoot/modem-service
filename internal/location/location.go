@@ -63,24 +63,58 @@ func NewService(logger *log.Logger, gpsdServer string) *Service {
 
 func (s *Service) EnableGPS(modemID string) error {
 	s.ModemID = modemID
+	s.Enabled = true
 
-	for attempt := range MaxGPSRetries {
-		if err := s.configureGPS(); err != nil {
-			s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
-			time.Sleep(GPSRetryInterval)
-			continue
-		}
+	go func() {
+		attempt := 0
+		for {
+			if !s.Enabled {
+				return
+			}
 
-		if err := s.connectToGPSD(); err != nil {
-			s.Logger.Printf("Failed to connect to gpsd: %v", err)
+			if s.GpsdConn == nil {
+				s.Logger.Printf("GPS not configured or gpsd connection lost, attempting configuration (attempt %d)", attempt+1)
+
+				if err := s.configureGPS(); err != nil {
+					s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
+					time.Sleep(GPSRetryInterval)
+					attempt++
+					continue
+				}
+
+				if err := s.connectToGPSD(); err != nil {
+					s.Logger.Printf("Failed to connect to gpsd: %v", err)
+					time.Sleep(GPSRetryInterval)
+					attempt++
+					continue
+				}
+
+				s.Logger.Printf("Successfully connected to gpsd")
+				attempt = 0
+			}
+
+			if s.HasValidFix && time.Since(s.LastFix) > GPSTimeout {
+				s.Logger.Printf("No GPS updates received for %v, reconnecting", GPSTimeout)
+				if s.GpsdConn != nil {
+					s.GpsdConn.Close()
+					s.GpsdConn = nil
+				}
+				continue
+			}
+
 			time.Sleep(GPSRetryInterval)
-			continue
 		}
-		s.Enabled = true
-		return nil
+	}()
+
+	if err := s.configureGPS(); err != nil {
+		s.Logger.Printf("Initial GPS configuration failed: %v", err)
 	}
 
-	return fmt.Errorf("failed to configure GPS after %d attempts", MaxGPSRetries)
+	if err := s.connectToGPSD(); err != nil {
+		s.Logger.Printf("Initial connection to gpsd failed: %v", err)
+	}
+
+	return nil
 }
 
 func (s *Service) configureGPS() error {
@@ -103,6 +137,25 @@ func (s *Service) configureGPS() error {
 
 		for _, enabled := range status.Enabled {
 			sourcesEnabled[enabled] = true
+		}
+	}
+
+	var conflictingSources []string
+
+	if sourcesEnabled["gps-nmea"] {
+		s.Logger.Printf("Disabling conflicting gps-nmea location source")
+		conflictingSources = append(conflictingSources, "--location-disable-gps-nmea")
+	}
+
+	if sourcesEnabled["gps-raw"] {
+		s.Logger.Printf("Disabling conflicting gps-raw location source")
+		conflictingSources = append(conflictingSources, "--location-disable-gps-raw")
+	}
+
+	if len(conflictingSources) > 0 {
+		args := append([]string{"-m", s.ModemID}, conflictingSources...)
+		if err := exec.Command("mmcli", args...).Run(); err != nil {
+			s.Logger.Printf("Warning: Failed to disable conflicting location sources: %v", err)
 		}
 	}
 
@@ -135,10 +188,8 @@ func (s *Service) configureGPS() error {
 			return fmt.Errorf("failed to set SUPL server: %v", err)
 		}
 	} else {
-		s.Logger.Printf("SUPL server already set correctly, skipping configuration")
+		s.Logger.Printf("SUPL server already set correctly")
 	}
-
-	s.Logger.Printf("Ensuring 3gpp-lac-ci, agps-msb, and gps-unmanaged location sources are enabled")
 
 	if !sourcesEnabled["3gpp-lac-ci"] {
 		if err := exec.Command("mmcli", "-m", s.ModemID,
@@ -175,7 +226,9 @@ func (s *Service) configureGPS() error {
 
 func (s *Service) connectToGPSD() error {
 	if s.GpsdConn != nil {
-		return nil
+		s.Logger.Printf("Closing existing gpsd connection")
+		s.GpsdConn.Close()
+		s.GpsdConn = nil
 	}
 
 	s.Logger.Printf("Connecting to gpsd on %s", s.GpsdServer)
@@ -222,8 +275,6 @@ func (s *Service) connectToGPSD() error {
 
 		s.LastFix = time.Now()
 		s.HasValidFix = true
-		// s.Logger.Printf("Received valid GPS fix: latitude=%.6f longitude=%.6f mode=%d",
-		// 	s.CurrentLoc.Latitude, s.CurrentLoc.Longitude, report.Mode)
 	})
 
 	s.Done = s.GpsdConn.Watch()
@@ -232,6 +283,7 @@ func (s *Service) connectToGPSD() error {
 }
 
 func (s *Service) Close() {
+	s.Enabled = false
 	if s.GpsdConn != nil {
 		s.GpsdConn.Close()
 		s.GpsdConn = nil

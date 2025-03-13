@@ -1,8 +1,8 @@
-# Rescoot Modem Service
+# Librescoot Modem Service
 
 ## Overview
 
-The Rescoot Modem Service is a Go-based monitoring tool designed to track and manage cellular modem connectivity using ModemManager, with state synchronization through Redis.
+The Librescoot Modem Service is a Go-based monitoring tool designed to track and manage cellular modem connectivity using ModemManager, with state synchronization through Redis.
 
 It is a free and open replacement for the `unu-modem` service on unu's Scooter Pro.
 
@@ -25,7 +25,6 @@ It is a free and open replacement for the `unu-modem` service on unu's Scooter P
 Assuming your mdb is connected via USB Ethernet as 192.168.7.1 and aliased as `mdb`;
 ```bash
 make dist
-ssh root@mdb mkdir -p /etc/rescoot /etc/librescoot
 scp rescoot-modem-arm-dist root@mdb:/usr/bin/rescoot-modem
 ```
 
@@ -53,11 +52,18 @@ The service monitors and publishes the following modem state attributes:
 - IMEI
 - ICCID
 
+## GPS Location Tracking
+
+The service configures the modem location ports to unmanaged mode for gpsd use.
+Position, altitude, speed and course information is forwarded from gpsd to
+Redis for consumption by other components.
+
 ## Redis Integration
 
 The service uses Redis to:
 - Store current modem state
 - Publish state change notifications on the `internet` channel
+- Publish GPS information
 
 ### Redis Hash Structure
 
@@ -87,4 +93,4 @@ rescoot-modem \
 
 ## Error Handling
 
-The service logs errors and attempts to maintain the most recent known state. If modem information cannot be retrieved or internet connectivity is lost, the service will update the state accordingly.
+The service logs errors and attempts to maintain the most recent known state. If modem information cannot be retrieved, internet connectivity is lost, or GPS connection fails, the service will update the state accordingly and automatically attempt to recover.
