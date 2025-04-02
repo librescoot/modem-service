@@ -113,10 +113,14 @@ func (s *Service) EnableGPS(modemID string) error {
 
 	if err := s.configureGPS(); err != nil {
 		s.Logger.Printf("Initial GPS configuration failed: %v", err)
+		s.State = "error"
+		return err
 	}
 
 	if err := s.connectToGPSD(); err != nil {
 		s.Logger.Printf("Initial connection to gpsd failed: %v", err)
+		s.State = "error"
+		return err
 	}
 
 	return nil
