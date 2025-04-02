@@ -47,6 +47,7 @@ type Service struct {
 	FixMode       string  // "none", "2d", "3d"
 	Quality       float64 // DOP value
 	GpsdConnected bool
+	State         string // "off", "searching", "fix-established", "error"
 }
 
 func NewService(logger *log.Logger, gpsdServer string) *Service {
@@ -61,6 +62,7 @@ func NewService(logger *log.Logger, gpsdServer string) *Service {
 		GpsdServer:  gpsdServer,
 		Done:        make(chan bool),
 		HasValidFix: false,
+		State:       "off",
 	}
 }
 
@@ -249,6 +251,7 @@ func (s *Service) connectToGPSD() error {
 		report, ok := r.(*gpsd.TPVReport)
 		if !ok {
 			s.Logger.Printf("Error: Could not cast TPV report")
+			s.State = "error"
 			return
 		}
 
@@ -256,12 +259,16 @@ func (s *Service) connectToGPSD() error {
 		switch report.Mode {
 		case 0:
 			s.FixMode = "none"
+			s.State = "searching"
 		case 1:
 			s.FixMode = "none"
+			s.State = "searching"
 		case 2:
 			s.FixMode = "2d"
+			s.State = "fix-established"
 		case 3:
 			s.FixMode = "3d"
+			s.State = "fix-established"
 		}
 
 		// Update quality metrics
@@ -306,6 +313,7 @@ func (s *Service) connectToGPSD() error {
 
 func (s *Service) Close() {
 	s.Enabled = false
+	s.State = "off"
 	if s.GpsdConn != nil {
 		s.GpsdConn.Close()
 		s.GpsdConn = nil
@@ -319,5 +327,6 @@ func (s *Service) GetGPSStatus() map[string]interface{} {
 		"quality":   s.Quality,
 		"active":    s.HasValidFix,
 		"connected": s.GpsdConnected,
+		"state":     s.State,
 	}
 }
