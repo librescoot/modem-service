@@ -83,11 +83,23 @@ The service maintains a Redis hash `internet` with the following keys:
 - `sim-iccid` ICCID (unique SIM card identifier)
 
 Location information is tracked in a Redis hash `gps` with the keys:
-- `latitude`, `longitude`: Current GPS lat/lon with 6 decimals
-- `altitude`: Current GPS altitude
-- `speed`: Current GPS speed in km/h
-- `course`: Current GPS course (heading) in degrees
-- `timestamp`: GPS timestamp
+- `latitude`, `longitude` Current GPS lat/lon with 6 decimals
+- `altitude` Current GPS altitude
+- `speed` Current GPS speed in km/h
+- `course` Current GPS course (heading) in degrees
+- `timestamp` GPS timestamp
+- `state` GPS state with the following possible values:
+  - `off` GPS is disabled (initial state)
+  - `searching` Actively searching for GPS signal
+  - `fix-established` Valid GPS fix obtained (2D or 3D)
+  - `error` GPS configuration or connection failed
+
+GPS state transitions occur when:
+1. Enabling GPS: `off` → `searching`
+2. Getting first fix: `searching` → `fix-established`
+3. Losing fix: `fix-established` → `searching`
+4. Configuration failure: `searching` → `error`
+5. Disabling GPS: any state → `off`
 
 ## Usage
 
