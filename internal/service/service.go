@@ -292,8 +292,11 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 		"timestamp": loc.Timestamp.Format(time.RFC3339),
 	}
 
-	// s.Logger.Printf("Published location to redis: latitude=%.6f longitude=%.6f altitude=%.6f speed=%.6f course=%.6f timestamp=%s",
-	// 	loc.Latitude, loc.Longitude, loc.Altitude, loc.Speed, loc.Course, loc.Timestamp.Format(time.RFC3339))
+	// Add GPS status fields
+	gpsStatus := s.Location.GetGPSStatus()
+	for k, v := range gpsStatus {
+		data[k] = v
+	}
 
 	return s.Redis.PublishLocationState(ctx, data)
 }
@@ -355,8 +358,9 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					}
 				}
 
-				// Only publish to Redis if we have a valid fix
-				if s.Location.HasValidFix {
+				// Always publish GPS status, even without valid fix
+				gpsStatus := s.Location.GetGPSStatus()
+				if gpsStatus["active"].(bool) {
 					// If we were waiting (flag is true), log that we got a fix
 					if s.WaitingForGPSLogged {
 						s.Logger.Printf("GPS fix established")
@@ -370,6 +374,17 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					if !s.WaitingForGPSLogged {
 						s.Logger.Printf("Waiting for valid GPS fix...")
 						s.WaitingForGPSLogged = true
+					}
+
+					// Publish just the status without location data
+					data := map[string]interface{}{
+						"fix":       gpsStatus["fix"],
+						"quality":   gpsStatus["quality"],
+						"active":    gpsStatus["active"],
+						"connected": gpsStatus["connected"],
+					}
+					if err := s.Redis.PublishLocationState(ctx, data); err != nil {
+						s.Logger.Printf("Failed to publish GPS status: %v", err)
 					}
 				}
 			}

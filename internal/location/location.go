@@ -34,16 +34,19 @@ type Location struct {
 }
 
 type Service struct {
-	ModemID     string
-	Config      Config
-	LastFix     time.Time
-	CurrentLoc  Location
-	Enabled     bool
-	Logger      *log.Logger
-	GpsdConn    *gpsd.Session
-	GpsdServer  string
-	Done        chan bool
-	HasValidFix bool
+	ModemID       string
+	Config        Config
+	LastFix       time.Time
+	CurrentLoc    Location
+	Enabled       bool
+	Logger        *log.Logger
+	GpsdConn      *gpsd.Session
+	GpsdServer    string
+	Done          chan bool
+	HasValidFix   bool
+	FixMode       string  // "none", "2d", "3d"
+	Quality       float64 // DOP value
+	GpsdConnected bool
 }
 
 func NewService(logger *log.Logger, gpsdServer string) *Service {
@@ -249,8 +252,24 @@ func (s *Service) connectToGPSD() error {
 			return
 		}
 
+		// Update fix status
+		switch report.Mode {
+		case 0:
+			s.FixMode = "none"
+		case 1:
+			s.FixMode = "none"
+		case 2:
+			s.FixMode = "2d"
+		case 3:
+			s.FixMode = "3d"
+		}
+
+		// Update quality metrics
+		s.Quality = report.Ept // Using estimated time precision as quality metric
+
 		if report.Mode == 1 || report.Mode == 0 {
 			// 0=unknown, 1=no fix
+			s.HasValidFix = false
 			return
 		}
 
@@ -277,6 +296,9 @@ func (s *Service) connectToGPSD() error {
 		s.HasValidFix = true
 	})
 
+	// Track gpsd connection state
+	s.GpsdConnected = true
+
 	s.Done = s.GpsdConn.Watch()
 
 	return nil
@@ -287,5 +309,15 @@ func (s *Service) Close() {
 	if s.GpsdConn != nil {
 		s.GpsdConn.Close()
 		s.GpsdConn = nil
+	}
+	s.GpsdConnected = false
+}
+
+func (s *Service) GetGPSStatus() map[string]interface{} {
+	return map[string]interface{}{
+		"fix":       s.FixMode,
+		"quality":   s.Quality,
+		"active":    s.HasValidFix,
+		"connected": s.GpsdConnected,
 	}
 }
