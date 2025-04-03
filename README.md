@@ -67,7 +67,9 @@ The service uses Redis to:
 
 ### Redis Hash Structure
 
-The service maintains a Redis hash `internet` with the following keys:
+The service maintains various Redis hashes:
+
+#### `internet` hash
 - `modem-health` (`normal`, `recovering`, `recovery-failed-waiting-reboot`, `permanent-failure-needs-replacement`)
 - `modem-state` (`off`, `disconnected`, `connected`, or `UNKNOWN`)
 - `ip-address` (external IPv4 address or `UNKNOWN`)
@@ -81,6 +83,17 @@ The service maintains a Redis hash `internet` with the following keys:
 - `sim-imei` IMEI (unique hardware identifier) (this actually identifies the modem, but the name is kept for backward compatibility)
 - `sim-imsi` IMSI (unique subscriber identity)
 - `sim-iccid` ICCID (unique SIM card identifier)
+
+#### `modem` hash
+- `power-state` (on/off/low-power)
+- `sim-state` (active/locked/missing/unknown)
+- `sim-lock` (enabled/disabled/unknown)
+- `operator-name` (current network operator name)
+- `operator-code` (current network operator code)
+- `is-roaming` (true/false)
+- `registration-fail` (reason if registration failed)
+
+#### `gps` hash
 
 Location information is tracked in a Redis hash `gps` with the keys:
 - `latitude`, `longitude` Current GPS lat/lon with 6 decimals

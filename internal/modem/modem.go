@@ -20,6 +20,29 @@ const (
 	SignalQualityDefault = 255
 )
 
+// Modem power states
+const (
+	PowerStateOn  = "on"
+	PowerStateOff = "off"
+)
+
+// SIM states
+const (
+	SIMStatePresent  = "present"
+	SIMStateMissing  = "missing"
+	SIMStateLocked   = "locked"
+	SIMStateInactive = "inactive"
+)
+
+// Registration states
+const (
+	RegistrationHome    = "home"
+	RegistrationRoaming = "roaming"
+	RegistrationDenied  = "denied"
+	RegistrationFailed  = "failed"
+	RegistrationUnknown = "unknown"
+)
+
 // GPIO Control constants
 const (
 	GPIOPin        = 110
@@ -29,26 +52,40 @@ const (
 
 // State represents the current state of the modem
 type State struct {
-	Status        string
-	AccessTech    string
-	SignalQuality uint8
-	IPAddr        string
-	IfIPAddr      string
-	Registration  string
-	IMEI          string
-	IMSI          string
-	ICCID         string
+	Status           string
+	AccessTech       string
+	SignalQuality    uint8
+	IPAddr           string
+	IfIPAddr         string
+	Registration     string
+	IMEI             string
+	IMSI             string
+	ICCID            string
+	PowerState       string
+	SIMState         string
+	SIMLockStatus    string
+	OperatorName     string
+	OperatorCode     string
+	IsRoaming        bool
+	RegistrationFail string
 }
 
 // NewState creates a new modem state with default values
 func NewState() *State {
 	return &State{
-		Status:        StateDefault,
-		AccessTech:    AccessTechDefault,
-		SignalQuality: SignalQualityDefault,
-		IPAddr:        "UNKNOWN",
-		IfIPAddr:      "UNKNOWN",
-		Registration:  "",
+		Status:           StateDefault,
+		AccessTech:       AccessTechDefault,
+		SignalQuality:    SignalQualityDefault,
+		IPAddr:           "UNKNOWN",
+		IfIPAddr:         "UNKNOWN",
+		Registration:     "",
+		PowerState:       PowerStateOff,
+		SIMState:         SIMStateMissing,
+		SIMLockStatus:    "",
+		OperatorName:     "",
+		OperatorCode:     "",
+		IsRoaming:        false,
+		RegistrationFail: "",
 	}
 }
 
@@ -84,6 +121,7 @@ func GetModemInfo(interfaceName string, logger *log.Logger) (*State, error) {
 
 	modemID, err := FindModemID()
 	if err != nil {
+		state.Status = "no-modem"
 		return state, err
 	}
 
@@ -92,21 +130,61 @@ func GetModemInfo(interfaceName string, logger *log.Logger) (*State, error) {
 		return state, err
 	}
 
-	simInfo, err := mmcli.GetSIMInfo(strings.Split(mm.Modem.Generic.SIM, "/")[5])
-	if err != nil {
-		return state, err
+	// Set power state
+	state.PowerState = mm.Modem.Generic.PowerState
+
+	// Handle SIM state
+	if mm.Modem.Generic.SIM == "" || mm.Modem.Generic.SIM == "--" {
+		state.SIMState = SIMStateMissing
+	} else {
+		simInfo, err := mmcli.GetSIMInfo(strings.Split(mm.Modem.Generic.SIM, "/")[5])
+		if err != nil {
+			state.SIMState = SIMStateMissing
+		} else {
+			state.SIMState = SIMStatePresent
+			state.IMSI = simInfo.Properties.IMSI
+			state.ICCID = simInfo.Properties.ICCID
+			state.OperatorName = simInfo.Properties.OperatorName
+			state.OperatorCode = simInfo.Properties.OperatorCode
+
+			if simInfo.Properties.Active != "yes" {
+				state.SIMState = SIMStateInactive
+			}
+		}
 	}
 
-	state.IMSI = simInfo.Properties.IMSI
-	state.ICCID = simInfo.Properties.ICCID
+	// Set SIM lock status
+	if mm.Modem.Generic.UnlockRequired != "" && mm.Modem.Generic.UnlockRequired != "none" {
+		state.SIMLockStatus = mm.Modem.Generic.UnlockRequired
+	}
 
+	// Set signal quality
 	if quality, err := mm.SignalStrength(); err == nil {
 		state.SignalQuality = uint8(quality)
 	}
 
+	// Set access tech and IMEI
 	state.AccessTech = mm.GetCurrentAccessTechnology()
 	state.IMEI = mm.Modem.ThreeGPP.IMEI
 
+	// Set registration state
+	switch mm.Modem.ThreeGPP.RegistrationState {
+	case "home":
+		state.Registration = RegistrationHome
+		state.IsRoaming = false
+	case "roaming":
+		state.Registration = RegistrationRoaming
+		state.IsRoaming = true
+	case "denied":
+		state.Registration = RegistrationDenied
+		state.RegistrationFail = mm.Modem.Generic.StateFailedReason
+	case "searching", "registered":
+		// No special handling
+	default:
+		state.Registration = RegistrationUnknown
+	}
+
+	// Set connection status
 	switch {
 	case mm.Modem.Generic.PowerState != "on":
 		state.Status = "off"

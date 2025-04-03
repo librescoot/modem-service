@@ -33,14 +33,27 @@ func (c *Client) Ping(ctx context.Context) error {
 	return c.client.Ping(ctx).Err()
 }
 
-// PublishModemState publishes modem state to Redis
-func (c *Client) PublishModemState(ctx context.Context, key, field, value string) error {
+// PublishInternetState publishes modem state to Redis
+func (c *Client) PublishInternetState(ctx context.Context, key, field, value string) error {
 	pipe := c.client.Pipeline()
 	pipe.HSet(ctx, "internet", field, value)
 	pipe.Publish(ctx, "internet", field)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		c.logger.Printf("Unable to set %s in redis: %v", field, err)
+		return fmt.Errorf("cannot write to redis: %v", err)
+	}
+	return nil
+}
+
+// PublishModemState publishes modem state to Redis under modem hash
+func (c *Client) PublishModemState(ctx context.Context, field, value string) error {
+	pipe := c.client.Pipeline()
+	pipe.HSet(ctx, "modem", field, value)
+	pipe.Publish(ctx, "modem", field)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		c.logger.Printf("Unable to set modem.%s in redis: %v", field, err)
 		return fmt.Errorf("cannot write to redis: %v", err)
 	}
 	return nil

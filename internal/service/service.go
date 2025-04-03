@@ -219,13 +219,13 @@ func (s *Service) attemptRecovery() error {
 }
 
 func (s *Service) publishHealthState(ctx context.Context) error {
-	return s.Redis.PublishModemState(ctx, "internet", "modem-health", s.Health.State)
+	return s.Redis.PublishInternetState(ctx, "internet", "modem-health", s.Health.State)
 }
 
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State) error {
 	if s.LastState.Status != currentState.Status {
 		s.Logger.Printf("internet modem-state: %s", currentState.Status)
-		if err := s.Redis.PublishModemState(ctx, "internet", "modem-state", currentState.Status); err != nil {
+		if err := s.Redis.PublishInternetState(ctx, "internet", "modem-state", currentState.Status); err != nil {
 			return err
 		}
 		s.LastState.Status = currentState.Status
@@ -233,7 +233,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.IfIPAddr != currentState.IfIPAddr {
 		s.Logger.Printf("internet ip-address: %s", currentState.IfIPAddr)
-		if err := s.Redis.PublishModemState(ctx, "internet", "ip-address", currentState.IfIPAddr); err != nil {
+		if err := s.Redis.PublishInternetState(ctx, "internet", "ip-address", currentState.IfIPAddr); err != nil {
 			return err
 		}
 		s.LastState.IfIPAddr = currentState.IfIPAddr
@@ -241,7 +241,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.AccessTech != currentState.AccessTech {
 		s.Logger.Printf("internet access-tech: %s", currentState.AccessTech)
-		if err := s.Redis.PublishModemState(ctx, "internet", "access-tech", currentState.AccessTech); err != nil {
+		if err := s.Redis.PublishInternetState(ctx, "internet", "access-tech", currentState.AccessTech); err != nil {
 			return err
 		}
 		s.LastState.AccessTech = currentState.AccessTech
@@ -249,15 +249,71 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.SignalQuality != currentState.SignalQuality {
 		s.Logger.Printf("internet signal-quality: %d", currentState.SignalQuality)
-		if err := s.Redis.PublishModemState(ctx, "internet", "signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
+		if err := s.Redis.PublishInternetState(ctx, "internet", "signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
 			return err
 		}
 		s.LastState.SignalQuality = currentState.SignalQuality
 	}
 
+	if s.LastState.PowerState != currentState.PowerState {
+		s.Logger.Printf("modem power-state: %s", currentState.PowerState)
+		if err := s.Redis.PublishModemState(ctx, "power-state", currentState.PowerState); err != nil {
+			return err
+		}
+		s.LastState.PowerState = currentState.PowerState
+	}
+
+	if s.LastState.SIMState != currentState.SIMState {
+		s.Logger.Printf("modem sim-state: %s", currentState.SIMState)
+		if err := s.Redis.PublishModemState(ctx, "sim-state", currentState.SIMState); err != nil {
+			return err
+		}
+		s.LastState.SIMState = currentState.SIMState
+	}
+
+	if s.LastState.SIMLockStatus != currentState.SIMLockStatus {
+		s.Logger.Printf("modem sim-lock: %s", currentState.SIMLockStatus)
+		if err := s.Redis.PublishModemState(ctx, "sim-lock", currentState.SIMLockStatus); err != nil {
+			return err
+		}
+		s.LastState.SIMLockStatus = currentState.SIMLockStatus
+	}
+
+	if s.LastState.OperatorName != currentState.OperatorName {
+		s.Logger.Printf("operator name: %s", currentState.OperatorName)
+		if err := s.Redis.PublishModemState(ctx, "operator-name", currentState.OperatorName); err != nil {
+			return err
+		}
+		s.LastState.OperatorName = currentState.OperatorName
+	}
+
+	if s.LastState.OperatorCode != currentState.OperatorCode {
+		s.Logger.Printf("operator code: %s", currentState.OperatorCode)
+		if err := s.Redis.PublishModemState(ctx, "operator-code", currentState.OperatorCode); err != nil {
+			return err
+		}
+		s.LastState.OperatorCode = currentState.OperatorCode
+	}
+
+	if s.LastState.IsRoaming != currentState.IsRoaming {
+		s.Logger.Printf("roaming: %t", currentState.IsRoaming)
+		if err := s.Redis.PublishModemState(ctx, "is-roaming", fmt.Sprintf("%t", currentState.IsRoaming)); err != nil {
+			return err
+		}
+		s.LastState.IsRoaming = currentState.IsRoaming
+	}
+
+	if s.LastState.RegistrationFail != currentState.RegistrationFail {
+		s.Logger.Printf("registration-fail: %s", currentState.RegistrationFail)
+		if err := s.Redis.PublishModemState(ctx, "registration-fail", currentState.RegistrationFail); err != nil {
+			return err
+		}
+		s.LastState.RegistrationFail = currentState.RegistrationFail
+	}
+
 	if s.LastState.IMEI != currentState.IMEI {
 		s.Logger.Printf("modem IMEI: %s", currentState.IMEI)
-		if err := s.Redis.PublishModemState(ctx, "internet", "sim-imei", currentState.IMEI); err != nil {
+		if err := s.Redis.PublishInternetState(ctx, "internet", "sim-imei", currentState.IMEI); err != nil {
 			return err
 		}
 		s.LastState.IMEI = currentState.IMEI
@@ -265,7 +321,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.IMSI != currentState.IMSI {
 		s.Logger.Printf("SIM IMSI: %s", currentState.IMSI)
-		if err := s.Redis.PublishModemState(ctx, "internet", "sim-imsi", currentState.IMSI); err != nil {
+		if err := s.Redis.PublishInternetState(ctx, "internet", "sim-imsi", currentState.IMSI); err != nil {
 			return err
 		}
 		s.LastState.IMSI = currentState.IMSI
@@ -273,7 +329,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.ICCID != currentState.ICCID {
 		s.Logger.Printf("SIM ICCID: %s", currentState.ICCID)
-		if err := s.Redis.PublishModemState(ctx, "internet", "sim-iccid", currentState.ICCID); err != nil {
+		if err := s.Redis.PublishInternetState(ctx, "internet", "sim-iccid", currentState.ICCID); err != nil {
 			return err
 		}
 		s.LastState.ICCID = currentState.ICCID
