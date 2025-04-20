@@ -224,8 +224,8 @@ func (s *Service) publishHealthState(ctx context.Context) error {
 
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State) error {
 	if s.LastState.Status != currentState.Status {
-		s.Logger.Printf("internet modem-state: %s", currentState.Status)
-		if err := s.Redis.PublishInternetState(ctx, "internet", "modem-state", currentState.Status); err != nil {
+		s.Logger.Printf("internet status: %s", currentState.Status)
+		if err := s.Redis.PublishInternetState(ctx, "internet", "status", currentState.Status); err != nil {
 			return err
 		}
 		s.LastState.Status = currentState.Status
