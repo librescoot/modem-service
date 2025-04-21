@@ -1,5 +1,5 @@
 BIN := rescoot-modem
-GIT_REV := $(shell git describe --always 2>/dev/null)
+GIT_REV := $(shell git describe --tags --always 2>/dev/null)
 ifdef GIT_REV
 LDFLAGS := -X main.version=$(GIT_REV)
 else
