@@ -192,11 +192,11 @@ func (s *Service) attemptRecovery() error {
 		}
 	}
 
-	// If software reset failed or modem not found, try hardware reset via GPIO
-	s.Logger.Printf("Attempting to restart modem via GPIO pin %d", modem.GPIOPin)
-	if err := modem.RestartModem(); err != nil {
-		s.Logger.Printf("Failed to restart modem via GPIO: %v", err)
-		return err
+	// If software reset failed or modem not found, try hardware reset via GPIO (which now includes mmcli fallback)
+	s.Logger.Printf("Attempting modem restart (GPIO with mmcli fallback)...")
+	if err := modem.RestartModem(s.Logger); err != nil {
+		s.Logger.Printf("Modem restart attempt failed: %v", err)
+		return err // Return the combined error from RestartModem
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), health.RecoveryWaitTime)
@@ -222,15 +222,20 @@ func (s *Service) publishHealthState(ctx context.Context) error {
 	return s.Redis.PublishInternetState(ctx, "internet", "modem-health", s.Health.State)
 }
 
-func (s *Service) publishModemState(ctx context.Context, currentState *modem.State) error {
-	if s.LastState.Status != currentState.Status {
-		s.Logger.Printf("internet status: %s", currentState.Status)
-		if err := s.Redis.PublishInternetState(ctx, "internet", "status", currentState.Status); err != nil {
+// publishModemState publishes the detailed modem and derived internet state to Redis.
+// It now takes the determined internetStatus as an argument.
+func (s *Service) publishModemState(ctx context.Context, currentState *modem.State, internetStatus string) error {
+	// Publish the actual internet connectivity status
+	// Compare with LastState.Status which now stores the *last published internet status*
+	if s.LastState.Status != internetStatus {
+		s.Logger.Printf("internet status: %s", internetStatus)
+		if err := s.Redis.PublishInternetState(ctx, "internet", "status", internetStatus); err != nil {
 			return err
 		}
-		s.LastState.Status = currentState.Status
+		s.LastState.Status = internetStatus // Store the published internet status
 	}
 
+	// Publish modem's reported IP address (might be present even if ping fails)
 	if s.LastState.IfIPAddr != currentState.IfIPAddr {
 		s.Logger.Printf("internet ip-address: %s", currentState.IfIPAddr)
 		if err := s.Redis.PublishInternetState(ctx, "internet", "ip-address", currentState.IfIPAddr); err != nil {
@@ -360,17 +365,42 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	if err := s.checkHealth(); err != nil {
 		s.Logger.Printf("Health check failed: %v", err)
+		// If health check fails, assume disconnected and publish minimal state
+		s.publishModemState(ctx, modem.NewState(), "disconnected")
+		s.publishHealthState(ctx)
 		return err
 	}
 
 	currentState, err := modem.GetModemInfo(s.Config.Interface, s.Logger)
 	if err != nil {
 		s.Logger.Printf("Failed to get modem info: %v", err)
-		currentState.Status = "off"
+		// Treat as uninitialized modem
+		s.publishModemState(ctx, modem.NewState(), "disconnected")
+		s.publishHealthState(ctx)
+		return err
 	}
 
-	if err := s.publishModemState(ctx, currentState); err != nil {
+	internetStatus := "disconnected"
+	if currentState.Status == "connected" {
+		// Modem reports connected, perform a real connectivity check
+		connected, pingErr := health.CheckInternetConnectivity(ctx, s.Config.Interface)
+		if connected {
+			internetStatus = "connected"
+		} else {
+			if pingErr != nil {
+				s.Logger.Printf("Internet connectivity check failed: %v", pingErr)
+			} else {
+				s.Logger.Printf("Internet connectivity check failed (ping unsuccessful)")
+			}
+			internetStatus = "disconnected"
+		}
+	} else {
+		internetStatus = "disconnected"
+	}
+
+	if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
 		s.Logger.Printf("Failed to publish state: %v", err)
+		s.publishHealthState(ctx)
 		return err
 	}
 

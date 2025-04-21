@@ -276,25 +276,80 @@ func StartModem() error {
 	return nil
 }
 
-// RestartModem restarts the modem
-func RestartModem() error {
-	if err := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
-		return fmt.Errorf("failed to export GPIO pin: %v", err)
+// RestartModem restarts the modem, attempting GPIO first and falling back to mmcli reset.
+func RestartModem(logger *log.Logger) error {
+	logger.Printf("Attempting modem restart via GPIO pin %d...", GPIOPin)
+	gpioErr := attemptGPIORestart()
+
+	if gpioErr == nil {
+		logger.Printf("Modem restart via GPIO successful.")
+		return nil
 	}
 
-	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/direction", GPIOPin), []byte("out"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO direction: %v", err)
+	// GPIO failed, log warning and attempt mmcli reset as fallback
+	logger.Printf("WARN: Modem restart via GPIO failed (%v), attempting fallback via mmcli reset...", gpioErr)
+
+	modemID, findErr := FindModemID()
+	if findErr != nil {
+		// Cannot find modem to reset via mmcli either
+		return fmt.Errorf("GPIO restart failed (%v) and cannot find modem for mmcli reset (%v)", gpioErr, findErr)
 	}
 
-	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", GPIOPin), []byte("1"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value high: %v", err)
+	logger.Printf("Found modem %s, attempting mmcli reset.", modemID)
+	resetErr := ResetModem(modemID)
+	if resetErr != nil {
+		return fmt.Errorf("GPIO restart failed (%v) and mmcli reset failed (%v)", gpioErr, resetErr)
+	}
+
+	logger.Printf("Modem restart via mmcli reset successful.")
+	return nil
+}
+
+// attemptGPIORestart performs the modem restart sequence using GPIO.
+func attemptGPIORestart() error {
+	_, err := os.Stat(fmt.Sprintf("/sys/class/gpio/gpio%d", GPIOPin))
+	isAlreadyExported := err == nil
+
+	if !isAlreadyExported {
+		if err := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
+			// Check if the error is specifically "Device or resource busy" which often means already exported
+			if !strings.Contains(err.Error(), "Device or resource busy") {
+				return fmt.Errorf("failed to export GPIO pin %d: %w", GPIOPin, err)
+			}
+			// If it is busy/exported, ignore the error and proceed
+		}
+	}
+
+	// Set direction (might also fail if already set correctly by another process)
+	directionPath := fmt.Sprintf("/sys/class/gpio/gpio%d/direction", GPIOPin)
+	if err := os.WriteFile(directionPath, []byte("out"), 0644); err != nil {
+		// Read current direction to see if it's already 'out'
+		currentDirection, readErr := os.ReadFile(directionPath)
+		if readErr != nil || strings.TrimSpace(string(currentDirection)) != "out" {
+			return fmt.Errorf("failed to set GPIO direction for pin %d: %w (current: %s, readErr: %v)", GPIOPin, err, string(currentDirection), readErr)
+		}
+		// If already 'out', ignore the WriteFile error
+	}
+
+	// Set value high
+	valuePath := fmt.Sprintf("/sys/class/gpio/gpio%d/value", GPIOPin)
+	if err := os.WriteFile(valuePath, []byte("1"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value high for pin %d: %w", GPIOPin, err)
 	}
 
 	time.Sleep(3500 * time.Millisecond)
 
-	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", GPIOPin), []byte("0"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value low: %v", err)
+	// Set value low
+	if err := os.WriteFile(valuePath, []byte("0"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value low for pin %d: %w", GPIOPin, err)
 	}
+
+	// if !isAlreadyExported {
+	// 	if err := os.WriteFile("/sys/class/gpio/unexport", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
+	// 		// Log warning, but don't fail the restart for unexport failure
+	// 		fmt.Printf("WARN: Failed to unexport GPIO pin %d: %v\n", GPIOPin, err)
+	// 	}
+	// }
 
 	return nil
 }
