@@ -220,12 +220,27 @@ func (s *Service) configureGPS() error {
 		s.Logger.Printf("agps-msb location source already enabled")
 	}
 
+	// Add a small delay before enabling the final, critical source
+	time.Sleep(500 * time.Millisecond)
+
 	if !sourcesEnabled["gps-unmanaged"] {
-		if err := exec.Command("mmcli", "-m", s.ModemID,
-			"--location-enable-gps-unmanaged").Run(); err != nil {
-			return fmt.Errorf("failed to enable GPS unmanaged: %v", err)
+		s.Logger.Printf("Attempting to enable gps-unmanaged location source...")
+		var enableErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			enableErr = exec.Command("mmcli", "-m", s.ModemID, "--location-enable-gps-unmanaged").Run()
+			if enableErr == nil {
+				s.Logger.Printf("Successfully enabled gps-unmanaged location source (attempt %d)", attempt+1)
+				break // Success
+			}
+			s.Logger.Printf("Warning: Failed to enable gps-unmanaged (attempt %d/%d): %v", attempt+1, 3, enableErr)
+			if attempt < 2 { // Don't sleep after the last attempt
+				time.Sleep(1 * time.Second)
+			}
 		}
-		s.Logger.Printf("Enabled gps-unmanaged location source")
+		if enableErr != nil {
+			// Return error only if all attempts failed
+			return fmt.Errorf("failed to enable GPS unmanaged after multiple attempts: %v", enableErr)
+		}
 	} else {
 		s.Logger.Printf("gps-unmanaged location source already enabled")
 	}
