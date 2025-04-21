@@ -68,6 +68,7 @@ type State struct {
 	OperatorCode     string
 	IsRoaming        bool
 	RegistrationFail string
+	ErrorState       string
 }
 
 // NewState creates a new modem state with default values
@@ -86,6 +87,7 @@ func NewState() *State {
 		OperatorCode:     "",
 		IsRoaming:        false,
 		RegistrationFail: "",
+		ErrorState:       "", // Initialize as empty
 	}
 }
 
@@ -118,15 +120,22 @@ func GetModemStatus(modemID string) (*mmcli.ModemManager, error) {
 // GetModemInfo gets the modem information
 func GetModemInfo(interfaceName string, logger *log.Logger) (*State, error) {
 	state := NewState()
+	// Default error state is 'ok' unless overridden later
+	state.ErrorState = "ok"
 
 	modemID, err := FindModemID()
 	if err != nil {
 		state.Status = "no-modem"
+		state.ErrorState = "no-modem"
 		return state, err
 	}
 
 	mm, err := GetModemStatus(modemID)
 	if err != nil {
+		// If we can't get status, assume it's an issue, but keep 'no-modem' if that was the initial error
+		if state.ErrorState == "ok" {
+			state.ErrorState = "status-error"
+		}
 		return state, err
 	}
 
@@ -200,6 +209,25 @@ func GetModemInfo(interfaceName string, logger *log.Logger) (*State, error) {
 		} else {
 			logger.Printf("Error getting interface IP: %v", err)
 			state.Status = "disconnected"
+		}
+	}
+
+	// Determine consolidated error state based on priority, only if current state is 'ok'
+	if state.ErrorState == "ok" {
+		if state.PowerState != PowerStateOn {
+			state.ErrorState = "powered-off"
+		} else if state.SIMState == SIMStateMissing {
+			state.ErrorState = "sim-missing"
+		} else if state.SIMState == SIMStateInactive {
+			state.ErrorState = "sim-inactive"
+		} else if state.SIMLockStatus != "" && state.SIMLockStatus != "none" {
+			state.ErrorState = "sim-locked"
+		} else if state.Registration == RegistrationDenied {
+			state.ErrorState = "registration-denied"
+		} else if state.Registration == RegistrationFailed {
+			state.ErrorState = "registration-failed"
+		} else if state.Status == "disconnected" && state.Registration != RegistrationHome && state.Registration != RegistrationRoaming {
+			state.ErrorState = "disconnected"
 		}
 	}
 

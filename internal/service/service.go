@@ -340,6 +340,16 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		s.LastState.ICCID = currentState.ICCID
 	}
 
+	// Publish the consolidated error state
+	if s.LastState.ErrorState != currentState.ErrorState {
+		s.Logger.Printf("modem error-state: %s", currentState.ErrorState)
+		if err := s.Redis.PublishModemState(ctx, "error-state", currentState.ErrorState); err != nil {
+			// Log error but don't necessarily fail the whole publish operation
+			s.Logger.Printf("Failed to publish modem error-state: %v", err)
+		}
+		s.LastState.ErrorState = currentState.ErrorState
+	}
+
 	return nil
 }
 
@@ -374,10 +384,10 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	currentState, err := modem.GetModemInfo(s.Config.Interface, s.Logger)
 	if err != nil {
 		s.Logger.Printf("Failed to get modem info: %v", err)
-		// Treat as uninitialized modem
-		s.publishModemState(ctx, modem.NewState(), "disconnected")
+		// Publish the state we got, even if partial, as it contains the ErrorState
+		s.publishModemState(ctx, currentState, "disconnected")
 		s.publishHealthState(ctx)
-		return err
+		return err // Return the original error from GetModemInfo
 	}
 
 	internetStatus := "disconnected"
