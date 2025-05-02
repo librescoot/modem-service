@@ -281,104 +281,101 @@ func CheckPowerState(modemID string) error {
 	return nil
 }
 
-// StartModem starts the modem
-func StartModem() error {
-	if err := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
-		return fmt.Errorf("failed to export GPIO pin: %v", err)
+// toggleGPIO performs the GPIO toggle sequence with a configurable timespan.
+// It handles export, setting direction, toggling the pin, and unexport in a safe way.
+func toggleGPIO(pin int, toggleDuration time.Duration) error {
+	// Try to export GPIO pin, but continue even if it fails (might already be exported)
+	exportErr := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", pin)), 0644)
+	wasExported := exportErr == nil
+
+	// Set direction to output and continue anyway
+	directionPath := fmt.Sprintf("/sys/class/gpio/gpio%d/direction", pin)
+	dirErr := os.WriteFile(directionPath, []byte("out"), 0644)
+
+	// Only fail if we can't access the pin at all
+	if exportErr != nil && dirErr != nil {
+		return fmt.Errorf("failed to initialize GPIO pin %d: export error: %v, direction error: %v",
+			pin, exportErr, dirErr)
 	}
 
-	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/direction", GPIOPin), []byte("out"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO direction: %v", err)
+	// Set value high
+	valuePath := fmt.Sprintf("/sys/class/gpio/gpio%d/value", pin)
+	if err := os.WriteFile(valuePath, []byte("1"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value high for pin %d: %v", pin, err)
 	}
 
-	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", GPIOPin), []byte("1"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value high: %v", err)
+	time.Sleep(toggleDuration)
+
+	// Set value low
+	if err := os.WriteFile(valuePath, []byte("0"), 0644); err != nil {
+		return fmt.Errorf("failed to set GPIO value low for pin %d: %v", pin, err)
 	}
 
-	time.Sleep(500 * time.Millisecond)
-
-	if err := os.WriteFile(fmt.Sprintf("/sys/class/gpio/gpio%d/value", GPIOPin), []byte("0"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value low: %v", err)
+	// Always try to unexport the pin if we successfully exported it
+	if wasExported {
+		if err := os.WriteFile("/sys/class/gpio/unexport", []byte(fmt.Sprintf("%d", pin)), 0644); err != nil {
+			// Log warning, but don't fail the operation
+			fmt.Printf("WARN: Failed to unexport GPIO pin %d: %v\n", pin, err)
+		}
 	}
 
 	return nil
 }
 
-// RestartModem restarts the modem, attempting GPIO first and falling back to mmcli reset.
-func RestartModem(logger *log.Logger) error {
-	logger.Printf("Attempting modem restart via GPIO pin %d...", GPIOPin)
-	gpioErr := attemptGPIORestart()
+// StartModem starts the modem with an initial quick pulse.
+// If that fails, tries the full restart sequence as a fallback.
+func StartModem() error {
+	// First try a quick pulse to turn ON
+	if err := toggleGPIO(GPIOPin, 500*time.Millisecond); err == nil {
+		return nil
+	}
 
-	if gpioErr == nil {
-		logger.Printf("Modem restart via GPIO successful.")
+	// If the quick start failed, try the full restart sequence
+	logger := log.New(os.Stdout, "Modem Recovery: ", log.LstdFlags)
+	logger.Printf("Initial modem start failed, attempting full restart sequence")
+	return RestartModem(logger)
+}
+
+// RestartModem restarts the modem by first turning it OFF with a 3500ms pulse, then turning it ON with a 500ms pulse.
+// Falls back to mmcli reset if GPIO method fails.
+func RestartModem(logger *log.Logger) error {
+	// First turn the modem OFF with a 3500ms pulse
+	logger.Printf("Pulsing LTE_POWER for 3500ms to turn modem OFF")
+	offErr := toggleGPIO(GPIOPin, 3500*time.Millisecond)
+	if offErr != nil {
+		logger.Printf("Failed to turn modem OFF: %v", offErr)
+	} else {
+		// Give the modem a moment to fully shut down
+		time.Sleep(15 * time.Second)
+	}
+
+	// Then turn the modem ON with a 500ms pulse (same as StartModem)
+	logger.Printf("Pulsing LTE_POWER for 500ms to turn modem ON")
+	onErr := toggleGPIO(GPIOPin, 500*time.Millisecond)
+
+	if onErr == nil && offErr == nil {
+		logger.Printf("Modem restart via GPIO successful (OFF then ON).")
 		return nil
 	}
 
 	// GPIO failed, log warning and attempt mmcli reset as fallback
-	logger.Printf("WARN: Modem restart via GPIO failed (%v), attempting fallback via mmcli reset...", gpioErr)
+	logger.Printf("WARN: Modem restart via GPIO failed (OFF error: %v, ON error: %v), attempting fallback via mmcli reset...", offErr, onErr)
 
 	modemID, findErr := FindModemID()
 	if findErr != nil {
 		// Cannot find modem to reset via mmcli either
-		return fmt.Errorf("GPIO restart failed (%v) and cannot find modem for mmcli reset (%v)", gpioErr, findErr)
+		return fmt.Errorf("GPIO restart failed (OFF: %v, ON: %v) and cannot find modem for mmcli reset (%v)",
+			offErr, onErr, findErr)
 	}
 
 	logger.Printf("Found modem %s, attempting mmcli reset.", modemID)
 	resetErr := ResetModem(modemID)
 	if resetErr != nil {
-		return fmt.Errorf("GPIO restart failed (%v) and mmcli reset failed (%v)", gpioErr, resetErr)
+		return fmt.Errorf("GPIO restart failed (OFF: %v, ON: %v) and mmcli reset failed (%v)",
+			offErr, onErr, resetErr)
 	}
 
 	logger.Printf("Modem restart via mmcli reset successful.")
-	return nil
-}
-
-// attemptGPIORestart performs the modem restart sequence using GPIO.
-func attemptGPIORestart() error {
-	_, err := os.Stat(fmt.Sprintf("/sys/class/gpio/gpio%d", GPIOPin))
-	isAlreadyExported := err == nil
-
-	if !isAlreadyExported {
-		if err := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
-			// Check if the error is specifically "Device or resource busy" which often means already exported
-			if !strings.Contains(err.Error(), "Device or resource busy") {
-				return fmt.Errorf("failed to export GPIO pin %d: %w", GPIOPin, err)
-			}
-			// If it is busy/exported, ignore the error and proceed
-		}
-	}
-
-	// Set direction (might also fail if already set correctly by another process)
-	directionPath := fmt.Sprintf("/sys/class/gpio/gpio%d/direction", GPIOPin)
-	if err := os.WriteFile(directionPath, []byte("out"), 0644); err != nil {
-		// Read current direction to see if it's already 'out'
-		currentDirection, readErr := os.ReadFile(directionPath)
-		if readErr != nil || strings.TrimSpace(string(currentDirection)) != "out" {
-			return fmt.Errorf("failed to set GPIO direction for pin %d: %w (current: %s, readErr: %v)", GPIOPin, err, string(currentDirection), readErr)
-		}
-		// If already 'out', ignore the WriteFile error
-	}
-
-	// Set value high
-	valuePath := fmt.Sprintf("/sys/class/gpio/gpio%d/value", GPIOPin)
-	if err := os.WriteFile(valuePath, []byte("1"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value high for pin %d: %w", GPIOPin, err)
-	}
-
-	time.Sleep(3500 * time.Millisecond)
-
-	// Set value low
-	if err := os.WriteFile(valuePath, []byte("0"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value low for pin %d: %w", GPIOPin, err)
-	}
-
-	if !isAlreadyExported {
-		if err := os.WriteFile("/sys/class/gpio/unexport", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
-			// Log warning, but don't fail the restart for unexport failure
-			fmt.Printf("WARN: Failed to unexport GPIO pin %d: %v\n", GPIOPin, err)
-		}
-	}
-
 	return nil
 }
 
