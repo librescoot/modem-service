@@ -8,8 +8,6 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/redis/go-redis/v9 v9.7.0 h1:HhLSs+B6O021gwzl+locl0zEDnyNkxMtf/Z3NNBMa9E=
 github.com/redis/go-redis/v9 v9.7.0/go.mod h1:f6zhXITC7JUJIlPEiBOTXxJgPLdZcA93GewI7inzyWw=
-github.com/rescoot/go-mmcli v0.2.2 h1:6cctTv9V0x1AehTHq/aBLv9YuDM7/F+DXaqc70PRGgQ=
-github.com/rescoot/go-mmcli v0.2.2/go.mod h1:lWCT3FrdeNYVoHvkO5QrFGEe9u4ezo+g3Q+lqFagHe8=
 github.com/rescoot/go-mmcli v0.3.0 h1:kF4rfrOhzgKrOQnjg/JdUDmmIfMhN1sM/KUsW5GJIWg=
 github.com/rescoot/go-mmcli v0.3.0/go.mod h1:lWCT3FrdeNYVoHvkO5QrFGEe9u4ezo+g3Q+lqFagHe8=
 github.com/stratoberry/go-gpsd v1.3.0 h1:JxJOEC4SgD0QY65AE7B1CtJtweP73nqJghZeLNU9J+c=

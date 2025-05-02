@@ -372,12 +372,12 @@ func attemptGPIORestart() error {
 		return fmt.Errorf("failed to set GPIO value low for pin %d: %w", GPIOPin, err)
 	}
 
-	// if !isAlreadyExported {
-	// 	if err := os.WriteFile("/sys/class/gpio/unexport", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
-	// 		// Log warning, but don't fail the restart for unexport failure
-	// 		fmt.Printf("WARN: Failed to unexport GPIO pin %d: %v\n", GPIOPin, err)
-	// 	}
-	// }
+	if !isAlreadyExported {
+		if err := os.WriteFile("/sys/class/gpio/unexport", []byte(fmt.Sprintf("%d", GPIOPin)), 0644); err != nil {
+			// Log warning, but don't fail the restart for unexport failure
+			fmt.Printf("WARN: Failed to unexport GPIO pin %d: %v\n", GPIOPin, err)
+		}
+	}
 
 	return nil
 }
