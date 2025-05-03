@@ -403,6 +403,21 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 				s.Logger.Printf("Internet connectivity check failed (ping unsuccessful)")
 			}
 			internetStatus = "disconnected"
+			
+			// Publish the disconnected status immediately
+			if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
+				s.Logger.Printf("Failed to publish internet disconnected state: %v", err)
+			}
+			
+			// After publishing status, trigger modem recovery
+			s.Logger.Printf("Modem reports connected but internet check failed, attempting recovery")
+			recoveryErr := s.handleModemFailure("internet_connectivity_failed")
+			if recoveryErr != nil {
+				s.Logger.Printf("Failed to initiate modem recovery: %v", recoveryErr)
+			}
+			
+			// Return since we've already published the state
+			return nil
 		}
 	} else {
 		internetStatus = "disconnected"
