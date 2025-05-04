@@ -79,8 +79,8 @@ func CheckInternetConnectivity(ctx context.Context, interfaceName string) (bool,
 	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second) // 2-second timeout for ping
 	defer cancel()
 
-	// Command: ping -c 1 (one packet) -W 1 (1-second wait) -I interface 8.8.8.8 (Google DNS)
-	cmd := exec.CommandContext(pingCtx, "ping", "-c", "1", "-W", "1", "-I", interfaceName, "8.8.8.8")
+	// Command: ping -c 1 (one packet) -W 1 (1-second wait) 8.8.8.8 (Google DNS)
+	cmd := exec.CommandContext(pingCtx, "ping", "-c", "1", "-W", "1", "8.8.8.8")
 
 	err := cmd.Run()
 
