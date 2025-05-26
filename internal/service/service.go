@@ -227,12 +227,23 @@ func (s *Service) publishHealthState(ctx context.Context) error {
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State, internetStatus string) error {
 	// Publish the actual internet connectivity status
 	// Compare with LastState.Status which now stores the *last published internet status*
+	// NOTE: LastState.Status here refers to the overall internet connectivity, not the raw modem status.
 	if s.LastState.Status != internetStatus {
 		s.Logger.Printf("internet status: %s", internetStatus)
 		if err := s.Redis.PublishInternetState(ctx, "internet", "status", internetStatus); err != nil {
 			return err
 		}
 		s.LastState.Status = internetStatus // Store the published internet status
+	}
+
+	// Publish the raw modem state (1:1 copy of currentState.Status)
+	if s.LastState.LastRawModemStatus != currentState.Status {
+		s.Logger.Printf("internet modem-state: %s", currentState.Status)
+		if err := s.Redis.PublishInternetState(ctx, "internet", "modem-state", currentState.Status); err != nil {
+			// Log error but don't necessarily fail the whole publish operation for this specific field
+			s.Logger.Printf("Failed to publish internet modem-state: %v", err)
+		}
+		s.LastState.LastRawModemStatus = currentState.Status // Store the published raw modem status
 	}
 
 	// Publish modem's reported IP address (might be present even if ping fails)

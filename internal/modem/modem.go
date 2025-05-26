@@ -52,42 +52,44 @@ const (
 
 // State represents the current state of the modem
 type State struct {
-	Status           string
-	AccessTech       string
-	SignalQuality    uint8
-	IPAddr           string
-	IfIPAddr         string
-	Registration     string
-	IMEI             string
-	IMSI             string
-	ICCID            string
-	PowerState       string
-	SIMState         string
-	SIMLockStatus    string
-	OperatorName     string
-	OperatorCode     string
-	IsRoaming        bool
-	RegistrationFail string
-	ErrorState       string
+	Status             string // Raw status from modem: "off", "connected", "disconnected", "no-modem", "UNKNOWN"
+	LastRawModemStatus string // Used by service layer to cache last published raw modem status
+	AccessTech         string
+	SignalQuality      uint8
+	IPAddr             string
+	IfIPAddr           string
+	Registration       string
+	IMEI               string
+	IMSI               string
+	ICCID              string
+	PowerState         string
+	SIMState           string
+	SIMLockStatus      string
+	OperatorName       string
+	OperatorCode       string
+	IsRoaming          bool
+	RegistrationFail   string
+	ErrorState         string
 }
 
 // NewState creates a new modem state with default values
 func NewState() *State {
 	return &State{
-		Status:           StateDefault,
-		AccessTech:       AccessTechDefault,
-		SignalQuality:    SignalQualityDefault,
-		IPAddr:           "UNKNOWN",
-		IfIPAddr:         "UNKNOWN",
-		Registration:     "",
-		PowerState:       PowerStateOff,
-		SIMState:         SIMStateMissing,
-		SIMLockStatus:    "",
-		OperatorName:     "",
-		OperatorCode:     "",
-		IsRoaming:        false,
-		RegistrationFail: "",
-		ErrorState:       "", // Initialize as empty
+		Status:             StateDefault,
+		LastRawModemStatus: StateDefault, // Initialize to UNKNOWN
+		AccessTech:         AccessTechDefault,
+		SignalQuality:      SignalQualityDefault,
+		IPAddr:             "UNKNOWN",
+		IfIPAddr:           "UNKNOWN",
+		Registration:       "",
+		PowerState:         PowerStateOff,
+		SIMState:           SIMStateMissing,
+		SIMLockStatus:      "",
+		OperatorName:       "",
+		OperatorCode:       "",
+		IsRoaming:          false,
+		RegistrationFail:   "",
+		ErrorState:         "", // Initialize as empty
 	}
 }
 
