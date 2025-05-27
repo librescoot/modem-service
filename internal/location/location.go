@@ -34,23 +34,27 @@ type Location struct {
 }
 
 type Service struct {
-	ModemID       string
-	Config        Config
-	LastFix       time.Time
-	CurrentLoc    Location
-	Enabled       bool
-	Logger        *log.Logger
-	GpsdConn      *gpsd.Session
-	GpsdServer    string
-	Done          chan bool
-	HasValidFix   bool
-	FixMode       string  // "none", "2d", "3d"
-	Quality       float64 // DOP value
-	GpsdConnected bool
-	State         string // "off", "searching", "fix-established", "error"
+	ModemID                 string
+	Config                  Config
+	LastFix                 time.Time
+	CurrentLoc              Location
+	Enabled                 bool
+	Logger                  *log.Logger
+	GpsdConn                *gpsd.Session
+	GpsdServer              string
+	Done                    chan bool
+	HasValidFix             bool
+	FixMode                 string  // "none", "2d", "3d"
+	Quality                 float64 // DOP value
+	GpsdConnected           bool
+	State                   string // "off", "searching", "fix-established", "error"
+	Filter                  *GPSFilter
+	LastRawReportedLocation Location
 }
 
 func NewService(logger *log.Logger, gpsdServer string) *Service {
+	// TODO: Make filter config configurable from main config
+	filter := NewGPSFilter(nil)
 	return &Service{
 		Config: Config{
 			SuplServer:     "supl.google.com:7275",
@@ -63,6 +67,7 @@ func NewService(logger *log.Logger, gpsdServer string) *Service {
 		Done:        make(chan bool),
 		HasValidFix: false,
 		State:       "off",
+		Filter:      filter,
 	}
 }
 
@@ -299,26 +304,38 @@ func (s *Service) connectToGPSD() error {
 			return
 		}
 
-		s.CurrentLoc.Latitude = report.Lat
-		s.CurrentLoc.Longitude = report.Lon
+		rawLocation := Location{
+			Latitude:  report.Lat,
+			Longitude: report.Lon,
+		}
 
 		if report.Alt != 0 {
-			s.CurrentLoc.Altitude = report.Alt
+			rawLocation.Altitude = report.Alt
 		}
 		if report.Speed != 0 {
-			s.CurrentLoc.Speed = report.Speed
+			rawLocation.Speed = report.Speed
 		}
 		if report.Track != 0 {
-			s.CurrentLoc.Course = report.Track
+			rawLocation.Course = report.Track
 		}
 
 		if !report.Time.IsZero() {
-			s.CurrentLoc.Timestamp = report.Time
+			rawLocation.Timestamp = report.Time
 		} else {
-			s.CurrentLoc.Timestamp = time.Now()
+			rawLocation.Timestamp = time.Now()
 		}
 
-		s.LastFix = time.Now()
+		// Store raw location before filtering
+		s.LastRawReportedLocation = rawLocation
+
+		// Apply filter
+		s.CurrentLoc = s.Filter.FilterLocation(rawLocation)
+		// Ensure the timestamp from the raw report is preserved if the filter doesn't set it
+		if s.CurrentLoc.Timestamp.IsZero() {
+			s.CurrentLoc.Timestamp = rawLocation.Timestamp
+		}
+
+		s.LastFix = time.Now() // This should ideally be based on report.Time if available and reliable
 		s.HasValidFix = true
 	})
 
