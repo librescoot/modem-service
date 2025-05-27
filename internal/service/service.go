@@ -369,7 +369,7 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 		"latitude":  fmt.Sprintf("%.6f", loc.Latitude),
 		"longitude": fmt.Sprintf("%.6f", loc.Longitude),
 		"altitude":  fmt.Sprintf("%.6f", loc.Altitude),
-		"speed":     fmt.Sprintf("%.6f", loc.Speed),
+		"speed":     fmt.Sprintf("%.6f", loc.Speed*3.6), // Convert m/s to km/h
 		"course":    fmt.Sprintf("%.6f", loc.Course),
 		"timestamp": loc.Timestamp.Format(time.RFC3339),
 	}
@@ -414,19 +414,19 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 				s.Logger.Printf("Internet connectivity check failed (ping unsuccessful)")
 			}
 			internetStatus = "disconnected"
-			
+
 			// Publish the disconnected status immediately
 			if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
 				s.Logger.Printf("Failed to publish internet disconnected state: %v", err)
 			}
-			
+
 			// After publishing status, trigger modem recovery
 			s.Logger.Printf("Modem reports connected but internet check failed, attempting recovery")
 			recoveryErr := s.handleModemFailure("internet_connectivity_failed")
 			if recoveryErr != nil {
 				s.Logger.Printf("Failed to initiate modem recovery: %v", recoveryErr)
 			}
-			
+
 			// Return since we've already published the state
 			return nil
 		}
