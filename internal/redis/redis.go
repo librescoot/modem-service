@@ -72,6 +72,19 @@ func (c *Client) PublishLocationState(ctx context.Context, data map[string]inter
 	return nil
 }
 
+// PublishFilteredLocationState publishes filtered location state to Redis
+func (c *Client) PublishFilteredLocationState(ctx context.Context, data map[string]interface{}) error {
+	pipe := c.client.Pipeline()
+	pipe.HSet(ctx, "gps:filtered", data)
+	pipe.Publish(ctx, "gps:filtered", "location-update")
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		c.logger.Printf("Unable to set filtered location in redis: %v", err)
+		return fmt.Errorf("cannot write filtered location to redis: %v", err)
+	}
+	return nil
+}
+
 // Close closes the Redis client
 func (c *Client) Close() error {
 	return c.client.Close()
