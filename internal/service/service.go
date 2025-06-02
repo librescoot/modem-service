@@ -20,7 +20,9 @@ type Service struct {
 	Health              *health.Health
 	Location            *location.Service
 	LastState           *modem.State
-	WaitingForGPSLogged bool // Tracks if we've already logged the waiting for GPS message
+	WaitingForGPSLogged bool      // Tracks if we've already logged the waiting for GPS message
+	LastGPSDataTime     time.Time // Last time we received any GPS data
+	GPSEnabledTime      time.Time // When GPS was first enabled
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -461,6 +463,22 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	return nil
 }
 
+func (s *Service) checkGPSHealth() error {
+	now := time.Now()
+
+	// Check if GPS data is stale (no data for 30 seconds)
+	if !s.LastGPSDataTime.IsZero() && now.Sub(s.LastGPSDataTime) > 30*time.Second {
+		return fmt.Errorf("gps_data_stale: no GPS data received for %v", now.Sub(s.LastGPSDataTime))
+	}
+
+	// Check if GPS fix is taking too long (no fix for 300 seconds since GPS was enabled)
+	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix && now.Sub(s.GPSEnabledTime) > 300*time.Second {
+		return fmt.Errorf("gps_fix_timeout: no GPS fix established for %v", now.Sub(s.GPSEnabledTime))
+	}
+
+	return nil
+}
+
 func (s *Service) monitorStatus(ctx context.Context) {
 	ticker := time.NewTicker(s.Config.InternetCheckTime)
 	gpsTimer := time.NewTicker(location.GPSUpdateInterval)
@@ -491,91 +509,39 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.Logger.Printf("Failed to enable GPS: %v", err)
 						continue
 					}
+					s.GPSEnabledTime = time.Now()
+				}
+
+				// Check for GPS health issues and trigger recovery if needed
+				if err := s.checkGPSHealth(); err != nil {
+					s.Logger.Printf("GPS health check failed: %v", err)
+					if recoveryErr := s.handleModemFailure(fmt.Sprintf("gps_stuck: %v", err)); recoveryErr != nil {
+						s.Logger.Printf("Failed to initiate modem recovery for GPS issue: %v", recoveryErr)
+					}
+					continue
 				}
 
 				// Always publish GPS status, even without valid fix
 				gpsStatus := s.Location.GetGPSStatus()
 				if gpsStatus["active"].(bool) {
+					// Update GPS data timestamp when we have active GPS
+					s.LastGPSDataTime = time.Now()
+
 					// If we were waiting (flag is true), log that we got a fix
 					if s.WaitingForGPSLogged {
 						s.Logger.Printf("GPS fix established")
 						s.WaitingForGPSLogged = false
 					}
 
-					// s.Location.CurrentLoc is already the filtered location
-					// We need the raw location before filtering to publish it.
-					// This requires a change in location.Service to expose raw location or pass it through.
-					// For now, let's assume s.Location.CurrentLoc is what we want for filtered,
-					// and we'd need to get the raw one.
-					// Let's modify location.go to store both raw and filtered, or pass raw through TPV.
-					// Quickest path for now: assume CurrentLoc is filtered. We need raw.
-					// The TPV handler in location.go now sets s.CurrentLoc to the filtered one.
-					// We need to access the raw one that was passed to s.Filter.FilterLocation()
-					// This implies a design change in how location data flows or is stored in location.Service.
-
-					// Simplification for now: We will publish the filtered location to both endpoints.
-					// This is not ideal but avoids further refactoring of location.go in this step.
-					// The user can refine this later if they need distinct raw data.
-					// OR, we can assume that s.Location.Filter.lastLocation is the *input* to the filter for the current s.Location.CurrentLoc
-					// This is a bit of a hack.
-					// A cleaner way would be for FilterLocation to return both raw and filtered, or for location.Service to store both.
-
-					// Let's assume s.Location.CurrentLoc is the *filtered* one.
-					// And s.Location.Filter.lastLocation was the *raw* input that produced the current filtered output.
-					// This is not strictly true by the current filter.go logic, as lastLocation is updated with filtered.
-					//
-					// The TPV handler in location.go does:
-					// rawLocation := Location{... from report ...}
-					// s.CurrentLoc = s.Filter.FilterLocation(rawLocation)
-					// So, to get the raw location that corresponds to s.CurrentLoc, we'd need to have stored `rawLocation` in the location.Service
-					// or have the filter return it.
-					//
-					// Let's make a temporary adjustment to publishLocationState to accept only one Location
-					// and publish it to both, and then I'll suggest a follow-up to properly separate raw/filtered.
-					// For now, we'll publish the filtered location to both raw and filtered Redis keys.
-
-					// The `publishLocationState` function now expects raw and filtered.
-					// The `s.Location.CurrentLoc` is the filtered location.
-					// We need to get the raw location. The filter doesn't directly expose the last raw input.
-					// The location service's TPV handler creates `rawLocation` then passes it to the filter.
-					// We need to make `rawLocation` available here.
-					//
-					// Let's modify location.Service to store LastRawLocation
-					// Add `LastRawLocation Location` to `location.Service` struct
-					// In TPV handler:
-					//   s.LastRawLocation = rawLocation // Store it
-					//   s.CurrentLoc = s.Filter.FilterLocation(rawLocation)
-					// Then here:
-					//   err := s.publishLocationState(ctx, s.Location.LastRawLocation, s.Location.CurrentLoc)
-
-					// This requires another edit to location.go. I will do that first.
-					// For now, I will proceed with the current structure and publish CurrentLoc (filtered) to both.
-					// This is a known limitation to be addressed.
-
-					// Correct approach: publishLocationState should take the filtered location.
-					// The raw data is implicitly handled by the fact that CurrentLoc *is* the filtered one.
-					// The request was to publish *filtered* data to `gps:filtered` and keep `gps` as raw.
-					// This means `publishLocationState` needs to be called with the *raw* data for the `gps` key,
-					// and then separately with *filtered* data for `gps:filtered`.
-					//
-					// The current `s.Location.CurrentLoc` IS the filtered location.
-					// We need the raw data that was used to produce this.
-					// The `location.go` TPV handler has `rawLocation`. We need to pass this up.
-					//
-					// Plan:
-					// 1. Modify `location.Service` to have `LastRawReportedLocation Location`
-					// 2. In `location.go` TPV handler, after creating `rawLocation`, set `s.LastRawReportedLocation = rawLocation`
-					// 3. In `service.go` `monitorStatus`, call `s.publishLocationState(ctx, s.Location.LastRawReportedLocation, s.Location.CurrentLoc)`
-
-					// Given I can only do one file edit at a time, I will make a placeholder here
-					// and then edit location.go, then come back to service.go.
-					// For now, I will call publishLocationState with s.Location.CurrentLoc for both arguments.
-					// This is incorrect but allows the code to compile.
-					// UPDATE: Now that LastRawReportedLocation is available in location.Service:
 					if err := s.publishLocationState(ctx, s.Location.LastRawReportedLocation, s.Location.CurrentLoc); err != nil {
 						s.Logger.Printf("Failed to publish location: %v", err)
 					}
 				} else {
+					// Update GPS data timestamp even when no fix, if GPS is connected
+					if gpsStatus["connected"].(bool) {
+						s.LastGPSDataTime = time.Now()
+					}
+
 					if !s.WaitingForGPSLogged {
 						s.Logger.Printf("Waiting for valid GPS fix...")
 						s.WaitingForGPSLogged = true
