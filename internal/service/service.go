@@ -365,7 +365,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 }
 
 func (s *Service) publishLocationState(ctx context.Context, rawLoc location.Location, filteredLoc location.Location) error {
-	// Publish Raw GPS Data
+	// Prepare Raw GPS Data
 	rawData := map[string]interface{}{
 		"latitude":  fmt.Sprintf("%.6f", rawLoc.Latitude),
 		"longitude": fmt.Sprintf("%.6f", rawLoc.Longitude),
@@ -378,12 +378,8 @@ func (s *Service) publishLocationState(ctx context.Context, rawLoc location.Loca
 	for k, v := range gpsStatus {
 		rawData[k] = v
 	}
-	if err := s.Redis.PublishLocationState(ctx, rawData); err != nil {
-		s.Logger.Printf("Failed to publish raw location: %v", err)
-		// Potentially return err here or just log
-	}
 
-	// Publish Filtered GPS Data
+	// Prepare Filtered GPS Data
 	filteredData := map[string]interface{}{
 		"latitude":  fmt.Sprintf("%.6f", filteredLoc.Latitude),
 		"longitude": fmt.Sprintf("%.6f", filteredLoc.Longitude),
@@ -395,7 +391,9 @@ func (s *Service) publishLocationState(ctx context.Context, rawLoc location.Loca
 	for k, v := range gpsStatus { // Add status to filtered data as well
 		filteredData[k] = v
 	}
-	return s.Redis.PublishFilteredLocationState(ctx, filteredData)
+
+	// Use new PublishLocationState that handles raw, filtered, and main gps hash
+	return s.Redis.PublishLocationState(ctx, rawData, filteredData)
 }
 
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
@@ -590,7 +588,8 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						"active":    gpsStatus["active"],
 						"connected": gpsStatus["connected"],
 					}
-					if err := s.Redis.PublishLocationState(ctx, data); err != nil {
+					// Use same data for both raw and filtered when no fix available
+					if err := s.Redis.PublishLocationState(ctx, data, data); err != nil {
 						s.Logger.Printf("Failed to publish GPS status: %v", err)
 					}
 				}
