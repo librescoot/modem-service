@@ -326,15 +326,16 @@ func toggleGPIO(pin int, toggleDuration time.Duration) error {
 
 // StartModem starts the modem with an initial quick pulse.
 // If that fails, tries the full restart sequence as a fallback.
-func StartModem() error {
+func StartModem(logger *log.Logger) error {
 	// First try a quick pulse to turn ON
 	if err := toggleGPIO(GPIOPin, 500*time.Millisecond); err == nil {
 		return nil
 	}
 
 	// If the quick start failed, try the full restart sequence
-	logger := log.New(os.Stdout, "Modem Recovery: ", log.LstdFlags)
-	logger.Printf("Initial modem start failed, attempting full restart sequence")
+	if logger != nil {
+		logger.Printf("Initial modem start failed, attempting full restart sequence")
+	}
 	return RestartModem(logger)
 }
 

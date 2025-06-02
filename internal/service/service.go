@@ -92,8 +92,7 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 		s.Logger.Printf("Modem start attempt %d/%d with %v wait time",
 			attempt+1, health.MaxRecoveryAttempts, waitTime)
 
-		if err := modem.StartModem(); err != nil {
-			s.Logger.Printf("Failed to start modem: %v", err)
+		if err := modem.StartModem(s.Logger); err != nil {
 			continue
 		}
 
@@ -107,7 +106,6 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 			return nil
 		}
 
-		s.Logger.Printf("Modem did not come up after attempt %d: %v", attempt+1, err)
 
 		select {
 		case <-ctx.Done():
@@ -197,7 +195,6 @@ func (s *Service) attemptRecovery() error {
 	// If software reset failed or modem not found, try hardware reset via GPIO (which now includes mmcli fallback)
 	s.Logger.Printf("Attempting modem restart (GPIO with mmcli fallback)...")
 	if err := modem.RestartModem(s.Logger); err != nil {
-		s.Logger.Printf("Modem restart attempt failed: %v", err)
 		return err // Return the combined error from RestartModem
 	}
 
@@ -205,7 +202,6 @@ func (s *Service) attemptRecovery() error {
 	defer cancel()
 
 	if err := modem.WaitForModem(ctx, s.Config.Interface, s.Logger); err != nil {
-		s.Logger.Printf("Modem did not come up after GPIO restart: %v", err)
 		return err
 	}
 
