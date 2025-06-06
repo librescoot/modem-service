@@ -23,6 +23,7 @@ type Service struct {
 	WaitingForGPSLogged bool      // Tracks if we've already logged the waiting for GPS message
 	LastGPSDataTime     time.Time // Last time we received any GPS data
 	GPSEnabledTime      time.Time // When GPS was first enabled
+	GPSRecoveryCount    int       // Number of GPS recovery attempts
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -156,10 +157,14 @@ func (s *Service) handleModemFailure(reason string) error {
 		return fmt.Errorf("recovery in progress")
 	}
 
+	// Be more forgiving - instead of entering terminal state, just wait longer
 	if !s.Health.CanRecover() {
-		s.Health.MarkRecoveryFailed()
-		s.publishHealthState(context.Background())
-		return fmt.Errorf("max recovery attempts reached")
+		s.Logger.Printf("Max recovery attempts reached, waiting before reset...")
+		// Instead of entering terminal state, wait and reset recovery counter
+		time.Sleep(2 * time.Minute)
+		s.Health.RecoveryAttempts = 0 // Reset recovery attempts
+		s.Logger.Printf("Recovery attempts reset, will try again")
+		return nil // Don't fail permanently
 	}
 
 	return s.attemptRecovery()
@@ -173,51 +178,142 @@ func (s *Service) attemptRecovery() error {
 
 	s.publishHealthState(context.Background())
 
-	// Try software reset first if modem is present
+	// Strategy 1: Try software reset first if modem is present
 	modemID, err := modem.FindModemID()
 	if err == nil {
-		// Try mmcli reset
 		s.Logger.Printf("Attempting to reset the modem via mmcli")
 		if err := modem.ResetModem(modemID); err != nil {
 			s.Logger.Printf("Failed to reset modem via mmcli: %v", err)
 		} else {
+			// Wait for modem to recover
 			time.Sleep(health.RecoveryWaitTime)
 
 			if err := s.checkHealth(); err == nil {
 				s.Logger.Printf("Modem recovery successful via mmcli reset")
 				s.Health.MarkNormal()
+				s.GPSRecoveryCount = 0 // Reset GPS recovery counter on successful modem recovery
 				s.publishHealthState(context.Background())
 				return nil
 			}
 		}
 	}
 
-	// If software reset failed or modem not found, try hardware reset via GPIO (which now includes mmcli fallback)
+	// Strategy 2: Try USB unbind/bind recovery
+	s.Logger.Printf("Attempting USB recovery (unbind/bind)...")
+	if err := modem.RecoverUSB(s.Logger); err != nil {
+		s.Logger.Printf("USB recovery failed: %v", err)
+	} else {
+		// Wait for modem to come back up after USB recovery
+		ctx, cancel := context.WithTimeout(context.Background(), health.RecoveryWaitTime)
+		defer cancel()
+
+		if err := modem.WaitForModem(ctx, s.Config.Interface, s.Logger); err == nil {
+			if err := s.checkHealth(); err == nil {
+				s.Logger.Printf("Modem recovery successful via USB recovery")
+				s.Health.MarkNormal()
+				s.GPSRecoveryCount = 0 // Reset GPS recovery counter
+				s.publishHealthState(context.Background())
+				return nil
+			}
+		}
+	}
+
+	// Strategy 3: Try hardware reset via GPIO
 	s.Logger.Printf("Attempting modem restart (GPIO with mmcli fallback)...")
 	if err := modem.RestartModem(s.Logger); err != nil {
-		return err // Return the combined error from RestartModem
+		s.Logger.Printf("GPIO restart failed: %v", err)
+		// Don't return error immediately, try waiting longer
+	} else {
+		// Wait for modem to come back up
+		ctx, cancel := context.WithTimeout(context.Background(), health.RecoveryWaitTime)
+		defer cancel()
+
+		if err := modem.WaitForModem(ctx, s.Config.Interface, s.Logger); err == nil {
+			if err := s.checkHealth(); err == nil {
+				s.Logger.Printf("Modem recovery successful via GPIO restart")
+				s.Health.MarkNormal()
+				s.GPSRecoveryCount = 0 // Reset GPS recovery counter
+				s.publishHealthState(context.Background())
+				return nil
+			}
+		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), health.RecoveryWaitTime)
-	defer cancel()
+	// Strategy 4: Just wait longer and hope the modem recovers
+	s.Logger.Printf("Hardware recovery uncertain, waiting additional time for modem to stabilize...")
+	time.Sleep(30 * time.Second)
 
-	if err := modem.WaitForModem(ctx, s.Config.Interface, s.Logger); err != nil {
-		return err
+	// Check if modem recovered during the wait
+	if err := s.checkHealth(); err == nil {
+		s.Logger.Printf("Modem recovered during extended wait")
+		s.Health.MarkNormal()
+		s.GPSRecoveryCount = 0
+		s.publishHealthState(context.Background())
+		return nil
 	}
 
-	if err := s.checkHealth(); err != nil {
-		s.Logger.Printf("Recovery failed after GPIO restart: %v", err)
-		return err
-	}
-
-	s.Logger.Printf("Modem recovery successful via GPIO restart")
-	s.Health.MarkNormal()
-	s.publishHealthState(context.Background())
-	return nil
+	// If we get here, this recovery attempt failed, but don't give up entirely
+	s.Logger.Printf("Recovery attempt %d failed, will retry", s.Health.RecoveryAttempts)
+	return fmt.Errorf("recovery attempt failed, will retry")
 }
 
 func (s *Service) publishHealthState(ctx context.Context) error {
 	return s.Redis.PublishInternetState(ctx, "internet", "modem-health", s.Health.State)
+}
+
+// handleGPSFailure attempts GPS-specific recovery before escalating to modem recovery
+func (s *Service) handleGPSFailure(gpsErr error) error {
+	s.Logger.Printf("Attempting GPS-specific recovery for: %v", gpsErr)
+
+	// Try to restart GPS configuration without restarting the entire modem
+	if err := s.attemptGPSRecovery(); err != nil {
+		s.Logger.Printf("GPS-specific recovery failed: %v", err)
+		// Only escalate to modem recovery for severe GPS issues after GPS recovery fails
+		if recoveryErr := s.handleModemFailure(fmt.Sprintf("gps_stuck_after_gps_recovery: %v", gpsErr)); recoveryErr != nil {
+			return fmt.Errorf("both GPS and modem recovery failed: %v", recoveryErr)
+		}
+	}
+
+	return nil
+}
+
+// attemptGPSRecovery tries to recover GPS without restarting the modem
+func (s *Service) attemptGPSRecovery() error {
+	s.GPSRecoveryCount++
+	s.Logger.Printf("Attempting GPS recovery (attempt %d)...", s.GPSRecoveryCount)
+
+	// If we've tried GPS recovery too many times, give up and return success
+	// to avoid infinite loops - the service will restart GPS configuration naturally
+	if s.GPSRecoveryCount > 3 {
+		s.Logger.Printf("GPS recovery attempted %d times, giving GPS a longer break", s.GPSRecoveryCount)
+		s.GPSRecoveryCount = 0 // Reset counter
+		// Wait longer before the next attempt
+		time.Sleep(30 * time.Second)
+		return nil
+	}
+
+	// Close existing GPS connection
+	s.Location.Close()
+	time.Sleep(2 * time.Second)
+
+	// Reset GPS state tracking
+	s.LastGPSDataTime = time.Time{}
+	s.GPSEnabledTime = time.Time{}
+	s.WaitingForGPSLogged = false
+
+	// Try to re-enable GPS
+	modemID, err := modem.FindModemID()
+	if err != nil {
+		return fmt.Errorf("modem not found for GPS recovery: %v", err)
+	}
+
+	if err := s.Location.EnableGPS(modemID); err != nil {
+		return fmt.Errorf("failed to re-enable GPS: %v", err)
+	}
+
+	s.GPSEnabledTime = time.Now()
+	s.Logger.Printf("GPS recovery completed, waiting for fix...")
+	return nil
 }
 
 // publishModemState publishes the detailed modem and derived internet state to Redis.
@@ -508,11 +604,11 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					s.GPSEnabledTime = time.Now()
 				}
 
-				// Check for GPS health issues and trigger recovery if needed
+				// Check for GPS health issues and try GPS-specific recovery first
 				if err := s.checkGPSHealth(); err != nil {
 					s.Logger.Printf("GPS health check failed: %v", err)
-					if recoveryErr := s.handleModemFailure(fmt.Sprintf("gps_stuck: %v", err)); recoveryErr != nil {
-						s.Logger.Printf("Failed to initiate modem recovery for GPS issue: %v", recoveryErr)
+					if recoveryErr := s.handleGPSFailure(err); recoveryErr != nil {
+						s.Logger.Printf("GPS recovery failed: %v", recoveryErr)
 					}
 					continue
 				}

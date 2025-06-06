@@ -1,6 +1,7 @@
 package location
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os/exec"
@@ -15,6 +16,8 @@ const (
 	GPSTimeout        = 10 * time.Minute
 	MaxGPSRetries     = 10
 	GPSRetryInterval  = 5 * time.Second
+	GPSConfigTimeout  = 30 * time.Second
+	MaxConfigRetries  = 3
 )
 
 type Config struct {
@@ -132,6 +135,43 @@ func (s *Service) EnableGPS(modemID string) error {
 }
 
 func (s *Service) configureGPS() error {
+	// Use timeout context for the entire configuration process
+	ctx, cancel := context.WithTimeout(context.Background(), GPSConfigTimeout)
+	defer cancel()
+
+	return s.configureGPSWithRetries(ctx)
+}
+
+func (s *Service) configureGPSWithRetries(ctx context.Context) error {
+	var lastErr error
+	for attempt := 0; attempt < MaxConfigRetries; attempt++ {
+		if err := s.doGPSConfiguration(ctx); err != nil {
+			lastErr = err
+			s.Logger.Printf("GPS configuration attempt %d/%d failed: %v", attempt+1, MaxConfigRetries, err)
+			if attempt < MaxConfigRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(2 * time.Second):
+					// Brief pause before retry
+				}
+			}
+			continue
+		}
+		s.Logger.Printf("GPS configuration successful on attempt %d", attempt+1)
+		return nil
+	}
+	return fmt.Errorf("GPS configuration failed after %d attempts, last error: %v", MaxConfigRetries, lastErr)
+}
+
+func (s *Service) doGPSConfiguration(ctx context.Context) error {
+	// First, get current status with timeout
+	status, err := s.getLocationStatusWithTimeout(ctx)
+	if err != nil {
+		s.Logger.Printf("Warning: Could not get current location status: %v", err)
+		// Continue with configuration anyway
+	}
+
 	sourcesEnabled := map[string]bool{
 		"3gpp-lac-ci":   false,
 		"agps-msb":      false,
@@ -142,39 +182,69 @@ func (s *Service) configureGPS() error {
 		"agps-msa":      false,
 	}
 
-	status, err := mmcli.GetLocationStatus(s.ModemID)
-	if err != nil {
-		s.Logger.Printf("Warning: Could not get current location status: %v", err)
-		// Continue anyway, we'll try to set everything
-	} else {
+	if status != nil {
 		s.Logger.Printf("Current location sources status: %+v", status)
-
 		for _, enabled := range status.Enabled {
 			sourcesEnabled[enabled] = true
 		}
 	}
 
-	var conflictingSources []string
-
-	if sourcesEnabled["gps-nmea"] {
-		s.Logger.Printf("Disabling conflicting gps-nmea location source")
-		conflictingSources = append(conflictingSources, "--location-disable-gps-nmea")
+	// Disable conflicting sources first
+	if err := s.disableConflictingSources(ctx, sourcesEnabled); err != nil {
+		s.Logger.Printf("Warning: Failed to disable conflicting sources: %v", err)
 	}
 
-	if sourcesEnabled["gps-raw"] {
-		s.Logger.Printf("Disabling conflicting gps-raw location source")
-		conflictingSources = append(conflictingSources, "--location-disable-gps-raw")
+	// Configure SUPL server
+	if err := s.configureSuplServer(ctx, status); err != nil {
+		return fmt.Errorf("failed to configure SUPL server: %v", err)
 	}
 
-	if len(conflictingSources) > 0 {
-		args := append([]string{"-m", s.ModemID}, conflictingSources...)
-		if err := exec.Command("mmcli", args...).Run(); err != nil {
-			s.Logger.Printf("Warning: Failed to disable conflicting location sources: %v", err)
+	// Enable required location sources
+	if err := s.enableLocationSources(ctx, sourcesEnabled); err != nil {
+		return fmt.Errorf("failed to enable location sources: %v", err)
+	}
+
+	return nil
+}
+
+func (s *Service) getLocationStatusWithTimeout(ctx context.Context) (*mmcli.LocationStatus, error) {
+	done := make(chan struct{})
+	var status *mmcli.LocationStatus
+	var err error
+
+	go func() {
+		defer close(done)
+		status, err = mmcli.GetLocationStatus(s.ModemID)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-done:
+		return status, err
+	}
+}
+
+func (s *Service) disableConflictingSources(ctx context.Context, sourcesEnabled map[string]bool) error {
+	// Disable conflicting sources one by one for better reliability
+	conflictingSources := []string{"gps-nmea", "gps-raw"}
+
+	for _, source := range conflictingSources {
+		if sourcesEnabled[source] {
+			s.Logger.Printf("Disabling conflicting %s location source", source)
+			args := []string{"-m", s.ModemID, "--location-disable-" + source}
+			if err := s.runMMCLICommand(ctx, args); err != nil {
+				s.Logger.Printf("Warning: Failed to disable %s: %v", source, err)
+				// Continue with other sources
+			}
 		}
 	}
+	return nil
+}
 
+func (s *Service) configureSuplServer(ctx context.Context, status *mmcli.LocationStatus) error {
 	currentSuplServer := ""
-	if err == nil && status != nil {
+	if status != nil {
 		currentSuplServer = status.GPS.SuplServer
 		s.Logger.Printf("Current SUPL server: %s", currentSuplServer)
 	}
@@ -182,75 +252,103 @@ func (s *Service) configureGPS() error {
 	if currentSuplServer != s.Config.SuplServer {
 		s.Logger.Printf("Setting SUPL server to %s", s.Config.SuplServer)
 
-		allSources := []string{
-			"--location-disable-3gpp",
-			"--location-disable-agps-msb",
-			"--location-disable-gps-unmanaged",
-			"--location-disable-gps-nmea",
-			"--location-disable-gps-raw",
-			"--location-disable-cdma-bs",
-			"--location-disable-agps-msa",
+		// Disable all sources individually before setting SUPL server
+		allSources := []string{"3gpp", "agps-msb", "gps-unmanaged", "gps-nmea", "gps-raw", "cdma-bs", "agps-msa"}
+
+		for _, source := range allSources {
+			args := []string{"-m", s.ModemID, "--location-disable-" + source}
+			if err := s.runMMCLICommand(ctx, args); err != nil {
+				s.Logger.Printf("Warning: Failed to disable %s: %v", source, err)
+				// Continue with other sources
+			}
+			// Small delay between commands
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 
-		args := append([]string{"-m", s.ModemID}, allSources...)
-		if err := exec.Command("mmcli", args...).Run(); err != nil {
-			s.Logger.Printf("Warning: Failed to disable all location sources: %v", err)
-		}
-
-		if err := exec.Command("mmcli", "-m", s.ModemID,
-			"--location-set-supl-server", s.Config.SuplServer).Run(); err != nil {
+		// Set SUPL server
+		args := []string{"-m", s.ModemID, "--location-set-supl-server", s.Config.SuplServer}
+		if err := s.runMMCLICommand(ctx, args); err != nil {
 			return fmt.Errorf("failed to set SUPL server: %v", err)
 		}
 	} else {
 		s.Logger.Printf("SUPL server already set correctly")
 	}
 
-	if !sourcesEnabled["3gpp-lac-ci"] {
-		if err := exec.Command("mmcli", "-m", s.ModemID,
-			"--location-enable-3gpp").Run(); err != nil {
-			return fmt.Errorf("failed to enable 3GPP location services: %v", err)
-		}
-		s.Logger.Printf("Enabled 3gpp-lac-ci location source")
-	} else {
-		s.Logger.Printf("3gpp-lac-ci location source already enabled")
+	return nil
+}
+
+func (s *Service) enableLocationSources(ctx context.Context, sourcesEnabled map[string]bool) error {
+	// Define the sources we want to enable in order
+	requiredSources := []struct {
+		name        string
+		mmcliFlag   string
+		description string
+		required    bool
+	}{
+		{"3gpp-lac-ci", "--location-enable-3gpp", "3GPP location services", true},
+		{"agps-msb", "--location-enable-agps-msb", "A-GPS", true},
+		{"gps-unmanaged", "--location-enable-gps-unmanaged", "GPS unmanaged", true},
 	}
 
-	if !sourcesEnabled["agps-msb"] {
-		if err := exec.Command("mmcli", "-m", s.ModemID,
-			"--location-enable-agps-msb").Run(); err != nil {
-			return fmt.Errorf("failed to enable A-GPS: %v", err)
-		}
-		s.Logger.Printf("Enabled agps-msb location source")
-	} else {
-		s.Logger.Printf("agps-msb location source already enabled")
-	}
+	for _, source := range requiredSources {
+		if !sourcesEnabled[source.name] {
+			s.Logger.Printf("Attempting to enable %s location source...", source.name)
 
-	// Add a small delay before enabling the final, critical source
-	time.Sleep(500 * time.Millisecond)
+			// Try enabling with retries for critical sources
+			var enableErr error
+			maxRetries := 1
+			if source.required {
+				maxRetries = 3
+			}
 
-	if !sourcesEnabled["gps-unmanaged"] {
-		s.Logger.Printf("Attempting to enable gps-unmanaged location source...")
-		var enableErr error
-		for attempt := 0; attempt < 3; attempt++ {
-			enableErr = exec.Command("mmcli", "-m", s.ModemID, "--location-enable-gps-unmanaged").Run()
-			if enableErr == nil {
-				s.Logger.Printf("Successfully enabled gps-unmanaged location source (attempt %d)", attempt+1)
-				break // Success
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				args := []string{"-m", s.ModemID, source.mmcliFlag}
+				enableErr = s.runMMCLICommand(ctx, args)
+				if enableErr == nil {
+					s.Logger.Printf("Successfully enabled %s location source (attempt %d)", source.name, attempt+1)
+					break
+				}
+				s.Logger.Printf("Warning: Failed to enable %s (attempt %d/%d): %v", source.name, attempt+1, maxRetries, enableErr)
+
+				// Brief pause before retry
+				if attempt < maxRetries-1 {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(1 * time.Second):
+					}
+				}
 			}
-			s.Logger.Printf("Warning: Failed to enable gps-unmanaged (attempt %d/%d): %v", attempt+1, 3, enableErr)
-			if attempt < 2 { // Don't sleep after the last attempt
-				time.Sleep(1 * time.Second)
+
+			if enableErr != nil {
+				if source.required {
+					return fmt.Errorf("failed to enable required %s after %d attempts: %v", source.description, maxRetries, enableErr)
+				} else {
+					s.Logger.Printf("Warning: Failed to enable optional %s: %v", source.description, enableErr)
+				}
 			}
+		} else {
+			s.Logger.Printf("%s location source already enabled", source.name)
 		}
-		if enableErr != nil {
-			// Return error only if all attempts failed
-			return fmt.Errorf("failed to enable GPS unmanaged after multiple attempts: %v", enableErr)
+
+		// Small delay between enabling different sources
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
 		}
-	} else {
-		s.Logger.Printf("gps-unmanaged location source already enabled")
 	}
 
 	return nil
+}
+
+func (s *Service) runMMCLICommand(ctx context.Context, args []string) error {
+	cmd := exec.CommandContext(ctx, "mmcli", args...)
+	return cmd.Run()
 }
 
 func (s *Service) connectToGPSD() error {

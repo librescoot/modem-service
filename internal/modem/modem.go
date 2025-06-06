@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -428,4 +429,85 @@ func WaitForModem(ctx context.Context, interfaceName string, logger *log.Logger)
 // ResetModem resets the modem
 func ResetModem(modemID string) error {
 	return exec.Command("mmcli", "-m", modemID, "--reset").Run()
+}
+
+// RecoverUSB attempts to recover the modem by unbinding and rebinding the USB device
+func RecoverUSB(logger *log.Logger) error {
+	const waitTimeBindUnbind = 30
+	const waitTimeMmcli = 30
+	const usbDevice = "1-1" // USB device path for the modem
+
+	logger.Printf("USB recovery: 'unbind'")
+	if err := writeToFile("/sys/bus/usb/drivers/usb/unbind", usbDevice); err != nil {
+		logger.Printf("Warning: Failed to unbind USB device: %v", err)
+		// Continue anyway, might still work
+	}
+
+	time.Sleep(waitTimeBindUnbind * time.Second)
+
+	if isUSBDevicePresent() {
+		logger.Printf("USB recovery: USB device still found after 'unbind'")
+	}
+
+	logger.Printf("USB recovery: 'bind'")
+	if err := writeToFile("/sys/bus/usb/drivers/usb/bind", usbDevice); err != nil {
+		logger.Printf("Warning: Failed to bind USB device: %v", err)
+		return fmt.Errorf("failed to bind USB device: %v", err)
+	}
+
+	// Wait for USB device to come back
+	time.Sleep(waitTimeBindUnbind * time.Second)
+
+	if isUSBDevicePresent() {
+		logger.Printf("USB recovery: USB device found after 'bind', modem seems to be ON")
+		logger.Printf("USB recovery: waiting %ds for 'mmcli -L'...", waitTimeMmcli)
+		time.Sleep(waitTimeMmcli * time.Second)
+	} else {
+		logger.Printf("USB recovery: USB device not found after 'bind', modem seems to be OFF")
+	}
+
+	logger.Printf("USB recovery: modem state after recovery:")
+	logger.Printf("USB recovery: usbFound: %t", isUSBDevicePresent())
+	logger.Printf("USB recovery: isModemFound: %t", IsDBusPresent())
+
+	return nil
+}
+
+// writeToFile writes data to a file (helper for USB recovery)
+func writeToFile(filename, data string) error {
+	file, err := os.OpenFile(filename, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = file.WriteString(data + "\n")
+	return err
+}
+
+// isUSBDevicePresent checks if the USB device is present
+func isUSBDevicePresent() bool {
+	// Check if USB device files exist (this is a simplified check)
+	// In a real implementation, you might want to check /sys/bus/usb/devices/ or use lsusb
+	if _, err := os.Stat("/sys/bus/usb/devices/1-1"); err == nil {
+		return true
+	}
+	// Also check for modem-specific USB devices
+	patterns := []string{
+		"/sys/bus/usb/devices/*/idVendor",
+		"/sys/bus/usb/devices/*/idProduct",
+	}
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(pattern)
+		for _, match := range matches {
+			if content, err := os.ReadFile(match); err == nil {
+				// Check for common modem vendor IDs (Simcom, etc.)
+				vendorProduct := strings.TrimSpace(string(content))
+				if vendorProduct == "1e0e" || vendorProduct == "05c6" { // Common modem vendor IDs
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
