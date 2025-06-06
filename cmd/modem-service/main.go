@@ -33,7 +33,7 @@ func main() {
 	// Create service
 	svc, err := service.New(cfg, logger, version)
 	if err != nil {
-		log.Fatalf("Failed to create service: %v", err)
+		logger.Fatalf("Failed to create service: %v", err)
 	}
 
 	// Handle signals
@@ -46,6 +46,6 @@ func main() {
 
 	// Run service
 	if err := svc.Run(ctx); err != nil {
-		log.Fatalf("Service failed: %v", err)
+		logger.Fatalf("Service failed: %v", err)
 	}
 }
