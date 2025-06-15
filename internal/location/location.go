@@ -331,6 +331,22 @@ func (s *Service) enableLocationSources(ctx context.Context, sourcesEnabled map[
 		}
 	}
 
+	// Wait 3 seconds after enabling GPS before restarting gpsd
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(3 * time.Second):
+	}
+
+	s.Logger.Printf("Restarting gpsd service after GPS configuration")
+	restartCmd := exec.CommandContext(ctx, "systemctl", "restart", "gpsd")
+	if err := restartCmd.Run(); err != nil {
+		s.Logger.Printf("Warning: Failed to restart gpsd: %v", err)
+		// Don't fail the entire operation if gpsd restart fails
+	} else {
+		s.Logger.Printf("Successfully restarted gpsd service")
+	}
+
 	return nil
 }
 
