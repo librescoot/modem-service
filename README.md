@@ -4,8 +4,6 @@
 
 The Librescoot Modem Service is a Go-based monitoring tool designed to track and manage cellular modem connectivity using ModemManager, with state synchronization through Redis.
 
-It is a free and open replacement for the `unu-modem` service on unu's Scooter Pro.
-
 ## Features
 
 - Real-time modem state monitoring

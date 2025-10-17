@@ -11,6 +11,8 @@ type Config struct {
 	InternetCheckTime time.Duration
 	Interface         string
 	GpsdServer        string
+	SuplServer        string
+	Debug             bool
 }
 
 func New() *Config {
@@ -21,6 +23,8 @@ func New() *Config {
 	flag.DurationVar(&cfg.InternetCheckTime, "internet-check-time", 30*time.Second, "Internet check interval")
 	flag.StringVar(&cfg.Interface, "interface", "wwan0", "Network interface to monitor")
 	flag.StringVar(&cfg.GpsdServer, "gpsd-server", "localhost:2947", "GPSD server address")
+	flag.StringVar(&cfg.SuplServer, "supl-server", "supl.google.com:7275", "SUPL server for A-GPS")
+	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 
 	return cfg
 }
