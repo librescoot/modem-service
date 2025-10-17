@@ -111,10 +111,10 @@ func (c *Client) PublishLocationState(ctx context.Context, rawData, filteredData
 		dataToStore = filteredData
 	}
 	
-	// Store to main gps hash and publish
+	// Store to main gps hash and publish timestamp field
 	pipe := c.client.Pipeline()
 	pipe.HSet(ctx, "gps", dataToStore)
-	pipe.Publish(ctx, "gps", "location-update")
+	pipe.Publish(ctx, "gps", "timestamp") // Publish field name to trigger immediate UI refresh
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		c.logger.Printf("Unable to set location in redis: %v", err)
