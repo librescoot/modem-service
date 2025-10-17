@@ -230,8 +230,16 @@ func (f *GPSFilter) FilterLocation(rawLoc Location) Location {
 	if f.isStationary {
 		filteredLoc.Speed = 0
 		filteredLoc.Course = f.lastValidCourse // Keep last known course when stationary
-		// Optionally, lock position to last stationary position if desired
-		// For now, we use the Kalman filtered position but set speed to 0.
+		// Lock position to prevent GPS drift when stationary
+		filteredLoc.Latitude = f.lastLocation.Latitude
+		filteredLoc.Longitude = f.lastLocation.Longitude
+		filteredLoc.Altitude = f.lastLocation.Altitude
+		// Reset Kalman velocities to zero to prevent pollution from drift
+		f.kalmanState.SetVec(2, 0) // lat_vel
+		f.kalmanState.SetVec(3, 0) // lon_vel
+		// Update Kalman position state to match locked position
+		f.kalmanState.SetVec(0, f.lastLocation.Latitude)
+		f.kalmanState.SetVec(1, f.lastLocation.Longitude)
 	} else {
 		// Calculate speed and course from Kalman filtered positions if dt is reasonable
 		if dt > 0.1 { // Avoid division by zero or too small dt
