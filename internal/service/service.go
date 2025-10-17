@@ -24,6 +24,7 @@ type Service struct {
 	LastGPSDataTime     time.Time // Last time we received any GPS data
 	GPSEnabledTime      time.Time // When GPS was first enabled
 	GPSRecoveryCount    int       // Number of GPS recovery attempts
+	LastGPSQualityLog   time.Time // Last time GPS quality was logged
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -623,6 +624,12 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					if s.WaitingForGPSLogged {
 						s.Logger.Printf("GPS fix established")
 						s.WaitingForGPSLogged = false
+					}
+
+					// Log GPS quality every 90 seconds (similar to signal quality)
+					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
+						s.Logger.Printf("gps quality: %.2f", gpsStatus["quality"].(float64))
+						s.LastGPSQualityLog = time.Now()
 					}
 
 					if err := s.publishLocationState(ctx, s.Location.LastRawReportedLocation, s.Location.CurrentLoc); err != nil {
