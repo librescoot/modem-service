@@ -49,6 +49,10 @@ type Service struct {
 	HasValidFix             bool
 	FixMode                 string  // "none", "2d", "3d"
 	Quality                 float64 // DOP value
+	HDOP                    float64 // Horizontal Dilution of Precision
+	VDOP                    float64 // Vertical Dilution of Precision
+	PDOP                    float64 // Position (3D) Dilution of Precision
+	EPH                     float64 // Estimated horizontal position error (meters)
 	GpsdConnected           bool
 	State                   string // "off", "searching", "fix-established", "error"
 	Filter                  *GPSFilter
@@ -373,6 +377,20 @@ func (s *Service) connectToGPSD() error {
 
 	s.GpsdConn = conn
 
+	// Subscribe to SKY reports for DOP values
+	s.GpsdConn.AddFilter("SKY", func(r interface{}) {
+		report, ok := r.(*gpsd.SKYReport)
+		if !ok {
+			s.Logger.Printf("Error: Could not cast SKY report")
+			return
+		}
+
+		// Update DOP values
+		s.HDOP = report.Hdop
+		s.VDOP = report.Vdop
+		s.PDOP = report.Pdop
+	})
+
 	s.GpsdConn.AddFilter("TPV", func(r interface{}) {
 		report, ok := r.(*gpsd.TPVReport)
 		if !ok {
@@ -397,8 +415,9 @@ func (s *Service) connectToGPSD() error {
 			s.State = "fix-established"
 		}
 
-		// Update quality metrics
+		// Update quality metrics from TPV report
 		s.Quality = report.Ept // Using estimated time precision as quality metric
+		s.EPH = report.Eph     // Horizontal position error estimate in meters
 
 		if report.Mode == 1 || report.Mode == 0 {
 			// 0=unknown, 1=no fix
@@ -463,6 +482,10 @@ func (s *Service) GetGPSStatus() map[string]interface{} {
 	return map[string]interface{}{
 		"fix":       s.FixMode,
 		"quality":   s.Quality,
+		"hdop":      s.HDOP,
+		"vdop":      s.VDOP,
+		"pdop":      s.PDOP,
+		"eph":       s.EPH,
 		"active":    s.HasValidFix,
 		"connected": s.GpsdConnected,
 		"state":     s.State,
