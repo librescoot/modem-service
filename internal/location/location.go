@@ -57,6 +57,8 @@ type Service struct {
 	State                   string // "off", "searching", "fix-established", "error"
 	Filter                  *GPSFilter
 	LastRawReportedLocation Location
+	GPSLostTime             time.Time // Time when GPS fix was lost
+	GPSFreshInit            bool      // True if GPS has just been initialized
 }
 
 func NewService(logger *log.Logger, gpsdServer string) *Service {
@@ -69,12 +71,13 @@ func NewService(logger *log.Logger, gpsdServer string) *Service {
 			AccuracyThresh: 50.0,
 			AntennaVoltage: 3.05,
 		},
-		Logger:      logger,
-		GpsdServer:  gpsdServer,
-		Done:        make(chan bool),
-		HasValidFix: false,
-		State:       "off",
-		Filter:      filter,
+		Logger:       logger,
+		GpsdServer:   gpsdServer,
+		Done:         make(chan bool),
+		HasValidFix:  false,
+		State:        "off",
+		Filter:       filter,
+		GPSFreshInit: true,
 	}
 }
 
@@ -490,4 +493,24 @@ func (s *Service) GetGPSStatus() map[string]interface{} {
 		"connected": s.GpsdConnected,
 		"state":     s.State,
 	}
+}
+
+// ShouldPublishRecovery determines if GPS recovery notification should be published.
+// This happens when GPS becomes available after being unavailable, and only if the
+// outage was significant (>5 minutes) or it's the first fix after initialization.
+func (s *Service) ShouldPublishRecovery(hasInternetConnection bool) bool {
+	if !hasInternetConnection {
+		return false
+	}
+
+	if s.GPSFreshInit {
+		return true
+	}
+
+	if !s.GPSLostTime.IsZero() {
+		duration := time.Since(s.GPSLostTime)
+		return duration > 5*time.Minute
+	}
+
+	return false
 }

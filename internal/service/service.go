@@ -108,7 +108,6 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 			return nil
 		}
 
-
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -459,7 +458,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	return nil
 }
 
-func (s *Service) publishLocationState(ctx context.Context, rawLoc location.Location, filteredLoc location.Location) error {
+func (s *Service) publishLocationState(ctx context.Context, rawLoc location.Location, filteredLoc location.Location, publishRecovery bool) error {
 	// Prepare Raw GPS Data
 	rawData := map[string]interface{}{
 		"latitude":  fmt.Sprintf("%.6f", rawLoc.Latitude),
@@ -488,7 +487,7 @@ func (s *Service) publishLocationState(ctx context.Context, rawLoc location.Loca
 	}
 
 	// Use new PublishLocationState that handles raw, filtered, and main gps hash
-	return s.Redis.PublishLocationState(ctx, rawData, filteredData)
+	return s.Redis.PublishLocationState(ctx, rawData, filteredData, publishRecovery)
 }
 
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
@@ -616,7 +615,24 @@ func (s *Service) monitorStatus(ctx context.Context) {
 
 				// Always publish GPS status, even without valid fix
 				gpsStatus := s.Location.GetGPSStatus()
-				if gpsStatus["active"].(bool) {
+				hasValidFix := gpsStatus["active"].(bool)
+
+				// Determine if we should publish GPS recovery notification
+				// Check current internet status from LastState
+				hasInternet := s.LastState.Status == "connected"
+				publishRecovery := false
+
+				if hasValidFix {
+					// GPS is now valid - check if this is a recovery event
+					publishRecovery = s.Location.ShouldPublishRecovery(hasInternet)
+					if publishRecovery {
+						// Clear the fresh init flag after first successful publish
+						s.Location.GPSFreshInit = false
+					}
+
+					// Reset GPS lost time since we have a fix now
+					s.Location.GPSLostTime = time.Time{}
+
 					// Update GPS data timestamp when we have active GPS
 					s.LastGPSDataTime = time.Now()
 
@@ -632,10 +648,15 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.LastGPSQualityLog = time.Now()
 					}
 
-					if err := s.publishLocationState(ctx, s.Location.LastRawReportedLocation, s.Location.CurrentLoc); err != nil {
+					if err := s.publishLocationState(ctx, s.Location.LastRawReportedLocation, s.Location.CurrentLoc, publishRecovery); err != nil {
 						s.Logger.Printf("Failed to publish location: %v", err)
 					}
 				} else {
+					// GPS fix is lost - mark the time
+					if s.Location.GPSLostTime.IsZero() {
+						s.Location.GPSLostTime = time.Now()
+					}
+
 					// Update GPS data timestamp even when no fix, if GPS is connected
 					if gpsStatus["connected"].(bool) {
 						s.LastGPSDataTime = time.Now()
@@ -646,7 +667,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.WaitingForGPSLogged = true
 					}
 
-					// Publish just the status without location data
+					// Publish just the status without location data (never publish recovery when no fix)
 					data := map[string]interface{}{
 						"fix":       gpsStatus["fix"],
 						"quality":   gpsStatus["quality"],
@@ -654,7 +675,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						"connected": gpsStatus["connected"],
 					}
 					// Use same data for both raw and filtered when no fix available
-					if err := s.Redis.PublishLocationState(ctx, data, data); err != nil {
+					if err := s.Redis.PublishLocationState(ctx, data, data, false); err != nil {
 						s.Logger.Printf("Failed to publish GPS status: %v", err)
 					}
 				}

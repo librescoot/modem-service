@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -83,18 +84,20 @@ func (c *Client) PublishFilteredLocationState(ctx context.Context, data map[stri
 	return nil
 }
 
-// PublishLocationState publishes location state to Redis based on filter setting
-func (c *Client) PublishLocationState(ctx context.Context, rawData, filteredData map[string]interface{}) error {
+// PublishLocationState publishes location state to Redis based on filter setting.
+// publishRecovery should be true only when GPS becomes available after significant outage
+// or on first fix after initialization.
+func (c *Client) PublishLocationState(ctx context.Context, rawData, filteredData map[string]interface{}, publishRecovery bool) error {
 	// Store raw data to gps:raw
 	if err := c.PublishRawLocationState(ctx, rawData); err != nil {
 		return err
 	}
-	
+
 	// Store filtered data to gps:filtered
 	if err := c.PublishFilteredLocationState(ctx, filteredData); err != nil {
 		return err
 	}
-	
+
 	// Check filter setting to decide which data to store in main gps hash
 	filterSetting, err := c.client.HGet(ctx, "modem", "gps:filter").Result()
 	if err != nil && err != redis.Nil {
@@ -102,7 +105,7 @@ func (c *Client) PublishLocationState(ctx context.Context, rawData, filteredData
 		// Default to filtered if we can't read the setting
 		filterSetting = "on"
 	}
-	
+
 	var dataToStore map[string]interface{}
 	if filterSetting == "off" {
 		dataToStore = rawData
@@ -110,11 +113,18 @@ func (c *Client) PublishLocationState(ctx context.Context, rawData, filteredData
 		// Default to filtered data when setting is "on" or missing
 		dataToStore = filteredData
 	}
-	
-	// Store to main gps hash and publish timestamp field
+
+	// Add updated timestamp to track when data was last refreshed
+	dataToStore["updated"] = time.Now().Format(time.RFC3339)
+
+	// Store to main gps hash and conditionally publish recovery notification
 	pipe := c.client.Pipeline()
 	pipe.HSet(ctx, "gps", dataToStore)
-	pipe.Publish(ctx, "gps", "timestamp") // Publish field name to trigger immediate UI refresh
+	if publishRecovery {
+		// Only publish recovery notification when GPS becomes available after
+		// significant outage or first fix after initialization
+		pipe.Publish(ctx, "gps", "timestamp")
+	}
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		c.logger.Printf("Unable to set location in redis: %v", err)
