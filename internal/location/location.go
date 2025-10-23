@@ -12,12 +12,13 @@ import (
 )
 
 const (
-	GPSUpdateInterval = 1 * time.Second
-	GPSTimeout        = 10 * time.Minute
-	MaxGPSRetries     = 10
-	GPSRetryInterval  = 5 * time.Second
-	GPSConfigTimeout  = 30 * time.Second
-	MaxConfigRetries  = 3
+	GPSUpdateInterval         = 1 * time.Second
+	GPSTimeout                = 10 * time.Minute
+	GPSTimestampStaleness     = 180 * time.Second
+	MaxGPSRetries             = 10
+	GPSRetryInterval          = 5 * time.Second
+	GPSConfigTimeout          = 30 * time.Second
+	MaxConfigRetries          = 3
 )
 
 type Config struct {
@@ -59,6 +60,8 @@ type Service struct {
 	LastRawReportedLocation Location
 	GPSLostTime             time.Time // Time when GPS fix was lost
 	GPSFreshInit            bool      // True if GPS has just been initialized
+	LastGPSTimestamp        time.Time // Last GPS timestamp received from GPSD
+	LastGPSTimestampUpdate  time.Time // When we last saw the GPS timestamp change
 }
 
 func NewService(logger *log.Logger, gpsdServer string) *Service {
@@ -445,6 +448,12 @@ func (s *Service) connectToGPSD() error {
 
 		if !report.Time.IsZero() {
 			rawLocation.Timestamp = report.Time
+
+			// Track GPS timestamp changes
+			if s.LastGPSTimestamp.IsZero() || !report.Time.Equal(s.LastGPSTimestamp) {
+				s.LastGPSTimestamp = report.Time
+				s.LastGPSTimestampUpdate = time.Now()
+			}
 		} else {
 			rawLocation.Timestamp = time.Now()
 		}
@@ -468,6 +477,15 @@ func (s *Service) connectToGPSD() error {
 
 	s.Done = s.GpsdConn.Watch()
 
+	return nil
+}
+
+func (s *Service) StopGPSD() error {
+	cmd := exec.Command("systemctl", "stop", "gpsd")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to stop gpsd: %v", err)
+	}
+	s.Logger.Printf("Successfully stopped gpsd service")
 	return nil
 }
 

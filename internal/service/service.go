@@ -292,6 +292,13 @@ func (s *Service) attemptGPSRecovery() error {
 		return nil
 	}
 
+	// Stop gpsd before performing GPS-related modem reset
+	s.Logger.Printf("Stopping gpsd service before GPS reset...")
+	if err := s.Location.StopGPSD(); err != nil {
+		s.Logger.Printf("Warning: Failed to stop gpsd: %v", err)
+		// Continue with recovery even if gpsd stop fails
+	}
+
 	// Close existing GPS connection
 	s.Location.Close()
 	time.Sleep(2 * time.Second)
@@ -300,6 +307,8 @@ func (s *Service) attemptGPSRecovery() error {
 	s.LastGPSDataTime = time.Time{}
 	s.GPSEnabledTime = time.Time{}
 	s.WaitingForGPSLogged = false
+	s.Location.LastGPSTimestamp = time.Time{}
+	s.Location.LastGPSTimestampUpdate = time.Time{}
 
 	// Try to re-enable GPS
 	modemID, err := modem.FindModemID()
@@ -561,6 +570,11 @@ func (s *Service) checkGPSHealth() error {
 	// Check if GPS data is stale (no data for 30 seconds)
 	if !s.LastGPSDataTime.IsZero() && now.Sub(s.LastGPSDataTime) > 30*time.Second {
 		return fmt.Errorf("gps_data_stale: no GPS data received for %v", now.Sub(s.LastGPSDataTime))
+	}
+
+	// Check if GPS timestamp is stuck (timestamp hasn't changed for 180 seconds)
+	if !s.Location.LastGPSTimestampUpdate.IsZero() && now.Sub(s.Location.LastGPSTimestampUpdate) > location.GPSTimestampStaleness {
+		return fmt.Errorf("gps_timestamp_stuck: GPS timestamp hasn't changed for %v", now.Sub(s.Location.LastGPSTimestampUpdate))
 	}
 
 	// Check if GPS fix is taking too long (no fix for 300 seconds since GPS was enabled)
