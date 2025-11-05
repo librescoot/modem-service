@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/rescoot/go-mmcli"
@@ -163,11 +164,15 @@ func (s *Service) configureGPSWithRetries(ctx context.Context) error {
 }
 
 func (s *Service) doGPSConfiguration(ctx context.Context) error {
-	// First, get current status with timeout
+	// Configure GPS via AT commands first
+	if err := s.configureGPSViaATCommands(ctx); err != nil {
+		s.Logger.Printf("Warning: GPS AT config failed: %v", err)
+	}
+
+	// Get current ModemManager location status
 	status, err := s.getLocationStatusWithTimeout(ctx)
 	if err != nil {
-		s.Logger.Printf("Warning: Could not get current location status: %v", err)
-		// Continue with configuration anyway
+		s.Logger.Printf("Warning: Could not get location status: %v", err)
 	}
 
 	sourcesEnabled := map[string]bool{
@@ -181,7 +186,7 @@ func (s *Service) doGPSConfiguration(ctx context.Context) error {
 	}
 
 	if status != nil {
-		s.Logger.Printf("Current location sources status: %+v", status)
+		s.Logger.Printf("Location sources: %d enabled (%s)", len(status.Enabled), strings.Join(status.Enabled, ", "))
 		for _, enabled := range status.Enabled {
 			sourcesEnabled[enabled] = true
 		}
@@ -202,6 +207,165 @@ func (s *Service) doGPSConfiguration(ctx context.Context) error {
 		return fmt.Errorf("failed to enable location sources: %v", err)
 	}
 
+	// Set GPS refresh rate
+	if err := s.setGPSRefreshRate(ctx); err != nil {
+		s.Logger.Printf("Warning: Failed to set GPS refresh rate: %v", err)
+	}
+
+	// Configure antenna power (critical - can reset on reboot)
+	if err := s.configureAntennaPower(ctx); err != nil {
+		s.Logger.Printf("Warning: Failed to configure antenna power: %v", err)
+	}
+
+	return nil
+}
+
+// sendATCommand is a helper to send AT commands with context and logging support
+func (s *Service) sendATCommand(ctx context.Context, command string, logResponse bool) (string, error) {
+	done := make(chan struct {
+		response string
+		err      error
+	}, 1)
+
+	go func() {
+		response, err := mmcli.SendATCommand(s.ModemID, command)
+		done <- struct {
+			response string
+			err      error
+		}{response, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result := <-done:
+		if result.err != nil {
+			return "", result.err
+		}
+		if logResponse && result.response != "" {
+			s.Logger.Printf("%s -> %s", command, result.response)
+		}
+		return result.response, nil
+	}
+}
+
+// configureGPSViaATCommands configures GPS using AT commands for optimal performance
+// Uses direct modem AT commands for comprehensive GPS setup including antenna power,
+// XTRA assisted GPS, and accuracy thresholds for faster and more reliable GPS fixes
+func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
+	s.Logger.Printf("Configuring GPS via AT commands...")
+
+	// Stop GPS before configuration (ignore errors if not running)
+	s.sendATCommand(ctx, "AT+CGPS=0", false)
+
+	// Wait a moment for GPS to stop
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(1 * time.Second):
+	}
+
+	// Disable automatic GPS start and standalone mode
+	s.sendATCommand(ctx, "AT+CGPSAUTO=0", false)
+	s.sendATCommand(ctx, "AT+CGPSMSB=0", false)
+
+	// Set accuracy threshold (50 meters - higher = faster fix)
+	accuracyMeters := int(s.Config.AccuracyThresh)
+	cmd := fmt.Sprintf("AT+CGPSHOR=%d", accuracyMeters)
+	s.sendATCommand(ctx, cmd, false)
+	s.Logger.Printf("GPS accuracy threshold: %dm", accuracyMeters)
+
+	// Set GPS antenna GPIO (GPIO 41 as output, high)
+	s.sendATCommand(ctx, "AT+CGDRT=41,1", false)
+	s.sendATCommand(ctx, "AT+CGSETV=41,1", false)
+
+	// Set GPS clock from system time
+	s.setGPSClockFromSystem(ctx)
+
+	// Configure APN and socket context (optional)
+	s.sendATCommand(ctx, `AT+CGDCONT=1,"IP","internet"`, false)
+	s.sendATCommand(ctx, `AT+CGSOCKCONT=1,"IP","internet"`, false)
+
+	// Enable GPS XTRA assisted GPS (faster fix)
+	s.sendATCommand(ctx, "AT+CGPSXE=1", false)
+	s.sendATCommand(ctx, "AT+CGPSSSL=0", false)
+	s.sendATCommand(ctx, "AT+CGPSXD=0", false)
+	s.sendATCommand(ctx, "AT+CGPSXDAUTO=1", false)
+	s.Logger.Printf("GPS XTRA assisted GPS enabled")
+
+	// Configure NMEA and positioning mode
+	s.sendATCommand(ctx, "AT+CGPSNMEA=511", false)
+	s.sendATCommand(ctx, "AT+CGPSPMD=7", false)
+	return nil
+}
+
+// configureAntennaPower configures the GPS antenna power supply
+// CRITICAL: This can reset to 2950mV after reboot which prevents GPS from working
+// Must be called on every GPS enable, not just initial configuration
+func (s *Service) configureAntennaPower(ctx context.Context) error {
+	voltageMillivolts := int(s.Config.AntennaVoltage * 1000)
+
+	// Check and log current antenna voltage
+	if response, err := s.sendATCommand(ctx, "AT+CVAUXV?", false); err == nil {
+		s.Logger.Printf("GPS antenna voltage: %s", response)
+	}
+
+	// Set antenna voltage (3050 = 3.05V for 3V antenna)
+	cmd := fmt.Sprintf("AT+CVAUXV=%d", voltageMillivolts)
+	if _, err := s.sendATCommand(ctx, cmd, false); err != nil {
+		return fmt.Errorf("failed to set antenna voltage: %v", err)
+	}
+
+	// Enable antenna power supply
+	if _, err := s.sendATCommand(ctx, "AT+CVAUXS=1", false); err != nil {
+		return fmt.Errorf("failed to enable antenna power: %v", err)
+	}
+	s.Logger.Printf("GPS antenna powered: %dmV", voltageMillivolts)
+
+	// Update GPS clock after antenna power up
+	s.updateGPSClockFromSystem(ctx)
+
+	// Check if GPS is enabled, start it if needed
+	response, err := s.sendATCommand(ctx, "AT+CGPS?", false)
+	if err == nil && !strings.Contains(response, "+CGPS: 1,1") && !strings.Contains(response, "+CGPS:1,1") {
+		s.sendATCommand(ctx, "AT+CGPS=1,1", false)
+		s.Logger.Printf("GPS started")
+	}
+
+	// Set GPS notification mode
+	s.sendATCommand(ctx, "AT+CGPSNOTIFY=0", false)
+
+	return nil
+}
+
+// setGPSClockFromSystem sets the modem's GPS clock from system time
+func (s *Service) setGPSClockFromSystem(ctx context.Context) error {
+	now := time.Now().UTC()
+	clockCmd := fmt.Sprintf(`AT+CCLK="%s"`, now.Format("06/01/02,15:04:05+00"))
+	s.sendATCommand(ctx, clockCmd, false)
+	s.Logger.Printf("Set GPS clock: %s", now.Format("15:04:05"))
+	return nil
+}
+
+// updateGPSClockFromSystem updates the modem's GPS clock from system time (used after antenna power up)
+func (s *Service) updateGPSClockFromSystem(ctx context.Context) error {
+	now := time.Now().UTC()
+	clockCmd := fmt.Sprintf(`AT+CCLK="%s"`, now.Format("06/01/02,15:04:05+00"))
+	s.sendATCommand(ctx, clockCmd, false)
+	s.Logger.Printf("Updated GPS clock: %s", now.Format("15:04:05"))
+	return nil
+}
+
+// setGPSRefreshRate sets the GPS refresh rate via ModemManager
+func (s *Service) setGPSRefreshRate(ctx context.Context) error {
+	// Set GPS refresh rate to 1 second (matches GPSUpdateInterval)
+	refreshSeconds := int(s.Config.RefreshRate.Seconds())
+	args := []string{"-m", s.ModemID, "--location-set-gps-refresh-rate", fmt.Sprintf("%d", refreshSeconds)}
+
+	if err := s.runMMCLICommand(ctx, args); err != nil {
+		return fmt.Errorf("failed to set GPS refresh rate to %ds: %v", refreshSeconds, err)
+	}
+	s.Logger.Printf("Set GPS refresh rate to %d second(s)", refreshSeconds)
 	return nil
 }
 
@@ -292,9 +456,10 @@ func (s *Service) enableLocationSources(ctx context.Context, sourcesEnabled map[
 		{"gps-unmanaged", "--location-enable-gps-unmanaged", "GPS unmanaged", true},
 	}
 
+	var alreadyEnabled []string
 	for _, source := range requiredSources {
 		if !sourcesEnabled[source.name] {
-			s.Logger.Printf("Attempting to enable %s location source...", source.name)
+			s.Logger.Printf("Enabling %s location source", source.name)
 
 			// Try enabling with retries for critical sources
 			var enableErr error
@@ -307,7 +472,7 @@ func (s *Service) enableLocationSources(ctx context.Context, sourcesEnabled map[
 				args := []string{"-m", s.ModemID, source.mmcliFlag}
 				enableErr = s.runMMCLICommand(ctx, args)
 				if enableErr == nil {
-					s.Logger.Printf("Successfully enabled %s location source (attempt %d)", source.name, attempt+1)
+					s.Logger.Printf("Enabled %s", source.name)
 					break
 				}
 				s.Logger.Printf("Warning: Failed to enable %s (attempt %d/%d): %v", source.name, attempt+1, maxRetries, enableErr)
@@ -330,7 +495,7 @@ func (s *Service) enableLocationSources(ctx context.Context, sourcesEnabled map[
 				}
 			}
 		} else {
-			s.Logger.Printf("%s location source already enabled", source.name)
+			alreadyEnabled = append(alreadyEnabled, source.name)
 		}
 
 		// Small delay between enabling different sources
@@ -339,6 +504,11 @@ func (s *Service) enableLocationSources(ctx context.Context, sourcesEnabled map[
 			return ctx.Err()
 		case <-time.After(200 * time.Millisecond):
 		}
+	}
+
+	// Log already enabled sources once
+	if len(alreadyEnabled) > 0 {
+		s.Logger.Printf("Location sources already configured: %s", strings.Join(alreadyEnabled, ", "))
 	}
 
 	// Wait 3 seconds after enabling GPS before restarting gpsd
