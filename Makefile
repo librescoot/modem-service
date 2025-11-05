@@ -1,4 +1,4 @@
-BIN := rescoot-modem
+BIN := modem-service
 GIT_REV := $(shell git describe --tags --always 2>/dev/null)
 ifdef GIT_REV
 LDFLAGS := -X main.version=$(GIT_REV)

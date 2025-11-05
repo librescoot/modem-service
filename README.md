@@ -25,7 +25,7 @@ It is a free and open replacement for the `unu-modem` service on unu's Scooter P
 Assuming your mdb is connected via USB Ethernet as 192.168.7.1 and aliased as `mdb`;
 ```bash
 make dist
-scp rescoot-modem-arm-dist root@mdb:/usr/bin/rescoot-modem
+scp modem-service-arm-dist root@mdb:/usr/bin/modem-service
 ```
 
 ## Configuration
@@ -117,7 +117,7 @@ GPS state transitions occur when:
 ## Usage
 
 ```bash
-rescoot-modem \
+modem-service \
   -redis-url redis://redis.example.com:6379 \
   -interface wwan0 \
   -internet-check-time 45s \

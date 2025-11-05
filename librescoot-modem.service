@@ -1,11 +1,11 @@
 [Unit]
-Description=rescoot modem service
+Description=librescoot modem service
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/etc/rescoot
-ExecStart=/usr/bin/rescoot-modem
+WorkingDirectory=/etc/librescoot
+ExecStart=/usr/bin/modem-service
 Restart=always
 RestartSec=30
 

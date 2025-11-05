@@ -19,7 +19,7 @@ func main() {
 	if os.Getenv("INVOCATION_ID") != "" {
 		logger = log.New(os.Stdout, "", 0)
 	} else {
-		logger = log.New(os.Stdout, "rescoot-modem: ", log.LstdFlags|log.Lmsgprefix)
+		logger = log.New(os.Stdout, "modem-service: ", log.LstdFlags|log.Lmsgprefix)
 	}
 
 	// Create config
