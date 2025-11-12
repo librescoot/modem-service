@@ -66,6 +66,7 @@ type Service struct {
 	LastGPSTimestamp       time.Time  // Last GPS timestamp received from GPSD
 	LastGPSTimestampUpdate time.Time  // When we last saw the GPS timestamp change
 	configMutex            sync.Mutex // Protects GPS configuration to prevent concurrent attempts
+	monitoringActive       bool       // True if monitoring goroutine is already running
 }
 
 func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, suplServer string) *Service {
@@ -94,7 +95,19 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 	s.ModemPath = modemPath
 	s.Enabled = true
 
+	// Prevent multiple monitoring goroutines from running
+	if s.monitoringActive {
+		s.Logger.Printf("GPS monitoring already active, skipping duplicate EnableGPS call")
+		return nil
+	}
+
+	s.monitoringActive = true
+
 	go func() {
+		defer func() {
+			s.monitoringActive = false
+		}()
+
 		attempt := 0
 		for {
 			if !s.Enabled {
