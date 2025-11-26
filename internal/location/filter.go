@@ -9,12 +9,13 @@ import (
 )
 
 const (
-	defaultSpeedThreshold         = 0.5 / 3.6 // m/s (0.5 km/h)
-	defaultPositionThreshold      = 3.0       // meters
-	defaultCourseSmoothingFactor  = 0.7       // Weight for previous course
-	defaultKalmanProcessNoise     = 0.01      // Tune based on expected acceleration
-	defaultKalmanMeasurementNoise = 10.0      // Tune based on GPS accuracy (meters)
-	earthRadius                   = 6371000   // meters
+	defaultSpeedThreshold         = 1.0 / 3.6  // m/s (1 km/h) - below this, heading doesn't update
+	defaultHeadingRampSpeed       = 10.0 / 3.6 // m/s (10 km/h) - above this, full heading responsiveness
+	defaultPositionThreshold      = 3.0        // meters
+	defaultCourseSmoothingFactor  = 0.7        // Weight for previous course at high speed
+	defaultKalmanProcessNoise     = 0.01       // Tune based on expected acceleration
+	defaultKalmanMeasurementNoise = 10.0       // Tune based on GPS accuracy (meters)
+	earthRadius                   = 6371000    // meters
 )
 
 // GPSFilterConfig holds configuration for the GPS filter
@@ -241,27 +242,29 @@ func (f *GPSFilter) FilterLocation(rawLoc Location) Location {
 		f.kalmanState.SetVec(0, f.lastLocation.Latitude)
 		f.kalmanState.SetVec(1, f.lastLocation.Longitude)
 	} else {
-		// Calculate speed and course from Kalman filtered positions if dt is reasonable
-		if dt > 0.1 { // Avoid division by zero or too small dt
-			// Speed from Kalman state (convert lat/lon velocity to m/s)
-			// This is a simplification; true conversion is more complex
-			latVel := f.kalmanState.AtVec(2) // degrees/sec
-			lonVel := f.kalmanState.AtVec(3) // degrees/sec
+		// Use raw GPS speed directly - GPSD reports speed in m/s which is accurate
+		// The Kalman filter velocity estimates are too noisy for speed calculation
+		filteredLoc.Speed = rawLoc.Speed
+		f.lastValidSpeed = filteredLoc.Speed
 
-			// Convert degrees/sec to m/s (approximate)
-			// dx = dlon * R * cos(lat)
-			// dy = dlat * R
-			dx := lonVel * (math.Pi / 180.0) * earthRadius * math.Cos(filteredLoc.Latitude*(math.Pi/180.0))
-			dy := latVel * (math.Pi / 180.0) * earthRadius
-			filteredLoc.Speed = math.Sqrt(dx*dx + dy*dy)
-
-			if filteredLoc.Speed > 0.1 { // Only update course if moving significantly
-				newCourse := math.Atan2(dx, dy) * (180.0 / math.Pi)
-				if newCourse < 0 {
-					newCourse += 360
+		// Update course only when moving fast enough for GPS track to be reliable
+		// At low speeds, GPS course/track is very noisy due to position uncertainty
+		if rawLoc.Speed > f.config.SpeedThreshold {
+			newCourse := rawLoc.Course
+			if newCourse >= 0 && newCourse < 360 {
+				// Calculate speed-proportional smoothing factor
+				// At low speeds (1-10 km/h), increase smoothing to dampen GPS noise
+				smoothingFactor := f.config.CourseSmoothingFactor
+				if rawLoc.Speed < defaultHeadingRampSpeed {
+					// Linear interpolation: more smoothing at lower speeds
+					// speedRatio goes from 0 (at threshold) to 1 (at ramp speed)
+					speedRatio := (rawLoc.Speed - f.config.SpeedThreshold) / (defaultHeadingRampSpeed - f.config.SpeedThreshold)
+					// Smoothing goes from 0.95 (low speed) to configured value (high speed)
+					smoothingFactor = 0.95 - (0.95-f.config.CourseSmoothingFactor)*speedRatio
 				}
-				// Smooth course
-				if f.lastValidCourse != 0 { // Avoid smoothing if last course was 0 (e.g. initial)
+
+				// Smooth course with exponential moving average
+				if f.lastValidCourse >= 0 {
 					// Handle wrap-around for course (e.g. 350 deg to 10 deg)
 					diff := newCourse - f.lastValidCourse
 					if diff > 180 {
@@ -269,7 +272,7 @@ func (f *GPSFilter) FilterLocation(rawLoc Location) Location {
 					} else if diff < -180 {
 						diff += 360
 					}
-					smoothedCourse := f.lastValidCourse + (1-f.config.CourseSmoothingFactor)*diff
+					smoothedCourse := f.lastValidCourse + (1-smoothingFactor)*diff
 					if smoothedCourse < 0 {
 						smoothedCourse += 360
 					} else if smoothedCourse >= 360 {
@@ -280,14 +283,11 @@ func (f *GPSFilter) FilterLocation(rawLoc Location) Location {
 					filteredLoc.Course = newCourse
 				}
 				f.lastValidCourse = filteredLoc.Course
-			} else { // Low speed, keep last valid course
-				filteredLoc.Course = f.lastValidCourse
 			}
-		} else { // dt too small, use raw speed/course or keep last
-			filteredLoc.Speed = rawLoc.Speed   // Or f.lastValidSpeed
-			filteredLoc.Course = rawLoc.Course // Or f.lastValidCourse
+		} else {
+			// At low speeds, keep last valid course
+			filteredLoc.Course = f.lastValidCourse
 		}
-		f.lastValidSpeed = filteredLoc.Speed
 	}
 
 	// Update last known good location and time
