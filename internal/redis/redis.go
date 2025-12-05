@@ -60,72 +60,22 @@ func (c *Client) PublishModemState(ctx context.Context, field, value string) err
 	return nil
 }
 
-// PublishRawLocationState publishes raw location state to Redis
-func (c *Client) PublishRawLocationState(ctx context.Context, data map[string]interface{}) error {
-	pipe := c.client.Pipeline()
-	pipe.HSet(ctx, "gps:raw", data)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		c.logger.Printf("Unable to set raw location in redis: %v", err)
-		return fmt.Errorf("cannot write raw location to redis: %v", err)
-	}
-	return nil
-}
-
-// PublishFilteredLocationState publishes filtered location state to Redis
-func (c *Client) PublishFilteredLocationState(ctx context.Context, data map[string]interface{}) error {
-	pipe := c.client.Pipeline()
-	pipe.HSet(ctx, "gps:filtered", data)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		c.logger.Printf("Unable to set filtered location in redis: %v", err)
-		return fmt.Errorf("cannot write filtered location to redis: %v", err)
-	}
-	return nil
-}
-
-// PublishLocationState publishes location state to Redis based on filter setting.
+// PublishLocationState publishes location state to Redis.
 // publishRecovery should be true only when GPS becomes available after significant outage
 // or on first fix after initialization.
-func (c *Client) PublishLocationState(ctx context.Context, rawData, filteredData map[string]interface{}, publishRecovery bool) error {
-	// Store raw data to gps:raw
-	if err := c.PublishRawLocationState(ctx, rawData); err != nil {
-		return err
-	}
-
-	// Store filtered data to gps:filtered
-	if err := c.PublishFilteredLocationState(ctx, filteredData); err != nil {
-		return err
-	}
-
-	// Check filter setting to decide which data to store in main gps hash
-	filterSetting, err := c.client.HGet(ctx, "modem", "gps:filter").Result()
-	if err != nil && err != redis.Nil {
-		c.logger.Printf("Unable to get gps:filter setting: %v", err)
-		// Default to filtered if we can't read the setting
-		filterSetting = "on"
-	}
-
-	var dataToStore map[string]interface{}
-	if filterSetting == "off" {
-		dataToStore = rawData
-	} else {
-		// Default to filtered data when setting is "on" or missing
-		dataToStore = filteredData
-	}
-
+func (c *Client) PublishLocationState(ctx context.Context, data map[string]interface{}, publishRecovery bool) error {
 	// Add updated timestamp to track when data was last refreshed
-	dataToStore["updated"] = time.Now().Format(time.RFC3339)
+	data["updated"] = time.Now().Format(time.RFC3339)
 
-	// Store to main gps hash and conditionally publish recovery notification
+	// Store to gps hash and conditionally publish recovery notification
 	pipe := c.client.Pipeline()
-	pipe.HSet(ctx, "gps", dataToStore)
+	pipe.HSet(ctx, "gps", data)
 	if publishRecovery {
 		// Only publish recovery notification when GPS becomes available after
 		// significant outage or first fix after initialization
 		pipe.Publish(ctx, "gps", "timestamp")
 	}
-	_, err = pipe.Exec(ctx)
+	_, err := pipe.Exec(ctx)
 	if err != nil {
 		c.logger.Printf("Unable to set location in redis: %v", err)
 		return fmt.Errorf("cannot write location to redis: %v", err)

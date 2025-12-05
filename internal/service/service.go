@@ -467,36 +467,21 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	return nil
 }
 
-func (s *Service) publishLocationState(ctx context.Context, rawLoc location.Location, filteredLoc location.Location, publishRecovery bool) error {
-	// Prepare Raw GPS Data
-	rawData := map[string]interface{}{
-		"latitude":  fmt.Sprintf("%.6f", rawLoc.Latitude),
-		"longitude": fmt.Sprintf("%.6f", rawLoc.Longitude),
-		"altitude":  fmt.Sprintf("%.6f", rawLoc.Altitude),
-		"speed":     fmt.Sprintf("%.6f", rawLoc.Speed*3.6), // Convert m/s to km/h
-		"course":    fmt.Sprintf("%.6f", rawLoc.Course),
-		"timestamp": rawLoc.Timestamp.Format(time.RFC3339),
+func (s *Service) publishLocationState(ctx context.Context, loc location.Location, publishRecovery bool) error {
+	data := map[string]interface{}{
+		"latitude":  fmt.Sprintf("%.6f", loc.Latitude),
+		"longitude": fmt.Sprintf("%.6f", loc.Longitude),
+		"altitude":  fmt.Sprintf("%.6f", loc.Altitude),
+		"speed":     fmt.Sprintf("%.6f", loc.Speed*3.6), // Convert m/s to km/h
+		"course":    fmt.Sprintf("%.6f", loc.Course),
+		"timestamp": loc.Timestamp.Format(time.RFC3339),
 	}
-	gpsStatus := s.Location.GetGPSStatus() // Same status for both
+	gpsStatus := s.Location.GetGPSStatus()
 	for k, v := range gpsStatus {
-		rawData[k] = v
+		data[k] = v
 	}
 
-	// Prepare Filtered GPS Data
-	filteredData := map[string]interface{}{
-		"latitude":  fmt.Sprintf("%.6f", filteredLoc.Latitude),
-		"longitude": fmt.Sprintf("%.6f", filteredLoc.Longitude),
-		"altitude":  fmt.Sprintf("%.6f", filteredLoc.Altitude),
-		"speed":     fmt.Sprintf("%.6f", filteredLoc.Speed*3.6), // Convert m/s to km/h
-		"course":    fmt.Sprintf("%.6f", filteredLoc.Course),
-		"timestamp": filteredLoc.Timestamp.Format(time.RFC3339), // Use filtered timestamp
-	}
-	for k, v := range gpsStatus { // Add status to filtered data as well
-		filteredData[k] = v
-	}
-
-	// Use new PublishLocationState that handles raw, filtered, and main gps hash
-	return s.Redis.PublishLocationState(ctx, rawData, filteredData, publishRecovery)
+	return s.Redis.PublishLocationState(ctx, data, publishRecovery)
 }
 
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
@@ -662,7 +647,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.LastGPSQualityLog = time.Now()
 					}
 
-					if err := s.publishLocationState(ctx, s.Location.LastRawReportedLocation, s.Location.CurrentLoc, publishRecovery); err != nil {
+					if err := s.publishLocationState(ctx, s.Location.CurrentLoc, publishRecovery); err != nil {
 						s.Logger.Printf("Failed to publish location: %v", err)
 					}
 				} else {
@@ -688,8 +673,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						"active":    gpsStatus["active"],
 						"connected": gpsStatus["connected"],
 					}
-					// Use same data for both raw and filtered when no fix available
-					if err := s.Redis.PublishLocationState(ctx, data, data, false); err != nil {
+					if err := s.Redis.PublishLocationState(ctx, data, false); err != nil {
 						s.Logger.Printf("Failed to publish GPS status: %v", err)
 					}
 				}

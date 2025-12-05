@@ -55,19 +55,15 @@ type Service struct {
 	VDOP                    float64 // Vertical Dilution of Precision
 	PDOP                    float64 // Position (3D) Dilution of Precision
 	EPH                     float64 // Estimated horizontal position error (meters)
-	GpsdConnected           bool
-	State                   string // "off", "searching", "fix-established", "error"
-	Filter                  *GPSFilter
-	LastRawReportedLocation Location
-	GPSLostTime             time.Time // Time when GPS fix was lost
-	GPSFreshInit            bool      // True if GPS has just been initialized
-	LastGPSTimestamp        time.Time // Last GPS timestamp received from GPSD
-	LastGPSTimestampUpdate  time.Time // When we last saw the GPS timestamp change
+	GpsdConnected          bool
+	State                  string // "off", "searching", "fix-established", "error"
+	GPSLostTime            time.Time // Time when GPS fix was lost
+	GPSFreshInit           bool      // True if GPS has just been initialized
+	LastGPSTimestamp       time.Time // Last GPS timestamp received from GPSD
+	LastGPSTimestampUpdate time.Time // When we last saw the GPS timestamp change
 }
 
 func NewService(logger *log.Logger, gpsdServer string) *Service {
-	// TODO: Make filter config configurable from main config
-	filter := NewGPSFilter(nil)
 	return &Service{
 		Config: Config{
 			SuplServer:     "supl.google.com:7275",
@@ -80,7 +76,6 @@ func NewService(logger *log.Logger, gpsdServer string) *Service {
 		Done:         make(chan bool),
 		HasValidFix:  false,
 		State:        "off",
-		Filter:       filter,
 		GPSFreshInit: true,
 	}
 }
@@ -628,17 +623,9 @@ func (s *Service) connectToGPSD() error {
 			rawLocation.Timestamp = time.Now()
 		}
 
-		// Store raw location before filtering
-		s.LastRawReportedLocation = rawLocation
-
-		// Apply filter
-		s.CurrentLoc = s.Filter.FilterLocation(rawLocation)
-		// Ensure the timestamp from the raw report is preserved if the filter doesn't set it
-		if s.CurrentLoc.Timestamp.IsZero() {
-			s.CurrentLoc.Timestamp = rawLocation.Timestamp
-		}
-
-		s.LastFix = time.Now() // This should ideally be based on report.Time if available and reliable
+		// Store raw location directly (no filtering)
+		s.CurrentLoc = rawLocation
+		s.LastFix = time.Now()
 		s.HasValidFix = true
 	})
 
