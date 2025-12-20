@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"modem-service/internal/config"
@@ -25,6 +26,8 @@ type Service struct {
 	GPSEnabledTime      time.Time // When GPS was first enabled
 	GPSRecoveryCount    int       // Number of GPS recovery attempts
 	LastGPSQualityLog   time.Time // Last time GPS quality was logged
+	gpsRecoveryMutex    sync.Mutex // Prevents concurrent GPS recovery/configuration attempts
+	gpsRecoveryInProgress bool     // Tracks if GPS recovery is currently running
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -279,6 +282,22 @@ func (s *Service) handleGPSFailure(gpsErr error) error {
 
 // attemptGPSRecovery tries to recover GPS without restarting the modem
 func (s *Service) attemptGPSRecovery() error {
+	// Acquire lock to prevent concurrent GPS recovery attempts
+	s.gpsRecoveryMutex.Lock()
+	defer s.gpsRecoveryMutex.Unlock()
+
+	// Check if recovery is already in progress
+	if s.gpsRecoveryInProgress {
+		s.Logger.Printf("GPS recovery already in progress, skipping duplicate attempt")
+		return nil
+	}
+
+	// Mark recovery as in progress
+	s.gpsRecoveryInProgress = true
+	defer func() {
+		s.gpsRecoveryInProgress = false
+	}()
+
 	s.GPSRecoveryCount++
 	s.Logger.Printf("Attempting GPS recovery (attempt %d)...", s.GPSRecoveryCount)
 
@@ -595,7 +614,12 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					continue
 				}
 
-				if !s.Location.Enabled {
+				// Check if GPS recovery is in progress before attempting to enable GPS
+				s.gpsRecoveryMutex.Lock()
+				recoveryInProgress := s.gpsRecoveryInProgress
+				s.gpsRecoveryMutex.Unlock()
+
+				if !s.Location.Enabled && !recoveryInProgress {
 					if err := s.Location.EnableGPS(modemID); err != nil {
 						s.Logger.Printf("Failed to enable GPS: %v", err)
 						continue
