@@ -1,28 +1,32 @@
 package redis
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	ipc "github.com/librescoot/redis-ipc"
 )
 
-// Client wraps the Redis client with additional functionality
+// Client wraps the Redis IPC client
 type Client struct {
-	client *redis.Client
+	client *ipc.Client
 	logger *log.Logger
 }
 
-// New creates a new Redis client
+// New creates a new Redis client using redis-ipc
 func New(redisURL string, logger *log.Logger) (*Client, error) {
-	opt, err := redis.ParseURL(redisURL)
+	client, err := ipc.New(
+		ipc.WithURL(redisURL),
+		ipc.WithCodec(ipc.StringCodec{}), // Use plain strings, not JSON (matches existing IPC)
+		ipc.WithOnDisconnect(func(err error) {
+			logger.Printf("Redis disconnected: %v", err)
+		}),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("invalid redis URL: %v", err)
+		return nil, fmt.Errorf("failed to create redis-ipc client: %v", err)
 	}
 
-	client := redis.NewClient(opt)
 	return &Client{
 		client: client,
 		logger: logger,
@@ -30,16 +34,13 @@ func New(redisURL string, logger *log.Logger) (*Client, error) {
 }
 
 // Ping checks if the Redis server is reachable
-func (c *Client) Ping(ctx context.Context) error {
-	return c.client.Ping(ctx).Err()
+func (c *Client) Ping() error {
+	return c.client.Ping()
 }
 
-// PublishInternetState publishes modem state to Redis
-func (c *Client) PublishInternetState(ctx context.Context, key, field, value string) error {
-	pipe := c.client.Pipeline()
-	pipe.HSet(ctx, "internet", field, value)
-	pipe.Publish(ctx, "internet", field)
-	_, err := pipe.Exec(ctx)
+// PublishInternetState publishes internet state to Redis using SetIfChanged
+func (c *Client) PublishInternetState(key, field, value string) error {
+	_, err := c.client.Hash("internet").SetIfChanged(field, value)
 	if err != nil {
 		c.logger.Printf("Unable to set %s in redis: %v", field, err)
 		return fmt.Errorf("cannot write to redis: %v", err)
@@ -47,12 +48,9 @@ func (c *Client) PublishInternetState(ctx context.Context, key, field, value str
 	return nil
 }
 
-// PublishModemState publishes modem state to Redis under modem hash
-func (c *Client) PublishModemState(ctx context.Context, field, value string) error {
-	pipe := c.client.Pipeline()
-	pipe.HSet(ctx, "modem", field, value)
-	pipe.Publish(ctx, "modem", field)
-	_, err := pipe.Exec(ctx)
+// PublishModemState publishes modem state to Redis under modem hash using SetIfChanged
+func (c *Client) PublishModemState(field, value string) error {
+	_, err := c.client.Hash("modem").SetIfChanged(field, value)
 	if err != nil {
 		c.logger.Printf("Unable to set modem.%s in redis: %v", field, err)
 		return fmt.Errorf("cannot write to redis: %v", err)
@@ -62,20 +60,22 @@ func (c *Client) PublishModemState(ctx context.Context, field, value string) err
 
 // PublishLocationState publishes location state to Redis.
 // publishRecovery should be true only when GPS becomes available after significant outage
-// or on first fix after initialization.
-func (c *Client) PublishLocationState(ctx context.Context, data map[string]interface{}, publishRecovery bool) error {
+// or on first fix after initialization. When true, publishes a "timestamp" notification.
+// When false, updates the hash without publishing (silent update).
+func (c *Client) PublishLocationState(data map[string]interface{}, publishRecovery bool) error {
 	// Add updated timestamp to track when data was last refreshed
 	data["updated"] = time.Now().Format(time.RFC3339)
 
-	// Store to gps hash and conditionally publish recovery notification
-	pipe := c.client.Pipeline()
-	pipe.HSet(ctx, "gps", data)
+	// Handle GPS publishing based on recovery status
+	// When publishRecovery is true: publish "timestamp" notification (GPS recovered)
+	// When publishRecovery is false: silent update (no pub/sub notification)
+	var err error
 	if publishRecovery {
-		// Only publish recovery notification when GPS becomes available after
-		// significant outage or first fix after initialization
-		pipe.Publish(ctx, "gps", "timestamp")
+		err = c.client.Hash("gps").SetManyPublishOne(data, "timestamp")
+	} else {
+		err = c.client.Hash("gps").SetMany(data, ipc.NoPublish())
 	}
-	_, err := pipe.Exec(ctx)
+
 	if err != nil {
 		c.logger.Printf("Unable to set location in redis: %v", err)
 		return fmt.Errorf("cannot write location to redis: %v", err)
