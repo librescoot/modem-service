@@ -8,7 +8,7 @@ endif
 BUILDFLAGS := -tags netgo,osusergo
 MAIN := ./cmd/modem-service
 
-.PHONY: build amd64 arm clean
+.PHONY: build amd64 arm build-arm clean
 
 dev: build
 build:
@@ -19,6 +19,8 @@ amd64:
 
 arm:
 	GOOS=linux GOARCH=arm GOARM=7 go build -ldflags "$(LDFLAGS)" $(BUILDFLAGS) -o ${BIN}-arm ${MAIN}
+
+build-arm: arm
 
 dist:
 	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS) -s -w" $(BUILDFLAGS) -o ${BIN}-arm-dist ${MAIN}
