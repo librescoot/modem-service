@@ -62,6 +62,7 @@ type Service struct {
 	State                  string     // "off", "searching", "fix-established", "error"
 	GPSLostTime            time.Time  // Time when GPS fix was lost
 	GPSFreshInit           bool       // True if GPS has just been initialized
+	LastDataReceived       time.Time  // Last time any GPS data was received (even without fix)
 	LastGPSTimestamp       time.Time  // Last GPS timestamp received from GPSD
 	LastGPSTimestampUpdate time.Time  // When we last saw the GPS timestamp change
 	configMutex            sync.Mutex // Protects GPS configuration to prevent concurrent attempts
@@ -104,7 +105,36 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 				s.configMutex.Lock()
 				// Double-check after acquiring lock (another goroutine might have configured it)
 				if s.GpsdConn == nil {
-					s.Logger.Printf("GPS not configured or gpsd connection lost, attempting configuration (attempt %d)", attempt+1)
+					// On first attempt, try connecting to gpsd without reconfiguring GPS
+					// (GPS might already be running from previous service instance)
+					if attempt == 0 && s.GPSFreshInit {
+						s.Logger.Printf("Trying to connect to existing gpsd...")
+						if err := s.connectToGPSD(); err == nil {
+							s.Logger.Printf("Connected to gpsd, checking for GPS data...")
+							s.configMutex.Unlock()
+
+							// Wait briefly to see if we get GPS data
+							time.Sleep(3 * time.Second)
+
+							if s.LastDataReceived.After(time.Now().Add(-5 * time.Second)) {
+								s.Logger.Printf("GPS already running, reusing existing connection")
+								s.GPSFreshInit = false
+								attempt = 0
+								continue
+							}
+
+							// No data, need to reconfigure
+							s.Logger.Printf("No GPS data received from gpsd, will reconfigure")
+							s.configMutex.Lock()
+							if s.GpsdConn != nil {
+								s.GpsdConn.Close()
+								s.GpsdConn = nil
+							}
+						}
+						s.GPSFreshInit = false
+					}
+
+					s.Logger.Printf("Configuring GPS (attempt %d)", attempt+1)
 
 					if err := s.configureGPS(); err != nil {
 						s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
@@ -569,6 +599,9 @@ func (s *Service) connectToGPSD() error {
 			s.State = "error"
 			return
 		}
+
+		// Track when we receive any GPS data (even without fix)
+		s.LastDataReceived = time.Now()
 
 		// Update fix status
 		switch report.Mode {
