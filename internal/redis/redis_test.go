@@ -47,11 +47,11 @@ func TestNew(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
 
 	tests := []struct {
-		name      string
-		redisURL  string
-		wantErr   bool
-		wantHost  string
-		wantPort  int
+		name     string
+		redisURL string
+		wantErr  bool
+		wantHost string
+		wantPort int
 	}{
 		{
 			name:     "valid URL with port",

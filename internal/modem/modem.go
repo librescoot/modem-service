@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"modem-service/internal/gpio"
+	"modem-service/internal/mm"
+	"modem-service/internal/usb"
 	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/rescoot/go-mmcli"
+	"github.com/godbus/dbus/v5"
 )
 
 // Constants for modem state
@@ -44,9 +45,8 @@ const (
 	RegistrationUnknown = "unknown"
 )
 
-// GPIO Control constants
+// Timing constants
 const (
-	GPIOPin        = 110
 	CheckInterval  = 5 * time.Second
 	MaxStartChecks = 60 // 5 minutes (60 * 5 seconds)
 )
@@ -73,11 +73,53 @@ type State struct {
 	ErrorState         string
 }
 
+// Manager manages modem operations via D-Bus
+type Manager struct {
+	client    *mm.Client
+	gpio      *gpio.PowerController
+	usb       *usb.Recovery
+	logger    *log.Logger
+	modemPath dbus.ObjectPath
+}
+
+// NewManager creates a new modem manager
+func NewManager(logger *log.Logger, debug bool) (*Manager, error) {
+	client, err := mm.NewClient(debug, logger.Printf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ModemManager client: %v", err)
+	}
+
+	gpioCtrl, err := gpio.NewPowerController(logger.Printf)
+	if err != nil {
+		logger.Printf("Warning: GPIO controller init failed: %v", err)
+	}
+
+	usbRecovery := usb.NewRecovery(logger.Printf)
+
+	return &Manager{
+		client: client,
+		gpio:   gpioCtrl,
+		usb:    usbRecovery,
+		logger: logger,
+	}, nil
+}
+
+// Close closes the manager and releases resources
+func (m *Manager) Close() error {
+	if m.gpio != nil {
+		m.gpio.Close()
+	}
+	if m.client != nil {
+		return m.client.Close()
+	}
+	return nil
+}
+
 // NewState creates a new modem state with default values
 func NewState() *State {
 	return &State{
 		Status:             StateDefault,
-		LastRawModemStatus: StateDefault, // Initialize to UNKNOWN
+		LastRawModemStatus: StateDefault,
 		AccessTech:         AccessTechDefault,
 		SignalQuality:      SignalQualityDefault,
 		IPAddr:             "UNKNOWN",
@@ -90,132 +132,162 @@ func NewState() *State {
 		OperatorCode:       "",
 		IsRoaming:          false,
 		RegistrationFail:   "",
-		ErrorState:         "", // Initialize as empty
+		ErrorState:         "",
 	}
 }
 
-// FindModemID finds the modem ID
-func FindModemID() (string, error) {
-	modemList, err := mmcli.ListModems()
-	if err != nil {
-		return "", fmt.Errorf("mmcli ListModems error: %v", err)
+// FindModem finds the modem via D-Bus
+func (m *Manager) FindModem() (dbus.ObjectPath, error) {
+	path, err := m.client.FindModem()
+	if err == nil {
+		m.modemPath = path
 	}
-
-	if len(modemList) == 0 {
-		return "", fmt.Errorf("no modem found")
-	}
-
-	// Extract ID from DBus path
-	modemPath := modemList[0]
-	return strings.Split(modemPath, "/")[5], nil
+	return path, err
 }
 
-// GetModemStatus gets the modem status
-func GetModemStatus(modemID string) (*mmcli.ModemManager, error) {
-	mm, err := mmcli.GetModemDetails(modemID)
-	if err != nil {
-		return nil, fmt.Errorf("mmcli GetModemDetails error: %v", err)
-	}
-
-	return mm, nil
-}
-
-// GetModemInfo gets the modem information
-func GetModemInfo(interfaceName string, logger *log.Logger) (*State, error) {
+// GetModemInfo gets comprehensive modem information
+func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 	state := NewState()
-	// Default error state is 'ok' unless overridden later
 	state.ErrorState = "ok"
 
-	modemID, err := FindModemID()
+	// Find modem
+	modemPath, err := m.FindModem()
 	if err != nil {
 		state.Status = "no-modem"
 		state.ErrorState = "no-modem"
 		return state, err
 	}
 
-	mm, err := GetModemStatus(modemID)
-	if err != nil {
-		// If we can't get status, assume it's an issue, but keep 'no-modem' if that was the initial error
-		if state.ErrorState == "ok" {
-			state.ErrorState = "status-error"
+	// Get power state
+	powerVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "PowerState")
+	if err == nil {
+		if powerState, ok := powerVar.Value().(uint32); ok {
+			state.PowerState = mm.PowerStateToString(int32(powerState))
 		}
-		return state, err
 	}
 
-	// Set power state
-	state.PowerState = mm.Modem.Generic.PowerState
-
-	// Handle SIM state
-	if mm.Modem.Generic.SIM == "" || mm.Modem.Generic.SIM == "--" {
-		state.SIMState = SIMStateMissing
-	} else {
-		simInfo, err := mmcli.GetSIMInfo(strings.Split(mm.Modem.Generic.SIM, "/")[5])
-		if err != nil {
-			state.SIMState = SIMStateMissing
-		} else {
-			state.SIMState = SIMStatePresent
-			state.IMSI = simInfo.Properties.IMSI
-			state.ICCID = simInfo.Properties.ICCID
-			state.OperatorName = simInfo.Properties.OperatorName
-			state.OperatorCode = simInfo.Properties.OperatorCode
-
-			if simInfo.Properties.Active != "yes" {
-				state.SIMState = SIMStateInactive
+	// Get modem state
+	stateVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "State")
+	if err == nil {
+		if modemState, ok := stateVar.Value().(int32); ok {
+			switch {
+			case state.PowerState != PowerStateOn:
+				state.Status = "off"
+			case modemState == mm.MMModemStateConnected:
+				state.Status = "connected"
+			default:
+				state.Status = "disconnected"
 			}
 		}
 	}
 
-	// Set SIM lock status
-	if mm.Modem.Generic.UnlockRequired != "" && mm.Modem.Generic.UnlockRequired != "none" {
-		state.SIMLockStatus = mm.Modem.Generic.UnlockRequired
+	// Get SIM information
+	simVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "Sim")
+	if err == nil {
+		if simPath, ok := simVar.Value().(dbus.ObjectPath); ok && string(simPath) != "/" {
+			state.SIMState = SIMStatePresent
+
+			// Get IMSI
+			if imsiVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "Imsi"); err == nil {
+				if imsi, ok := imsiVar.Value().(string); ok {
+					state.IMSI = imsi
+				}
+			}
+
+			// Get ICCID (also try via AT command)
+			if iccid, err := m.client.GetICCID(modemPath); err == nil && iccid != "" {
+				state.ICCID = iccid
+			} else if iccidVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "SimIdentifier"); err == nil {
+				if iccid, ok := iccidVar.Value().(string); ok {
+					state.ICCID = iccid
+				}
+			}
+
+			// Get operator info
+			if opVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "OperatorName"); err == nil {
+				if op, ok := opVar.Value().(string); ok {
+					state.OperatorName = op
+				}
+			}
+			if opCodeVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "OperatorIdentifier"); err == nil {
+				if opCode, ok := opCodeVar.Value().(string); ok {
+					state.OperatorCode = opCode
+				}
+			}
+		} else {
+			state.SIMState = SIMStateMissing
+		}
 	}
 
-	// Set signal quality
-	if quality, err := mm.SignalStrength(); err == nil {
-		state.SignalQuality = uint8(quality)
+	// Get SIM lock status
+	if lockVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "UnlockRequired"); err == nil {
+		if lock, ok := lockVar.Value().(uint32); ok {
+			lockStr := mm.LockReasonToString(lock)
+			if lockStr != "none" && lockStr != "unknown" {
+				state.SIMLockStatus = lockStr
+				state.SIMState = SIMStateLocked
+			}
+		}
 	}
 
-	// Set access tech and IMEI
-	state.AccessTech = mm.GetCurrentAccessTechnology()
-	state.IMEI = mm.Modem.ThreeGPP.IMEI
-
-	// Set registration state
-	switch mm.Modem.ThreeGPP.RegistrationState {
-	case "home":
-		state.Registration = RegistrationHome
-		state.IsRoaming = false
-	case "roaming":
-		state.Registration = RegistrationRoaming
-		state.IsRoaming = true
-	case "denied":
-		state.Registration = RegistrationDenied
-		state.RegistrationFail = mm.Modem.Generic.StateFailedReason
-	case "searching", "registered":
-		// No special handling
-	default:
-		state.Registration = RegistrationUnknown
+	// Get signal quality
+	if qualVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "SignalQuality"); err == nil {
+		if qual, ok := qualVar.Value().(uint32); ok {
+			state.SignalQuality = uint8(qual)
+		}
 	}
 
-	// Set connection status
-	switch {
-	case mm.Modem.Generic.PowerState != "on":
-		state.Status = "off"
-	case mm.IsConnected():
-		state.Status = "connected"
-	default:
-		state.Status = "disconnected"
+	// Get IMEI (try AT command first, fallback to property)
+	if imei, err := m.client.GetIMEI(modemPath); err == nil && imei != "" {
+		state.IMEI = imei
+	} else if imeiVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "EquipmentIdentifier"); err == nil {
+		if imei, ok := imeiVar.Value().(string); ok {
+			state.IMEI = imei
+		}
 	}
 
+	// Get access technology
+	if techVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "AccessTechnologies"); err == nil {
+		if tech, ok := techVar.Value().(uint32); ok {
+			state.AccessTech = mm.AccessTechnologyToString(tech)
+		}
+	}
+
+	// Get 3GPP registration state
+	if regVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "RegistrationState"); err == nil {
+		if reg, ok := regVar.Value().(uint32); ok {
+			state.Registration = mm.RegistrationStateToString(reg)
+			state.IsRoaming = (reg == mm.MMModem3gppRegistrationStateRoaming)
+		}
+	}
+
+	// Get operator name from 3GPP if not from SIM
+	if state.OperatorName == "" {
+		if opVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "OperatorName"); err == nil {
+			if op, ok := opVar.Value().(string); ok {
+				state.OperatorName = op
+			}
+		}
+	}
+	if state.OperatorCode == "" {
+		if opVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "OperatorCode"); err == nil {
+			if op, ok := opVar.Value().(string); ok {
+				state.OperatorCode = op
+			}
+		}
+	}
+
+	// Get interface IP if connected
 	if state.Status == "connected" {
 		if ifIP, err := GetInterfaceIP(interfaceName); err == nil {
 			state.IfIPAddr = ifIP
 		} else {
-			logger.Printf("Error getting interface IP: %v", err)
+			m.logger.Printf("Error getting interface IP: %v", err)
 			state.Status = "disconnected"
 		}
 	}
 
-	// Determine consolidated error state based on priority, only if current state is 'ok'
+	// Determine consolidated error state
 	if state.ErrorState == "ok" {
 		if state.PowerState != PowerStateOn {
 			state.ErrorState = "powered-off"
@@ -259,128 +331,103 @@ func GetInterfaceIP(interfaceName string) (string, error) {
 }
 
 // CheckPrimaryPort checks if the primary port is correct
-func CheckPrimaryPort(modemID string) error {
-	mm, err := GetModemStatus(modemID)
+func (m *Manager) CheckPrimaryPort() error {
+	if m.modemPath == "" {
+		if _, err := m.FindModem(); err != nil {
+			return err
+		}
+	}
+
+	portVar, err := m.client.GetProperty(m.modemPath, mm.ModemInterface, "PrimaryPort")
 	if err != nil {
 		return err
 	}
 
-	if mm.Modem.Generic.PrimaryPort != "cdc-wdm0" {
-		return fmt.Errorf("wrong primary port: %s", mm.Modem.Generic.PrimaryPort)
-	}
-	return nil
-}
-
-// CheckPowerState checks if the power state is correct
-func CheckPowerState(modemID string) error {
-	mm, err := GetModemStatus(modemID)
-	if err != nil {
-		return err
-	}
-
-	if mm.Modem.Generic.PowerState != "on" {
-		return fmt.Errorf("modem not powered on: %s", mm.Modem.Generic.PowerState)
-	}
-	return nil
-}
-
-// toggleGPIO performs the GPIO toggle sequence with a configurable timespan.
-// It handles export, setting direction, toggling the pin, and unexport in a safe way.
-func toggleGPIO(pin int, toggleDuration time.Duration) error {
-	// Try to export GPIO pin, but continue even if it fails (might already be exported)
-	exportErr := os.WriteFile("/sys/class/gpio/export", []byte(fmt.Sprintf("%d", pin)), 0644)
-	wasExported := exportErr == nil
-
-	// Set direction to output and continue anyway
-	directionPath := fmt.Sprintf("/sys/class/gpio/gpio%d/direction", pin)
-	dirErr := os.WriteFile(directionPath, []byte("out"), 0644)
-
-	// Only fail if we can't access the pin at all
-	if exportErr != nil && dirErr != nil {
-		return fmt.Errorf("failed to initialize GPIO pin %d: export error: %v, direction error: %v",
-			pin, exportErr, dirErr)
-	}
-
-	// Set value high
-	valuePath := fmt.Sprintf("/sys/class/gpio/gpio%d/value", pin)
-	if err := os.WriteFile(valuePath, []byte("1"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value high for pin %d: %v", pin, err)
-	}
-
-	time.Sleep(toggleDuration)
-
-	// Set value low
-	if err := os.WriteFile(valuePath, []byte("0"), 0644); err != nil {
-		return fmt.Errorf("failed to set GPIO value low for pin %d: %v", pin, err)
-	}
-
-	// Always try to unexport the pin if we successfully exported it
-	if wasExported {
-		if err := os.WriteFile("/sys/class/gpio/unexport", []byte(fmt.Sprintf("%d", pin)), 0644); err != nil {
-			// Log warning, but don't fail the operation
-			fmt.Printf("WARN: Failed to unexport GPIO pin %d: %v\n", pin, err)
+	if port, ok := portVar.Value().(string); ok {
+		if port != "cdc-wdm0" {
+			return fmt.Errorf("wrong primary port: %s", port)
 		}
 	}
 
 	return nil
 }
 
-// StartModem starts the modem with an initial quick pulse.
-// If that fails, tries the full restart sequence as a fallback.
-func StartModem(logger *log.Logger) error {
-	// First try a quick pulse to turn ON
-	if err := toggleGPIO(GPIOPin, 500*time.Millisecond); err == nil {
-		return nil
+// CheckPowerState checks if the power state is correct
+func (m *Manager) CheckPowerState() error {
+	if m.modemPath == "" {
+		if _, err := m.FindModem(); err != nil {
+			return err
+		}
 	}
 
-	// If the quick start failed, try the full restart sequence
-	if logger != nil {
-		logger.Printf("Initial modem start failed, attempting full restart sequence")
+	powerVar, err := m.client.GetProperty(m.modemPath, mm.ModemInterface, "PowerState")
+	if err != nil {
+		return err
 	}
-	return RestartModem(logger)
+
+	if power, ok := powerVar.Value().(int32); ok {
+		if power != mm.MMModemPowerStateOn {
+			return fmt.Errorf("modem not powered on: %s", mm.PowerStateToString(power))
+		}
+	}
+
+	return nil
 }
 
-// RestartModem restarts the modem by first turning it OFF with a 3500ms pulse, then turning it ON with a 500ms pulse.
-// Falls back to mmcli reset if GPIO method fails.
-func RestartModem(logger *log.Logger) error {
-	// First turn the modem OFF with a 3500ms pulse
-	logger.Printf("Pulsing LTE_POWER for 3500ms to turn modem OFF")
-	offErr := toggleGPIO(GPIOPin, 3500*time.Millisecond)
-	if offErr != nil {
-		logger.Printf("Failed to turn modem OFF: %v", offErr)
-	} else {
-		// Give the modem a moment to fully shut down
-		time.Sleep(15 * time.Second)
+// StartModem starts the modem via GPIO
+func (m *Manager) StartModem() error {
+	if m.gpio == nil {
+		return fmt.Errorf("GPIO controller not initialized")
 	}
 
-	// Then turn the modem ON with a 500ms pulse (same as StartModem)
-	logger.Printf("Pulsing LTE_POWER for 500ms to turn modem ON")
-	onErr := toggleGPIO(GPIOPin, 500*time.Millisecond)
+	if err := m.gpio.Init(); err != nil {
+		return fmt.Errorf("failed to init GPIO: %v", err)
+	}
+	defer m.gpio.Close()
 
-	if onErr == nil && offErr == nil {
-		logger.Printf("Modem restart via GPIO successful (OFF then ON).")
-		return nil
+	return m.gpio.PowerOn()
+}
+
+// RestartModem restarts the modem (power cycle)
+func (m *Manager) RestartModem() error {
+	if m.gpio == nil {
+		return fmt.Errorf("GPIO controller not initialized")
 	}
 
-	// GPIO failed, log warning and attempt mmcli reset as fallback
-	logger.Printf("WARN: Modem restart via GPIO failed (OFF error: %v, ON error: %v), attempting fallback via mmcli reset...", offErr, onErr)
+	if err := m.gpio.Init(); err != nil {
+		return fmt.Errorf("failed to init GPIO: %v", err)
+	}
+	defer m.gpio.Close()
 
-	modemID, findErr := FindModemID()
-	if findErr != nil {
-		// Cannot find modem to reset via mmcli either
-		return fmt.Errorf("GPIO restart failed (OFF: %v, ON: %v) and cannot find modem for mmcli reset (%v)",
-			offErr, onErr, findErr)
+	// Full power cycle
+	if err := m.gpio.Cycle(); err != nil {
+		// Fallback to D-Bus reset
+		m.logger.Printf("GPIO power cycle failed, attempting D-Bus reset...")
+		if m.modemPath == "" {
+			if _, err := m.FindModem(); err != nil {
+				return fmt.Errorf("GPIO failed and cannot find modem: %v", err)
+			}
+		}
+		return m.client.Reset(m.modemPath)
 	}
 
-	logger.Printf("Found modem %s, attempting mmcli reset.", modemID)
-	resetErr := ResetModem(modemID)
-	if resetErr != nil {
-		return fmt.Errorf("GPIO restart failed (OFF: %v, ON: %v) and mmcli reset failed (%v)",
-			offErr, onErr, resetErr)
-	}
-
-	logger.Printf("Modem restart via mmcli reset successful.")
 	return nil
+}
+
+// ResetModem resets the modem via D-Bus
+func (m *Manager) ResetModem() error {
+	if m.modemPath == "" {
+		if _, err := m.FindModem(); err != nil {
+			return err
+		}
+	}
+
+	return m.client.Reset(m.modemPath)
+}
+
+// RecoverUSB performs USB recovery
+func (m *Manager) RecoverUSB() error {
+	return m.usb.Recover()
 }
 
 // IsInterfacePresent checks if the interface is present
@@ -389,15 +436,15 @@ func IsInterfacePresent(interfaceName string) bool {
 	return err == nil
 }
 
-// IsDBusPresent checks if the DBus is present
-func IsDBusPresent() bool {
-	_, err := FindModemID()
+// IsModemPresent checks if modem is present via D-Bus
+func (m *Manager) IsModemPresent() bool {
+	_, err := m.FindModem()
 	return err == nil
 }
 
 // WaitForModem waits for the modem to come up
-func WaitForModem(ctx context.Context, interfaceName string, logger *log.Logger) error {
-	logger.Printf("Waiting for modem to come up...")
+func (m *Manager) WaitForModem(ctx context.Context, interfaceName string) error {
+	m.logger.Printf("Waiting for modem to come up...")
 
 	ticker := time.NewTicker(CheckInterval)
 	defer ticker.Stop()
@@ -409,12 +456,12 @@ func WaitForModem(ctx context.Context, interfaceName string, logger *log.Logger)
 			return ctx.Err()
 		case <-ticker.C:
 			if IsInterfacePresent(interfaceName) {
-				logger.Printf("Modem interface %s is now present", interfaceName)
+				m.logger.Printf("Modem interface %s is now present", interfaceName)
 				return nil
 			}
 
-			if IsDBusPresent() {
-				logger.Printf("Modem is now present via mmcli/dbus")
+			if m.IsModemPresent() {
+				m.logger.Printf("Modem is now present via D-Bus")
 				return nil
 			}
 
@@ -426,88 +473,27 @@ func WaitForModem(ctx context.Context, interfaceName string, logger *log.Logger)
 	}
 }
 
-// ResetModem resets the modem
-func ResetModem(modemID string) error {
-	return exec.Command("mmcli", "-m", modemID, "--reset").Run()
-}
-
-// RecoverUSB attempts to recover the modem by unbinding and rebinding the USB device
-func RecoverUSB(logger *log.Logger) error {
-	const waitTimeBindUnbind = 30
-	const waitTimeMmcli = 30
-	const usbDevice = "1-1" // USB device path for the modem
-
-	logger.Printf("USB recovery: 'unbind'")
-	if err := writeToFile("/sys/bus/usb/drivers/usb/unbind", usbDevice); err != nil {
-		logger.Printf("Warning: Failed to unbind USB device: %v", err)
-		// Continue anyway, might still work
-	}
-
-	time.Sleep(waitTimeBindUnbind * time.Second)
-
-	if isUSBDevicePresent() {
-		logger.Printf("USB recovery: USB device still found after 'unbind'")
-	}
-
-	logger.Printf("USB recovery: 'bind'")
-	if err := writeToFile("/sys/bus/usb/drivers/usb/bind", usbDevice); err != nil {
-		logger.Printf("Warning: Failed to bind USB device: %v", err)
-		return fmt.Errorf("failed to bind USB device: %v", err)
-	}
-
-	// Wait for USB device to come back
-	time.Sleep(waitTimeBindUnbind * time.Second)
-
-	if isUSBDevicePresent() {
-		logger.Printf("USB recovery: USB device found after 'bind', modem seems to be ON")
-		logger.Printf("USB recovery: waiting %ds for 'mmcli -L'...", waitTimeMmcli)
-		time.Sleep(waitTimeMmcli * time.Second)
-	} else {
-		logger.Printf("USB recovery: USB device not found after 'bind', modem seems to be OFF")
-	}
-
-	logger.Printf("USB recovery: modem state after recovery:")
-	logger.Printf("USB recovery: usbFound: %t", isUSBDevicePresent())
-	logger.Printf("USB recovery: isModemFound: %t", IsDBusPresent())
-
-	return nil
-}
-
-// writeToFile writes data to a file (helper for USB recovery)
-func writeToFile(filename, data string) error {
-	file, err := os.OpenFile(filename, os.O_WRONLY, 0)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	_, err = file.WriteString(data + "\n")
-	return err
-}
-
-// isUSBDevicePresent checks if the USB device is present
-func isUSBDevicePresent() bool {
-	// Check if USB device files exist (this is a simplified check)
-	// In a real implementation, you might want to check /sys/bus/usb/devices/ or use lsusb
+// IsUSBDevicePresent checks if the USB device is present
+func IsUSBDevicePresent() bool {
 	if _, err := os.Stat("/sys/bus/usb/devices/1-1"); err == nil {
 		return true
 	}
-	// Also check for modem-specific USB devices
-	patterns := []string{
-		"/sys/bus/usb/devices/*/idVendor",
-		"/sys/bus/usb/devices/*/idProduct",
-	}
-	for _, pattern := range patterns {
-		matches, _ := filepath.Glob(pattern)
-		for _, match := range matches {
-			if content, err := os.ReadFile(match); err == nil {
-				// Check for common modem vendor IDs (Simcom, etc.)
-				vendorProduct := strings.TrimSpace(string(content))
-				if vendorProduct == "1e0e" || vendorProduct == "05c6" { // Common modem vendor IDs
-					return true
-				}
-			}
-		}
-	}
 	return false
+}
+
+// Convenience functions for backward compatibility
+
+// FindModemID finds the modem and returns a string ID (for compatibility)
+func FindModemID(m *Manager) (string, error) {
+	path, err := m.FindModem()
+	if err != nil {
+		return "", err
+	}
+	// Extract last component of path as ID
+	pathStr := string(path)
+	parts := strings.Split(pathStr, "/")
+	if len(parts) > 0 {
+		return parts[len(parts)-1], nil
+	}
+	return pathStr, nil
 }

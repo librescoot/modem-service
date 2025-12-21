@@ -27,10 +27,10 @@ func TestGPSRecoveryConcurrency(t *testing.T) {
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
 	service := &Service{
-		Config:   cfg,
-		Logger:   logger,
-		Health:   health.New(),
-		Location: location.NewService(logger, cfg.GpsdServer),
+		Config:    cfg,
+		Logger:    logger,
+		Health:    health.New(),
+		Location:  location.NewService(logger, cfg.GpsdServer, nil, ""),
 		LastState: modem.NewState(),
 	}
 
@@ -98,10 +98,10 @@ func TestGPSRecoveryInProgressFlag(t *testing.T) {
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
 	service := &Service{
-		Config:   cfg,
-		Logger:   logger,
-		Health:   health.New(),
-		Location: location.NewService(logger, cfg.GpsdServer),
+		Config:    cfg,
+		Logger:    logger,
+		Health:    health.New(),
+		Location:  location.NewService(logger, cfg.GpsdServer, nil, ""),
 		LastState: modem.NewState(),
 	}
 
@@ -152,10 +152,10 @@ func TestGPSTimerRespectRecoveryFlag(t *testing.T) {
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
 	service := &Service{
-		Config:   cfg,
-		Logger:   logger,
-		Health:   health.New(),
-		Location: location.NewService(logger, cfg.GpsdServer),
+		Config:    cfg,
+		Logger:    logger,
+		Health:    health.New(),
+		Location:  location.NewService(logger, cfg.GpsdServer, nil, ""),
 		LastState: modem.NewState(),
 	}
 
@@ -210,10 +210,10 @@ func TestGPSRecoveryMutexProtection(t *testing.T) {
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
 	service := &Service{
-		Config:   cfg,
-		Logger:   logger,
-		Health:   health.New(),
-		Location: location.NewService(logger, cfg.GpsdServer),
+		Config:    cfg,
+		Logger:    logger,
+		Health:    health.New(),
+		Location:  location.NewService(logger, cfg.GpsdServer, nil, ""),
 		LastState: modem.NewState(),
 	}
 
@@ -272,10 +272,10 @@ func TestServiceInitialization(t *testing.T) {
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
 	service := &Service{
-		Config:   cfg,
-		Logger:   logger,
-		Health:   health.New(),
-		Location: location.NewService(logger, cfg.GpsdServer),
+		Config:    cfg,
+		Logger:    logger,
+		Health:    health.New(),
+		Location:  location.NewService(logger, cfg.GpsdServer, nil, ""),
 		LastState: modem.NewState(),
 	}
 
@@ -322,10 +322,10 @@ func TestGPSHealthCheck(t *testing.T) {
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
 	service := &Service{
-		Config:   cfg,
-		Logger:   logger,
-		Health:   health.New(),
-		Location: location.NewService(logger, cfg.GpsdServer),
+		Config:    cfg,
+		Logger:    logger,
+		Health:    health.New(),
+		Location:  location.NewService(logger, cfg.GpsdServer, nil, ""),
 		LastState: modem.NewState(),
 	}
 
@@ -398,10 +398,10 @@ func TestGPSRecoveryCountReset(t *testing.T) {
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
 	service := &Service{
-		Config:   cfg,
-		Logger:   logger,
-		Health:   health.New(),
-		Location: location.NewService(logger, cfg.GpsdServer),
+		Config:    cfg,
+		Logger:    logger,
+		Health:    health.New(),
+		Location:  location.NewService(logger, cfg.GpsdServer, nil, ""),
 		LastState: modem.NewState(),
 	}
 
@@ -419,7 +419,7 @@ func TestGPSRecoveryCountReset(t *testing.T) {
 // TestLocationServiceInitialization tests that location service initializes correctly
 func TestLocationServiceInitialization(t *testing.T) {
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
-	locService := location.NewService(logger, "localhost:2947")
+	locService := location.NewService(logger, "localhost:2947", nil, "")
 
 	if locService == nil {
 		t.Fatal("Expected location service to be initialized")
@@ -449,7 +449,7 @@ func TestLocationServiceInitialization(t *testing.T) {
 // TestGPSStatusMapping tests that GPS status is correctly mapped
 func TestGPSStatusMapping(t *testing.T) {
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
-	locService := location.NewService(logger, "localhost:2947")
+	locService := location.NewService(logger, "localhost:2947", nil, "")
 
 	status := locService.GetGPSStatus()
 
