@@ -136,13 +136,21 @@ func NewState() *State {
 	}
 }
 
-// FindModem finds the modem via D-Bus
+// FindModem finds the modem via D-Bus, using cached path if available
 func (m *Manager) FindModem() (dbus.ObjectPath, error) {
+	if m.modemPath != "" {
+		return m.modemPath, nil
+	}
 	path, err := m.client.FindModem()
 	if err == nil {
 		m.modemPath = path
 	}
 	return path, err
+}
+
+// InvalidateModemPath clears the cached modem path, forcing a fresh lookup
+func (m *Manager) InvalidateModemPath() {
+	m.modemPath = ""
 }
 
 // GetModemInfo gets comprehensive modem information
@@ -399,14 +407,15 @@ func (m *Manager) RestartModem() error {
 	}
 	defer m.gpio.Close()
 
+	// Invalidate cached path since modem will get new D-Bus path after restart
+	m.InvalidateModemPath()
+
 	// Full power cycle
 	if err := m.gpio.Cycle(); err != nil {
 		// Fallback to D-Bus reset
 		m.logger.Printf("GPIO power cycle failed, attempting D-Bus reset...")
-		if m.modemPath == "" {
-			if _, err := m.FindModem(); err != nil {
-				return fmt.Errorf("GPIO failed and cannot find modem: %v", err)
-			}
+		if _, err := m.FindModem(); err != nil {
+			return fmt.Errorf("GPIO failed and cannot find modem: %v", err)
 		}
 		return m.client.Reset(m.modemPath)
 	}
@@ -422,11 +431,16 @@ func (m *Manager) ResetModem() error {
 		}
 	}
 
-	return m.client.Reset(m.modemPath)
+	err := m.client.Reset(m.modemPath)
+	// Invalidate cached path since modem will get new D-Bus path after reset
+	m.InvalidateModemPath()
+	return err
 }
 
 // RecoverUSB performs USB recovery
 func (m *Manager) RecoverUSB() error {
+	// Invalidate cached path since modem will get new D-Bus path after recovery
+	m.InvalidateModemPath()
 	return m.usb.Recover()
 }
 

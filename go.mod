@@ -1,6 +1,6 @@
 module modem-service
 
-go 1.22.2
+go 1.22.1
 
 require (
 	github.com/godbus/dbus/v5 v5.1.0

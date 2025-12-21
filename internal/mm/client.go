@@ -65,7 +65,6 @@ func (c *Client) FindModem() (dbus.ObjectPath, error) {
 
 	for path, interfaces := range managedObjects {
 		if _, hasModem := interfaces[ModemInterface]; hasModem {
-			c.log("Found modem at %s", path)
 			return path, nil
 		}
 	}
