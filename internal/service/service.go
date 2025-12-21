@@ -37,6 +37,7 @@ type Service struct {
 	LastGPSQualityLog     time.Time  // Last time GPS quality was logged
 	gpsRecoveryMutex      sync.Mutex // Prevents concurrent GPS recovery/configuration attempts
 	gpsRecoveryInProgress bool       // Tracks if GPS recovery is currently running
+	connectivityFailures  int        // Consecutive internet connectivity check failures
 
 	// Modem enable/disable state
 	modemEnabled      bool       // Target state: should modem be on?
@@ -622,34 +623,40 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	internetStatus := "disconnected"
 	if currentState.Status == "connected" {
 		// Modem reports connected, perform a real connectivity check
-		connected, pingErr := health.CheckInternetConnectivity(ctx, s.Config.Interface)
+		connected, connErr := health.CheckInternetConnectivity(ctx, s.Config.Interface)
 		if connected {
 			internetStatus = "connected"
+			s.connectivityFailures = 0 // Reset on success
 		} else {
-			if pingErr != nil {
-				s.Logger.Printf("Internet connectivity check failed: %v", pingErr)
+			s.connectivityFailures++
+			if connErr != nil {
+				s.Logger.Printf("Internet connectivity check failed (%d/%d): %v", s.connectivityFailures, 3, connErr)
 			} else {
-				s.Logger.Printf("Internet connectivity check failed (ping unsuccessful)")
+				s.Logger.Printf("Internet connectivity check failed (%d/%d)", s.connectivityFailures, 3)
 			}
 			internetStatus = "disconnected"
 
-			// Publish the disconnected status immediately
-			if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
-				s.Logger.Printf("Failed to publish internet disconnected state: %v", err)
-			}
+			// Only trigger recovery after 3 consecutive failures
+			if s.connectivityFailures >= 3 {
+				// Publish the disconnected status immediately
+				if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
+					s.Logger.Printf("Failed to publish internet disconnected state: %v", err)
+				}
 
-			// After publishing status, trigger modem recovery
-			s.Logger.Printf("Modem reports connected but internet check failed, attempting recovery")
-			recoveryErr := s.handleModemFailure("internet_connectivity_failed")
-			if recoveryErr != nil {
-				s.Logger.Printf("Failed to initiate modem recovery: %v", recoveryErr)
-			}
+				s.Logger.Printf("Modem reports connected but internet check failed %d times, attempting recovery", s.connectivityFailures)
+				s.connectivityFailures = 0 // Reset before recovery
+				recoveryErr := s.handleModemFailure("internet_connectivity_failed")
+				if recoveryErr != nil {
+					s.Logger.Printf("Failed to initiate modem recovery: %v", recoveryErr)
+				}
 
-			// Return since we've already published the state
-			return nil
+				// Return since we've already published the state
+				return nil
+			}
 		}
 	} else {
 		internetStatus = "disconnected"
+		s.connectivityFailures = 0 // Reset if modem not connected
 	}
 
 	if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
