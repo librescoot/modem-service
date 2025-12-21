@@ -6,6 +6,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rescoot/go-mmcli"
@@ -61,6 +62,7 @@ type Service struct {
 	GPSFreshInit           bool      // True if GPS has just been initialized
 	LastGPSTimestamp       time.Time // Last GPS timestamp received from GPSD
 	LastGPSTimestampUpdate time.Time // When we last saw the GPS timestamp change
+	configMutex            sync.Mutex // Protects GPS configuration to prevent concurrent attempts
 }
 
 func NewService(logger *log.Logger, gpsdServer string) *Service {
@@ -92,32 +94,41 @@ func (s *Service) EnableGPS(modemID string) error {
 			}
 
 			if s.GpsdConn == nil {
-				s.Logger.Printf("GPS not configured or gpsd connection lost, attempting configuration (attempt %d)", attempt+1)
+				s.configMutex.Lock()
+				// Double-check after acquiring lock (another goroutine might have configured it)
+				if s.GpsdConn == nil {
+					s.Logger.Printf("GPS not configured or gpsd connection lost, attempting configuration (attempt %d)", attempt+1)
 
-				if err := s.configureGPS(); err != nil {
-					s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
-					time.Sleep(GPSRetryInterval)
-					attempt++
-					continue
+					if err := s.configureGPS(); err != nil {
+						s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
+						s.configMutex.Unlock()
+						time.Sleep(GPSRetryInterval)
+						attempt++
+						continue
+					}
+
+					if err := s.connectToGPSD(); err != nil {
+						s.Logger.Printf("Failed to connect to gpsd: %v", err)
+						s.configMutex.Unlock()
+						time.Sleep(GPSRetryInterval)
+						attempt++
+						continue
+					}
+
+					s.Logger.Printf("Successfully connected to gpsd")
+					attempt = 0
 				}
-
-				if err := s.connectToGPSD(); err != nil {
-					s.Logger.Printf("Failed to connect to gpsd: %v", err)
-					time.Sleep(GPSRetryInterval)
-					attempt++
-					continue
-				}
-
-				s.Logger.Printf("Successfully connected to gpsd")
-				attempt = 0
+				s.configMutex.Unlock()
 			}
 
 			if s.HasValidFix && time.Since(s.LastFix) > GPSTimeout {
 				s.Logger.Printf("No GPS updates received for %v, reconnecting", GPSTimeout)
+				s.configMutex.Lock()
 				if s.GpsdConn != nil {
 					s.GpsdConn.Close()
 					s.GpsdConn = nil
 				}
+				s.configMutex.Unlock()
 				continue
 			}
 
@@ -649,10 +660,12 @@ func (s *Service) StopGPSD() error {
 func (s *Service) Close() {
 	s.Enabled = false
 	s.State = "off"
+	s.configMutex.Lock()
 	if s.GpsdConn != nil {
 		s.GpsdConn.Close()
 		s.GpsdConn = nil
 	}
+	s.configMutex.Unlock()
 	s.GpsdConnected = false
 }
 
