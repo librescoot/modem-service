@@ -341,9 +341,14 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 func (s *Service) configureAntennaPower(ctx context.Context) error {
 	voltageMillivolts := int(s.Config.AntennaVoltage * 1000)
 
-	// Check and log current antenna voltage
+	// Check current antenna voltage (extract just the +CVAUXV line from response)
 	if response, err := s.sendATCommand(ctx, "AT+CVAUXV?", false); err == nil {
-		s.Logger.Printf("GPS antenna voltage: %s", response)
+		for _, line := range strings.Split(response, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "+CVAUXV:") {
+				s.Logger.Printf("Current antenna voltage: %s", strings.TrimSpace(line))
+				break
+			}
+		}
 	}
 
 	// Set antenna voltage (3050 = 3.05V for 3V antenna)
