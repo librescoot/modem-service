@@ -238,10 +238,13 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Get signal quality
+	// Get signal quality - returns (ub) struct: quality percentage and "recent" flag
 	if qualVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "SignalQuality"); err == nil {
-		if qual, ok := qualVar.Value().(uint32); ok {
-			state.SignalQuality = uint8(qual)
+		// Try as []interface{} first (D-Bus struct becomes slice)
+		if qualSlice, ok := qualVar.Value().([]interface{}); ok && len(qualSlice) > 0 {
+			if qual, ok := qualSlice[0].(uint32); ok {
+				state.SignalQuality = uint8(qual)
+			}
 		}
 	}
 
