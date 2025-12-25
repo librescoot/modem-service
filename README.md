@@ -1,4 +1,4 @@
-# Librescoot Modem Service
+# LibreScoot Modem Service
 
 ## Overview
 
