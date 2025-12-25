@@ -16,6 +16,9 @@ import (
 var version = "dev" // Default version, can be overridden during build
 
 func main() {
+	// Create config first to register all flags
+	cfg := config.New()
+
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -31,10 +34,6 @@ func main() {
 	} else {
 		logger = log.New(os.Stdout, "modem-service: ", log.LstdFlags|log.Lmsgprefix)
 	}
-
-	// Create config
-	cfg := config.New()
-	cfg.Parse()
 
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
