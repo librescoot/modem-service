@@ -163,7 +163,7 @@ func (s *Service) disableModem() {
 	s.Redis.PublishModemState("power-state", "off")
 
 	// Turn off the modem via GPIO (3.5 second pulse)
-	if err := modem.RestartModem(s.Logger); err != nil {
+	if err := s.Modem.RestartModem(); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
 	}
 
