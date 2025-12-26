@@ -3,7 +3,8 @@ package health
 import (
 	"context"
 	"fmt"
-	"os/exec"
+	"net"
+	"syscall"
 	"time"
 )
 
@@ -73,26 +74,36 @@ func (h *Health) String() string {
 	return fmt.Sprintf("Health{State: %s, RecoveryAttempts: %d}", h.State, h.RecoveryAttempts)
 }
 
-// CheckInternetConnectivity attempts to ping an external host via the specified interface.
+// CheckInternetConnectivity attempts to connect to an external host via the specified interface.
+// Uses TCP connect to Google DNS (8.8.8.8:53) with interface binding.
 func CheckInternetConnectivity(ctx context.Context, interfaceName string) (bool, error) {
-	// Use context with timeout for the ping command
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second) // 2-second timeout for ping
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	// Command: ping -c 1 (one packet) -W 1 (1-second wait) 8.8.8.8 (Google DNS)
-	cmd := exec.CommandContext(pingCtx, "ping", "-c", "1", "-W", "1", "8.8.8.8")
-
-	err := cmd.Run()
-
-	if err != nil {
-		// Check if the error is due to context deadline exceeded (timeout)
-		if ctxErr := pingCtx.Err(); ctxErr == context.DeadlineExceeded {
-			return false, fmt.Errorf("ping timed out: %w", err)
-		}
-		// Other errors (e.g., ping command not found, interface doesn't exist, network unreachable)
-		return false, fmt.Errorf("ping command failed: %w", err)
+	dialer := &net.Dialer{
+		Timeout: 2 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockErr error
+			err := c.Control(func(fd uintptr) {
+				// Bind socket to interface using SO_BINDTODEVICE
+				sockErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, interfaceName)
+			})
+			if err != nil {
+				return err
+			}
+			return sockErr
+		},
 	}
 
-	// If cmd.Run() returns nil, the ping was successful
+	// Try to establish TCP connection to Google DNS
+	conn, err := dialer.DialContext(checkCtx, "tcp", "8.8.8.8:53")
+	if err != nil {
+		if checkCtx.Err() == context.DeadlineExceeded {
+			return false, fmt.Errorf("connection timed out: %w", err)
+		}
+		return false, fmt.Errorf("connection failed: %w", err)
+	}
+	conn.Close()
+
 	return true, nil
 }
