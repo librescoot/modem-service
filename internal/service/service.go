@@ -14,6 +14,12 @@ import (
 	redisClient "modem-service/internal/redis"
 )
 
+// Vehicle states that should trigger modem enable
+var modemOnlineStates = map[string]bool{
+	"parked":         true,
+	"ready-to-drive": true,
+}
+
 type Service struct {
 	Config              *config.Config
 	Redis               *redisClient.Client
@@ -28,6 +34,10 @@ type Service struct {
 	LastGPSQualityLog   time.Time // Last time GPS quality was logged
 	gpsRecoveryMutex    sync.Mutex // Prevents concurrent GPS recovery/configuration attempts
 	gpsRecoveryInProgress bool     // Tracks if GPS recovery is currently running
+
+	// Modem enable/disable state
+	modemEnabled      bool       // Target state: should modem be on?
+	modemEnabledMutex sync.Mutex // Protects modemEnabled
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -56,6 +66,16 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("redis connection failed: %v", err)
 	}
 
+	// Start listening for modem enable/disable commands from pm-service
+	if err := s.Redis.StartModemCommandHandler(s.handleModemCommand); err != nil {
+		s.Logger.Printf("Failed to start modem command handler: %v", err)
+	}
+
+	// Start watching vehicle state to auto-enable modem
+	if err := s.Redis.StartVehicleStateWatcher(s.handleVehicleState); err != nil {
+		s.Logger.Printf("Failed to start vehicle state watcher: %v", err)
+	}
+
 	// Try to enable the modem if it's not present
 	if err := s.ensureModemEnabled(ctx); err != nil {
 		s.Logger.Printf("SEVERE ERROR: Failed to ensure modem is enabled: %v", err)
@@ -75,6 +95,60 @@ func (s *Service) Run(ctx context.Context) error {
 	s.Location.Close()
 
 	return nil
+}
+
+// handleModemCommand handles enable/disable commands from pm-service
+func (s *Service) handleModemCommand(command string) error {
+	s.modemEnabledMutex.Lock()
+	defer s.modemEnabledMutex.Unlock()
+
+	switch command {
+	case "enable":
+		s.Logger.Printf("Received modem enable command")
+		s.modemEnabled = true
+		// Modem will be enabled by ensureModemEnabled or monitor loop
+	case "disable":
+		s.Logger.Printf("Received modem disable command")
+		s.modemEnabled = false
+		// Disable the modem
+		go s.disableModem()
+	default:
+		s.Logger.Printf("Unknown modem command: %s", command)
+	}
+	return nil
+}
+
+// handleVehicleState handles vehicle state changes to auto-enable modem
+func (s *Service) handleVehicleState(state string) error {
+	if modemOnlineStates[state] {
+		s.modemEnabledMutex.Lock()
+		if !s.modemEnabled {
+			s.Logger.Printf("Vehicle state '%s' - enabling modem", state)
+			s.modemEnabled = true
+		}
+		s.modemEnabledMutex.Unlock()
+	}
+	return nil
+}
+
+// disableModem turns off the modem and publishes the off state
+func (s *Service) disableModem() {
+	s.Logger.Printf("Disabling modem...")
+
+	// Close GPS first
+	s.Location.Close()
+
+	// Publish off states
+	s.Redis.PublishInternetState("internet", "status", "disconnected")
+	s.Redis.PublishInternetState("internet", "modem-state", "off")
+	s.Redis.PublishModemState("power-state", "off")
+
+	// Turn off the modem via GPIO (3.5 second pulse)
+	if err := modem.RestartModem(s.Logger); err != nil {
+		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
+	}
+
+	s.Logger.Printf("Modem disabled")
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
@@ -127,6 +201,10 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	s.Health.State = health.StatePermanentFailure
 	s.publishHealthState(ctx)
 
+	// Log fault to events stream and add to fault set
+	s.Redis.LogFault("internet", redisClient.FaultCodeModemRecoveryFailed, "Modem recovery failed")
+	s.Redis.AddFault(redisClient.FaultCodeModemRecoveryFailed)
+
 	return fmt.Errorf("modem failed to come up after multiple attempts, marked as potentially defective")
 }
 
@@ -150,6 +228,8 @@ func (s *Service) checkHealth() error {
 	}
 
 	s.Health.MarkNormal()
+	// Clear any active faults when modem is healthy
+	s.Redis.RemoveFault(redisClient.FaultCodeModemRecoveryFailed)
 	return nil
 }
 
