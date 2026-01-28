@@ -166,12 +166,17 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		return state, err
 	}
 
-	// Get power state
+	// Get power state - if this fails with cached path, invalidate cache
 	powerVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "PowerState")
-	if err == nil {
-		if powerState, ok := powerVar.Value().(uint32); ok {
-			state.PowerState = mm.PowerStateToString(int32(powerState))
-		}
+	if err != nil {
+		// Modem path may be stale, invalidate cache for next lookup
+		m.InvalidateModemPath()
+		state.Status = "no-modem"
+		state.ErrorState = "modem-disappeared"
+		return state, fmt.Errorf("modem at %s not responding: %v", modemPath, err)
+	}
+	if powerState, ok := powerVar.Value().(uint32); ok {
+		state.PowerState = mm.PowerStateToString(int32(powerState))
 	}
 
 	// Get modem state
