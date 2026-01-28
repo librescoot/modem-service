@@ -27,9 +27,9 @@ func main() {
 		return
 	}
 
-	// Create logger
+	// Create logger - skip timestamps if running under systemd/journald
 	var logger *log.Logger
-	if os.Getenv("INVOCATION_ID") != "" {
+	if os.Getenv("JOURNAL_STREAM") != "" {
 		logger = log.New(os.Stdout, "", 0)
 	} else {
 		logger = log.New(os.Stdout, "modem-service: ", log.LstdFlags|log.Lmsgprefix)
