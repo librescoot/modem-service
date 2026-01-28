@@ -65,8 +65,9 @@ type Service struct {
 	LastDataReceived       time.Time  // Last time any GPS data was received (even without fix)
 	LastGPSTimestamp       time.Time  // Last GPS timestamp received from GPSD
 	LastGPSTimestampUpdate time.Time  // When we last saw the GPS timestamp change
-	configMutex            sync.Mutex // Protects GPS configuration to prevent concurrent attempts
-	monitoringActive       bool       // True if monitoring goroutine is already running
+	configMutex            sync.Mutex   // Protects GPS configuration to prevent concurrent attempts
+	monitoringActive       bool         // True if monitoring goroutine is already running
+	stopChan               chan struct{} // Signals monitoring goroutine to stop
 }
 
 func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, suplServer string) *Service {
@@ -102,6 +103,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 	}
 
 	s.monitoringActive = true
+	s.stopChan = make(chan struct{})
 
 	go func() {
 		defer func() {
@@ -110,6 +112,12 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 
 		attempt := 0
 		for {
+			// Check both Enabled flag and stop channel for shutdown
+			select {
+			case <-s.stopChan:
+				return
+			default:
+			}
 			if !s.Enabled {
 				return
 			}
@@ -127,7 +135,11 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 							s.configMutex.Unlock()
 
 							// Wait briefly to see if we get GPS data
-							time.Sleep(3 * time.Second)
+							select {
+							case <-s.stopChan:
+								return
+							case <-time.After(3 * time.Second):
+							}
 
 							if s.LastDataReceived.After(time.Now().Add(-5 * time.Second)) {
 								s.Logger.Printf("GPS already running, reusing existing connection")
@@ -152,7 +164,11 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 					if err := s.configureGPS(); err != nil {
 						s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
 						s.configMutex.Unlock()
-						time.Sleep(GPSRetryInterval)
+						select {
+						case <-s.stopChan:
+							return
+						case <-time.After(GPSRetryInterval):
+						}
 						attempt++
 						continue
 					}
@@ -160,7 +176,11 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 					if err := s.connectToGPSD(); err != nil {
 						s.Logger.Printf("Failed to connect to gpsd: %v", err)
 						s.configMutex.Unlock()
-						time.Sleep(GPSRetryInterval)
+						select {
+						case <-s.stopChan:
+							return
+						case <-time.After(GPSRetryInterval):
+						}
 						attempt++
 						continue
 					}
@@ -182,7 +202,11 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 				continue
 			}
 
-			time.Sleep(GPSRetryInterval)
+			select {
+			case <-s.stopChan:
+				return
+			case <-time.After(GPSRetryInterval):
+			}
 		}
 	}()
 
@@ -698,6 +722,11 @@ func (s *Service) StopGPSD() error {
 }
 
 func (s *Service) Close() {
+	// Signal monitoring goroutine to stop
+	if s.stopChan != nil {
+		close(s.stopChan)
+		s.stopChan = nil
+	}
 	s.Enabled = false
 	s.State = "off"
 	s.configMutex.Lock()
