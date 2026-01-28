@@ -208,7 +208,8 @@ func (c *Client) GetSuplServer(modemPath dbus.ObjectPath) (string, error) {
 
 // WatchModems sets up signal watching for modem added/removed
 func (c *Client) WatchModems(onAdded func(dbus.ObjectPath), onRemoved func(dbus.ObjectPath)) error {
-	signals := make(chan *dbus.Signal, 10)
+	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
+	signals := make(chan *dbus.Signal, 100)
 	c.conn.Signal(signals)
 
 	matchRules := []string{
@@ -264,7 +265,8 @@ func (c *Client) WatchModems(onAdded func(dbus.ObjectPath), onRemoved func(dbus.
 
 // WatchPropertyChanges watches for property changes on a modem
 func (c *Client) WatchPropertyChanges(modemPath dbus.ObjectPath, onChange func(string, string, dbus.Variant)) error {
-	signals := make(chan *dbus.Signal, 10)
+	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
+	signals := make(chan *dbus.Signal, 100)
 	c.conn.Signal(signals)
 
 	rule := fmt.Sprintf("type='signal',sender='%s',path='%s',interface='%s',member='PropertiesChanged'",
