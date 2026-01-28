@@ -400,13 +400,27 @@ func (s *Service) attemptGPSRecovery() error {
 	s.GPSRecoveryCount++
 	s.Logger.Printf("Attempting GPS recovery (attempt %d)...", s.GPSRecoveryCount)
 
-	// If we've tried GPS recovery too many times, give up and return success
-	// to avoid infinite loops - the service will restart GPS configuration naturally
+	// If we've tried GPS recovery too many times, do a full reset and wait longer
 	if s.GPSRecoveryCount > 3 {
-		s.Logger.Printf("GPS recovery attempted %d times, giving GPS a longer break", s.GPSRecoveryCount)
-		s.GPSRecoveryCount = 0 // Reset counter
-		// Wait longer before the next attempt
+		s.Logger.Printf("GPS recovery attempted %d times, performing full reset with longer break", s.GPSRecoveryCount)
+		s.GPSRecoveryCount = 0
+
+		// Stop gpsd and close GPS connection
+		if err := s.Location.StopGPSD(); err != nil {
+			s.Logger.Printf("Warning: Failed to stop gpsd: %v", err)
+		}
+		s.Location.Close()
+
+		// Reset state tracking
+		s.LastGPSDataTime = time.Time{}
+		s.GPSEnabledTime = time.Time{}
+		s.WaitingForGPSLogged = false
+		s.Location.LastGPSTimestamp = time.Time{}
+		s.Location.LastGPSTimestampUpdate = time.Time{}
+
+		// Wait longer before allowing monitor to re-enable GPS
 		time.Sleep(30 * time.Second)
+		s.Logger.Printf("GPS break complete, monitor will re-enable")
 		return nil
 	}
 

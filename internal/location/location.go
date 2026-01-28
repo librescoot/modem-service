@@ -397,7 +397,7 @@ func (s *Service) setGPSClockFromSystem(ctx context.Context) error {
 	now := time.Now().UTC()
 	clockCmd := fmt.Sprintf(`AT+CCLK="%s"`, now.Format("06/01/02,15:04:05+00"))
 	s.sendATCommand(ctx, clockCmd, false)
-	s.Logger.Printf("Set GPS clock: %s", now.Format("15:04:05"))
+	s.Logger.Printf("Set GPS clock: %s", now.Format("2006-01-02 15:04:05 MST"))
 	return nil
 }
 
@@ -406,7 +406,7 @@ func (s *Service) updateGPSClockFromSystem(ctx context.Context) error {
 	now := time.Now().UTC()
 	clockCmd := fmt.Sprintf(`AT+CCLK="%s"`, now.Format("06/01/02,15:04:05+00"))
 	s.sendATCommand(ctx, clockCmd, false)
-	s.Logger.Printf("Updated GPS clock: %s", now.Format("15:04:05"))
+	s.Logger.Printf("Updated GPS clock: %s", now.Format("2006-01-02 15:04:05 MST"))
 	return nil
 }
 
