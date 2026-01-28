@@ -658,7 +658,8 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 				}
 
 				s.Logger.Printf("Modem reports connected but internet check failed %d times, attempting recovery", s.connectivityFailures)
-				s.connectivityFailures = 0 // Reset before recovery
+				// Don't reset counter here - it will be reset on next successful connectivity check
+				// This ensures persistent connectivity issues are detected if recovery fails
 				recoveryErr := s.handleModemFailure("internet_connectivity_failed")
 				if recoveryErr != nil {
 					s.Logger.Printf("Failed to initiate modem recovery: %v", recoveryErr)
