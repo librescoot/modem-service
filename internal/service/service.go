@@ -783,6 +783,8 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					if s.WaitingForGPSLogged {
 						s.Logger.Printf("GPS fix established")
 						s.WaitingForGPSLogged = false
+						// Reset recovery counter since GPS is now working
+						s.GPSRecoveryCount = 0
 					}
 
 					// Log GPS quality every 90 seconds (similar to signal quality)
