@@ -62,10 +62,11 @@ type Service struct {
 	State                  string     // "off", "searching", "fix-established", "error"
 	GPSLostTime            time.Time  // Time when GPS fix was lost
 	GPSFreshInit           bool       // True if GPS has just been initialized
-	LastDataReceived       time.Time  // Last time any GPS data was received (even without fix)
-	LastGPSTimestamp       time.Time  // Last GPS timestamp received from GPSD
-	LastGPSTimestampUpdate time.Time  // When we last saw the GPS timestamp change
+	LastDataReceived       time.Time    // Last time any GPS data was received (even without fix)
+	LastGPSTimestamp       time.Time    // Last GPS timestamp received from GPSD
+	LastGPSTimestampUpdate time.Time    // When we last saw the GPS timestamp change
 	configMutex            sync.Mutex   // Protects GPS configuration to prevent concurrent attempts
+	stateMutex             sync.RWMutex // Protects GPS state fields accessed across goroutines
 	monitoringActive       bool         // True if monitoring goroutine is already running
 	stopChan               chan struct{} // Signals monitoring goroutine to stop
 }
@@ -141,7 +142,10 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 							case <-time.After(3 * time.Second):
 							}
 
-							if s.LastDataReceived.After(time.Now().Add(-5 * time.Second)) {
+							s.stateMutex.RLock()
+							lastData := s.LastDataReceived
+							s.stateMutex.RUnlock()
+							if lastData.After(time.Now().Add(-5 * time.Second)) {
 								s.Logger.Printf("GPS already running, reusing existing connection")
 								s.GPSFreshInit = false
 								attempt = 0
@@ -643,7 +647,9 @@ func (s *Service) connectToGPSD() error {
 		}
 
 		// Track when we receive any GPS data (even without fix)
+		s.stateMutex.Lock()
 		s.LastDataReceived = time.Now()
+		s.stateMutex.Unlock()
 
 		// Update fix status
 		switch report.Mode {
