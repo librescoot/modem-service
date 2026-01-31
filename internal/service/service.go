@@ -75,7 +75,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		WaitingForGPSLogged: false,
 	}
 
-	service.Logger.Printf("modem-service v%s", version)
+	service.Logger.Printf("modem-service %s", version)
 
 	return service, nil
 }
