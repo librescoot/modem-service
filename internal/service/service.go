@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -38,6 +39,8 @@ type Service struct {
 	gpsRecoveryMutex      sync.Mutex // Prevents concurrent GPS recovery/configuration attempts
 	gpsRecoveryInProgress bool       // Tracks if GPS recovery is currently running
 	connectivityFailures  int        // Consecutive internet connectivity check failures
+
+	clockSynced bool // True after system time has been set from GPS
 
 	// Modem enable/disable state
 	modemEnabled      bool       // Target state: should modem be on?
@@ -618,6 +621,19 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 	return s.Redis.PublishLocationState(data, publishRecovery)
 }
 
+func (s *Service) syncClockFromGPS(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	timeStr := t.UTC().Format("02 Jan 2006 15:04:05")
+	out, err := exec.Command("chronyc", "settime", timeStr).CombinedOutput()
+	if err != nil {
+		s.Logger.Printf("Failed to set system time from GPS: %v: %s", err, out)
+		return
+	}
+	s.Logger.Printf("System time set from GPS: %s", timeStr)
+}
+
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	if err := s.checkHealth(); err != nil {
 		s.Logger.Printf("Health check failed: %v", err)
@@ -768,6 +784,12 @@ func (s *Service) monitorStatus(ctx context.Context) {
 				publishRecovery := false
 
 				if hasValidFix {
+					// Set system time from GPS on first fix of this session
+					if !s.clockSynced {
+						s.syncClockFromGPS(s.Location.CurrentLoc.Timestamp)
+						s.clockSynced = true
+					}
+
 					// GPS is now valid - check if this is a recovery event
 					publishRecovery = s.Location.ShouldPublishRecovery(hasInternet)
 					if publishRecovery {
