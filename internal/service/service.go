@@ -112,6 +112,7 @@ func (s *Service) Run(ctx context.Context) error {
 	<-ctx.Done()
 
 	s.Location.Close()
+	s.Redis.PublishLocationState(map[string]interface{}{"state": "off"}, false)
 
 	return nil
 }
@@ -156,6 +157,7 @@ func (s *Service) disableModem() {
 
 	// Close GPS first
 	s.Location.Close()
+	s.Redis.PublishLocationState(map[string]interface{}{"state": "off"}, false)
 
 	// Publish off states
 	s.Redis.PublishInternetState("internet", "status", "disconnected")
@@ -818,6 +820,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						"quality":   gpsStatus["quality"],
 						"active":    gpsStatus["active"],
 						"connected": gpsStatus["connected"],
+						"state":     gpsStatus["state"],
 					}
 					if err := s.Redis.PublishLocationState(data, false); err != nil {
 						s.Logger.Printf("Failed to publish GPS status: %v", err)
