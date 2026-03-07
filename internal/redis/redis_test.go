@@ -144,28 +144,24 @@ func TestPublishInternetState(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		key     string
 		field   string
 		value   string
 		wantErr bool
 	}{
 		{
 			name:    "publish status",
-			key:     "internet",
 			field:   "status",
 			value:   "connected",
 			wantErr: false,
 		},
 		{
 			name:    "publish modem-state",
-			key:     "internet",
 			field:   "modem-state",
 			value:   "registered",
 			wantErr: false,
 		},
 		{
 			name:    "publish ip-address",
-			key:     "internet",
 			field:   "ip-address",
 			value:   "10.0.0.1",
 			wantErr: false,
@@ -174,7 +170,7 @@ func TestPublishInternetState(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := client.PublishInternetState(tt.key, tt.field, tt.value)
+			err := client.PublishInternetState(tt.field, tt.value)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PublishInternetState() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -198,20 +194,20 @@ func TestPublishInternetStateChangeDetection(t *testing.T) {
 	defer cleanup()
 
 	// First publish should succeed
-	err := client.PublishInternetState("internet", "status", "connected")
+	err := client.PublishInternetState("status", "connected")
 	if err != nil {
 		t.Fatalf("First publish failed: %v", err)
 	}
 
 	// Second publish with same value should not trigger a change
 	// (SetIfChanged will still return success, but won't publish)
-	err = client.PublishInternetState("internet", "status", "connected")
+	err = client.PublishInternetState("status", "connected")
 	if err != nil {
 		t.Fatalf("Second publish failed: %v", err)
 	}
 
 	// Third publish with different value should trigger a change
-	err = client.PublishInternetState("internet", "status", "disconnected")
+	err = client.PublishInternetState("status", "disconnected")
 	if err != nil {
 		t.Fatalf("Third publish failed: %v", err)
 	}
@@ -374,7 +370,7 @@ func TestConcurrentPublishing(t *testing.T) {
 	// Publish internet state concurrently
 	go func() {
 		for i := 0; i < 10; i++ {
-			client.PublishInternetState("internet", "test-field", fmt.Sprintf("value-%d", i))
+			client.PublishInternetState("test-field", fmt.Sprintf("value-%d", i))
 			time.Sleep(10 * time.Millisecond)
 		}
 		done <- true

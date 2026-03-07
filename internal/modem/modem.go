@@ -381,9 +381,9 @@ func (m *Manager) CheckPowerState() error {
 		return err
 	}
 
-	if power, ok := powerVar.Value().(int32); ok {
-		if power != mm.MMModemPowerStateOn {
-			return fmt.Errorf("modem not powered on: %s", mm.PowerStateToString(power))
+	if power, ok := powerVar.Value().(uint32); ok {
+		if int32(power) != mm.MMModemPowerStateOn {
+			return fmt.Errorf("modem not powered on: %s", mm.PowerStateToString(int32(power)))
 		}
 	}
 
@@ -402,6 +402,21 @@ func (m *Manager) StartModem() error {
 	defer m.gpio.Close()
 
 	return m.gpio.PowerOn()
+}
+
+// PowerOffModem turns off the modem via GPIO
+func (m *Manager) PowerOffModem() error {
+	if m.gpio == nil {
+		return fmt.Errorf("GPIO controller not initialized")
+	}
+
+	if err := m.gpio.Init(); err != nil {
+		return fmt.Errorf("failed to init GPIO: %v", err)
+	}
+	defer m.gpio.Close()
+
+	m.InvalidateModemPath()
+	return m.gpio.PowerOff()
 }
 
 // RestartModem restarts the modem (power cycle)

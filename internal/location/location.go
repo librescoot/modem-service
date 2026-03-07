@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -41,34 +42,42 @@ type Location struct {
 }
 
 type Service struct {
-	ModemPath              dbus.ObjectPath
-	MMClient               *mm.Client
-	Config                 Config
-	LastFix                time.Time
-	CurrentLoc             Location
-	Enabled                bool
-	Logger                 *log.Logger
-	GpsdConn               *gpsd.Session
-	GpsdServer             string
-	Done                   chan bool
-	HasValidFix            bool
-	FixMode                string  // "none", "2d", "3d"
-	Quality                float64 // DOP value
-	HDOP                   float64 // Horizontal Dilution of Precision
-	VDOP                   float64 // Vertical Dilution of Precision
-	PDOP                   float64 // Position (3D) Dilution of Precision
-	EPH                    float64 // Estimated horizontal position error (meters)
-	GpsdConnected          bool
-	State                  string     // "off", "searching", "fix-established", "error"
-	GPSLostTime            time.Time  // Time when GPS fix was lost
-	GPSFreshInit           bool       // True if GPS has just been initialized
-	LastDataReceived       time.Time    // Last time any GPS data was received (even without fix)
-	LastGPSTimestamp       time.Time    // Last GPS timestamp received from GPSD
-	LastGPSTimestampUpdate time.Time    // When we last saw the GPS timestamp change
-	configMutex            sync.Mutex   // Protects GPS configuration to prevent concurrent attempts
-	stateMutex             sync.RWMutex // Protects GPS state fields accessed across goroutines
-	monitoringActive       bool         // True if monitoring goroutine is already running
-	stopChan               chan struct{} // Signals monitoring goroutine to stop
+	ModemPath  dbus.ObjectPath
+	MMClient   *mm.Client
+	Config     Config
+	Enabled    bool
+	Logger     *log.Logger
+	GpsdConn   *gpsd.Session
+	GpsdServer string
+	Done       chan bool
+
+	// GPS state fields — written by gpsd callbacks, read by monitorStatus.
+	// Simple scalars use atomics; compound types (Location, time.Time) use stateMutex.
+	hasValidFix   atomic.Bool
+	fixMode       atomic.Value // string: "none", "2d", "3d"
+	quality       atomic.Value // float64
+	hdop          atomic.Value // float64
+	vdop          atomic.Value // float64
+	pdop          atomic.Value // float64
+	eph           atomic.Value // float64
+	gpsdConnected atomic.Bool
+	state         atomic.Value // string: "off", "searching", "fix-established", "error"
+
+	// Protected by stateMutex — compound types that can't use atomics
+	stateMutex             sync.RWMutex
+	currentLoc             Location
+	lastFix                time.Time
+	lastDataReceived       time.Time // Last time any GPS data was received (even without fix)
+	lastGPSTimestamp       time.Time // Last GPS timestamp received from GPSD
+	lastGPSTimestampUpdate time.Time // When we last saw the GPS timestamp change
+
+	// Accessed only from the main goroutine or under explicit coordination
+	GPSLostTime  time.Time // Time when GPS fix was lost
+	GPSFreshInit bool      // True if GPS has just been initialized
+
+	configMutex      sync.Mutex    // Protects GPS configuration to prevent concurrent attempts
+	monitoringActive atomic.Bool   // True if monitoring goroutine is already running
+	stopChan         chan struct{} // Signals monitoring goroutine to stop
 }
 
 func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, suplServer string) *Service {
@@ -76,7 +85,7 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 		suplServer = "supl.google.com:7275"
 	}
 
-	return &Service{
+	s := &Service{
 		Config: Config{
 			SuplServer:     suplServer,
 			RefreshRate:    GPSUpdateInterval,
@@ -87,10 +96,58 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 		Logger:       logger,
 		GpsdServer:   gpsdServer,
 		Done:         make(chan bool),
-		HasValidFix:  false,
-		State:        "off",
 		GPSFreshInit: true,
 	}
+	s.state.Store("off")
+	s.fixMode.Store("none")
+	s.quality.Store(float64(0))
+	s.hdop.Store(float64(0))
+	s.vdop.Store(float64(0))
+	s.pdop.Store(float64(0))
+	s.eph.Store(float64(0))
+	return s
+}
+
+// Accessor methods for atomic fields
+
+func (s *Service) HasValidFix() bool      { return s.hasValidFix.Load() }
+func (s *Service) FixMode() string         { return s.fixMode.Load().(string) }
+func (s *Service) Quality() float64        { return s.quality.Load().(float64) }
+func (s *Service) HDOP() float64           { return s.hdop.Load().(float64) }
+func (s *Service) VDOP() float64           { return s.vdop.Load().(float64) }
+func (s *Service) PDOP() float64           { return s.pdop.Load().(float64) }
+func (s *Service) EPH() float64            { return s.eph.Load().(float64) }
+func (s *Service) GpsdConnected() bool     { return s.gpsdConnected.Load() }
+func (s *Service) State() string           { return s.state.Load().(string) }
+
+func (s *Service) CurrentLoc() Location {
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+	return s.currentLoc
+}
+
+func (s *Service) LastGPSTimestampUpdate() time.Time {
+	s.stateMutex.RLock()
+	defer s.stateMutex.RUnlock()
+	return s.lastGPSTimestampUpdate
+}
+
+func (s *Service) ResetTimestampTracking() {
+	s.stateMutex.Lock()
+	defer s.stateMutex.Unlock()
+	s.lastGPSTimestamp = time.Time{}
+	s.lastGPSTimestampUpdate = time.Time{}
+	s.lastDataReceived = time.Time{}
+}
+
+func (s *Service) SetLastGPSTimestampUpdate(t time.Time) {
+	s.stateMutex.Lock()
+	defer s.stateMutex.Unlock()
+	s.lastGPSTimestampUpdate = t
+}
+
+func (s *Service) SetHasValidFix(v bool) {
+	s.hasValidFix.Store(v)
 }
 
 func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
@@ -98,17 +155,17 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 	s.Enabled = true
 
 	// Prevent multiple monitoring goroutines from running
-	if s.monitoringActive {
+	if s.monitoringActive.Load() {
 		s.Logger.Printf("GPS monitoring already active, skipping duplicate EnableGPS call")
 		return nil
 	}
 
-	s.monitoringActive = true
+	s.monitoringActive.Store(true)
 	s.stopChan = make(chan struct{})
 
 	go func() {
 		defer func() {
-			s.monitoringActive = false
+			s.monitoringActive.Store(false)
 		}()
 
 		attempt := 0
@@ -143,7 +200,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 							}
 
 							s.stateMutex.RLock()
-							lastData := s.LastDataReceived
+							lastData := s.lastDataReceived
 							s.stateMutex.RUnlock()
 							if lastData.After(time.Now().Add(-5 * time.Second)) {
 								s.Logger.Printf("GPS already running, reusing existing connection")
@@ -195,7 +252,11 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 				s.configMutex.Unlock()
 			}
 
-			if s.HasValidFix && time.Since(s.LastFix) > GPSTimeout {
+			if s.hasValidFix.Load() && func() bool {
+				s.stateMutex.RLock()
+				defer s.stateMutex.RUnlock()
+				return time.Since(s.lastFix) > GPSTimeout
+			}() {
 				s.Logger.Printf("No GPS updates received for %v, reconnecting", GPSTimeout)
 				s.configMutex.Lock()
 				if s.GpsdConn != nil {
@@ -357,7 +418,7 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	s.sendATCommand(ctx, "AT+CGSETV=41,1", false)
 
 	// Set GPS clock from system time
-	s.setGPSClockFromSystem(ctx)
+	s.syncGPSClock(ctx)
 
 	// Configure APN and socket context (optional)
 	s.sendATCommand(ctx, `AT+CGDCONT=1,"IP","internet"`, false)
@@ -405,7 +466,7 @@ func (s *Service) configureAntennaPower(ctx context.Context) error {
 	s.Logger.Printf("GPS antenna powered: %dmV", voltageMillivolts)
 
 	// Update GPS clock after antenna power up
-	s.updateGPSClockFromSystem(ctx)
+	s.syncGPSClock(ctx)
 
 	// Check if GPS is enabled, start it if needed
 	response, err := s.sendATCommand(ctx, "AT+CGPS?", false)
@@ -420,22 +481,12 @@ func (s *Service) configureAntennaPower(ctx context.Context) error {
 	return nil
 }
 
-// setGPSClockFromSystem sets the modem's GPS clock from system time
-func (s *Service) setGPSClockFromSystem(ctx context.Context) error {
+// syncGPSClock sets the modem's GPS clock from system time
+func (s *Service) syncGPSClock(ctx context.Context) {
 	now := time.Now().UTC()
 	clockCmd := fmt.Sprintf(`AT+CCLK="%s"`, now.Format("06/01/02,15:04:05+00"))
 	s.sendATCommand(ctx, clockCmd, false)
-	s.Logger.Printf("Set GPS clock: %s", now.Format("2006-01-02 15:04:05 MST"))
-	return nil
-}
-
-// updateGPSClockFromSystem updates the modem's GPS clock from system time (used after antenna power up)
-func (s *Service) updateGPSClockFromSystem(ctx context.Context) error {
-	now := time.Now().UTC()
-	clockCmd := fmt.Sprintf(`AT+CCLK="%s"`, now.Format("06/01/02,15:04:05+00"))
-	s.sendATCommand(ctx, clockCmd, false)
-	s.Logger.Printf("Updated GPS clock: %s", now.Format("2006-01-02 15:04:05 MST"))
-	return nil
+	s.Logger.Printf("GPS clock synced: %s", now.Format("2006-01-02 15:04:05 MST"))
 }
 
 // setGPSRefreshRate sets the GPS refresh rate via ModemManager D-Bus
@@ -632,48 +683,43 @@ func (s *Service) connectToGPSD() error {
 			return
 		}
 
-		// Update DOP values
-		s.HDOP = report.Hdop
-		s.VDOP = report.Vdop
-		s.PDOP = report.Pdop
+		s.hdop.Store(report.Hdop)
+		s.vdop.Store(report.Vdop)
+		s.pdop.Store(report.Pdop)
 	})
 
 	s.GpsdConn.AddFilter("TPV", func(r interface{}) {
 		report, ok := r.(*gpsd.TPVReport)
 		if !ok {
 			s.Logger.Printf("Error: Could not cast TPV report")
-			s.State = "error"
+			s.state.Store("error")
 			return
 		}
 
 		// Track when we receive any GPS data (even without fix)
 		s.stateMutex.Lock()
-		s.LastDataReceived = time.Now()
+		s.lastDataReceived = time.Now()
 		s.stateMutex.Unlock()
 
 		// Update fix status
 		switch report.Mode {
-		case 0:
-			s.FixMode = "none"
-			s.State = "searching"
-		case 1:
-			s.FixMode = "none"
-			s.State = "searching"
+		case 0, 1:
+			s.fixMode.Store("none")
+			s.state.Store("searching")
 		case 2:
-			s.FixMode = "2d"
-			s.State = "fix-established"
+			s.fixMode.Store("2d")
+			s.state.Store("fix-established")
 		case 3:
-			s.FixMode = "3d"
-			s.State = "fix-established"
+			s.fixMode.Store("3d")
+			s.state.Store("fix-established")
 		}
 
 		// Update quality metrics from TPV report
-		s.Quality = report.Ept // Using estimated time precision as quality metric
-		s.EPH = report.Eph     // Horizontal position error estimate in meters
+		s.quality.Store(report.Ept)
+		s.eph.Store(report.Eph)
 
 		if report.Mode == 1 || report.Mode == 0 {
-			// 0=unknown, 1=no fix
-			s.HasValidFix = false
+			s.hasValidFix.Store(false)
 			return
 		}
 
@@ -696,22 +742,26 @@ func (s *Service) connectToGPSD() error {
 			rawLocation.Timestamp = report.Time
 
 			// Track GPS timestamp changes
-			if s.LastGPSTimestamp.IsZero() || !report.Time.Equal(s.LastGPSTimestamp) {
-				s.LastGPSTimestamp = report.Time
-				s.LastGPSTimestampUpdate = time.Now()
+			s.stateMutex.Lock()
+			if s.lastGPSTimestamp.IsZero() || !report.Time.Equal(s.lastGPSTimestamp) {
+				s.lastGPSTimestamp = report.Time
+				s.lastGPSTimestampUpdate = time.Now()
 			}
+			s.stateMutex.Unlock()
 		} else {
 			rawLocation.Timestamp = time.Now()
 		}
 
 		// Store raw location directly (no filtering)
-		s.CurrentLoc = rawLocation
-		s.LastFix = time.Now()
-		s.HasValidFix = true
+		s.stateMutex.Lock()
+		s.currentLoc = rawLocation
+		s.lastFix = time.Now()
+		s.stateMutex.Unlock()
+		s.hasValidFix.Store(true)
 	})
 
 	// Track gpsd connection state
-	s.GpsdConnected = true
+	s.gpsdConnected.Store(true)
 
 	s.Done = s.GpsdConn.Watch()
 
@@ -734,27 +784,27 @@ func (s *Service) Close() {
 		s.stopChan = nil
 	}
 	s.Enabled = false
-	s.State = "off"
+	s.state.Store("off")
 	s.configMutex.Lock()
 	if s.GpsdConn != nil {
 		s.GpsdConn.Close()
 		s.GpsdConn = nil
 	}
 	s.configMutex.Unlock()
-	s.GpsdConnected = false
+	s.gpsdConnected.Store(false)
 }
 
 func (s *Service) GetGPSStatus() map[string]interface{} {
 	return map[string]interface{}{
-		"fix":       s.FixMode,
-		"quality":   s.Quality,
-		"hdop":      s.HDOP,
-		"vdop":      s.VDOP,
-		"pdop":      s.PDOP,
-		"eph":       s.EPH,
-		"active":    s.HasValidFix,
-		"connected": s.GpsdConnected,
-		"state":     s.State,
+		"fix":       s.FixMode(),
+		"quality":   s.Quality(),
+		"hdop":      s.HDOP(),
+		"vdop":      s.VDOP(),
+		"pdop":      s.PDOP(),
+		"eph":       s.EPH(),
+		"active":    s.HasValidFix(),
+		"connected": s.GpsdConnected(),
+		"state":     s.State(),
 	}
 }
 

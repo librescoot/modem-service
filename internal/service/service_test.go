@@ -352,8 +352,8 @@ func TestGPSHealthCheck(t *testing.T) {
 	}
 
 	// Test 4: GPS timestamp stuck should fail
-	service.LastGPSDataTime = time.Now() // Recent data
-	service.Location.LastGPSTimestampUpdate = time.Now().Add(-200 * time.Second)
+	service.LastGPSDataTime = time.Now()
+	service.Location.SetLastGPSTimestampUpdate(time.Now().Add(-200 * time.Second))
 	err = service.checkGPSHealth()
 	if err == nil {
 		t.Error("Expected error for stuck GPS timestamp, got nil")
@@ -363,9 +363,9 @@ func TestGPSHealthCheck(t *testing.T) {
 
 	// Test 5: GPS fix timeout should fail
 	service.LastGPSDataTime = time.Now()
-	service.Location.LastGPSTimestampUpdate = time.Now()
+	service.Location.SetLastGPSTimestampUpdate(time.Now())
 	service.GPSEnabledTime = time.Now().Add(-400 * time.Second)
-	service.Location.HasValidFix = false
+	service.Location.SetHasValidFix(false)
 	err = service.checkGPSHealth()
 	if err == nil {
 		t.Error("Expected error for GPS fix timeout, got nil")
@@ -387,13 +387,12 @@ func TestHealthStateInitialization(t *testing.T) {
 	}
 }
 
-// TestGPSRecoveryCountReset tests that GPS recovery count resets properly
+// TestGPSRecoveryCountReset tests that GPS recovery count can be incremented and reset
 func TestGPSRecoveryCountReset(t *testing.T) {
 	cfg := &config.Config{
 		Interface:         "wwan0",
 		InternetCheckTime: 30 * time.Second,
 		GpsdServer:        "localhost:2947",
-		RedisURL:          "redis://localhost:6379",
 	}
 
 	logger := log.New(os.Stdout, "TEST: ", log.LstdFlags)
@@ -405,12 +404,16 @@ func TestGPSRecoveryCountReset(t *testing.T) {
 		LastState: modem.NewState(),
 	}
 
-	// Set recovery count
-	service.GPSRecoveryCount = 5
+	// Simulate multiple GPS recovery attempts
+	for range 5 {
+		service.GPSRecoveryCount++
+	}
+	if service.GPSRecoveryCount != 5 {
+		t.Errorf("Expected GPS recovery count to be 5, got %d", service.GPSRecoveryCount)
+	}
 
-	// Simulate successful modem recovery (which should reset GPS recovery count)
+	// Simulate successful fix resetting the counter
 	service.GPSRecoveryCount = 0
-
 	if service.GPSRecoveryCount != 0 {
 		t.Errorf("Expected GPS recovery count to be reset to 0, got %d", service.GPSRecoveryCount)
 	}
@@ -433,11 +436,11 @@ func TestLocationServiceInitialization(t *testing.T) {
 		t.Errorf("Expected gpsd server to be 'localhost:2947', got '%s'", locService.GpsdServer)
 	}
 
-	if locService.State != "off" {
-		t.Errorf("Expected initial state to be 'off', got '%s'", locService.State)
+	if locService.State() != "off" {
+		t.Errorf("Expected initial state to be 'off', got '%s'", locService.State())
 	}
 
-	if locService.HasValidFix {
+	if locService.HasValidFix() {
 		t.Error("Expected HasValidFix to be false initially")
 	}
 

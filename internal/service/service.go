@@ -163,12 +163,11 @@ func (s *Service) disableModem() {
 	s.Redis.PublishLocationState(map[string]interface{}{"state": "off"}, false)
 
 	// Publish off states
-	s.Redis.PublishInternetState("internet", "status", "disconnected")
-	s.Redis.PublishInternetState("internet", "modem-state", "off")
+	s.Redis.PublishInternetState("status", "disconnected")
+	s.Redis.PublishInternetState("modem-state", "off")
 	s.Redis.PublishModemState("power-state", "off")
 
-	// Turn off the modem via GPIO (3.5 second pulse)
-	if err := s.Modem.RestartModem(); err != nil {
+	if err := s.Modem.PowerOffModem(); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
 	}
 
@@ -232,7 +231,7 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	return fmt.Errorf("modem failed to come up after multiple attempts, marked as potentially defective")
 }
 
-func (s *Service) checkHealth() error {
+func (s *Service) checkHealth(ctx context.Context) error {
 	// Skip health check if we're in a terminal state
 	if s.Health.IsTerminal() {
 		return fmt.Errorf("modem in terminal state: %s", s.Health.State)
@@ -240,15 +239,15 @@ func (s *Service) checkHealth() error {
 
 	_, err := s.Modem.FindModem()
 	if err != nil {
-		return s.handleModemFailure(fmt.Sprintf("no_modem_found: %v", err))
+		return s.handleModemFailure(ctx, fmt.Sprintf("no_modem_found: %v", err))
 	}
 
 	if err := s.Modem.CheckPrimaryPort(); err != nil {
-		return s.handleModemFailure(fmt.Sprintf("wrong_primary_port: %v", err))
+		return s.handleModemFailure(ctx, fmt.Sprintf("wrong_primary_port: %v", err))
 	}
 
 	if err := s.Modem.CheckPowerState(); err != nil {
-		return s.handleModemFailure(fmt.Sprintf("wrong_power_state: %v", err))
+		return s.handleModemFailure(ctx, fmt.Sprintf("wrong_power_state: %v", err))
 	}
 
 	s.Health.MarkNormal()
@@ -257,7 +256,7 @@ func (s *Service) checkHealth() error {
 	return nil
 }
 
-func (s *Service) handleModemFailure(reason string) error {
+func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 	s.Logger.Printf("Modem failure detected: %s", reason)
 
 	if s.Health.IsRecovering() {
@@ -267,23 +266,26 @@ func (s *Service) handleModemFailure(reason string) error {
 	// Be more forgiving - instead of entering terminal state, just wait longer
 	if !s.Health.CanRecover() {
 		s.Logger.Printf("Max recovery attempts reached, waiting before reset...")
-		// Instead of entering terminal state, wait and reset recovery counter
-		time.Sleep(2 * time.Minute)
-		s.Health.RecoveryAttempts = 0 // Reset recovery attempts
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Minute):
+		}
+		s.Health.RecoveryAttempts = 0
 		s.Logger.Printf("Recovery attempts reset, will try again")
-		return nil // Don't fail permanently
+		return nil
 	}
 
-	return s.attemptRecovery()
+	return s.attemptRecovery(ctx)
 }
 
-func (s *Service) attemptRecovery() error {
+func (s *Service) attemptRecovery(ctx context.Context) error {
 	s.Health.StartRecovery()
 
 	s.Logger.Printf("Attempting modem recovery (attempt %d/%d)",
 		s.Health.RecoveryAttempts, health.MaxRecoveryAttempts)
 
-	s.publishHealthState(context.Background())
+	s.publishHealthState(ctx)
 
 	// Strategy 1: Try software reset first if modem is present
 	_, err := s.Modem.FindModem()
@@ -292,14 +294,17 @@ func (s *Service) attemptRecovery() error {
 		if err := s.Modem.ResetModem(); err != nil {
 			s.Logger.Printf("Failed to reset modem via D-Bus: %v", err)
 		} else {
-			// Wait for modem to recover
-			time.Sleep(health.RecoveryWaitTime)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(health.RecoveryWaitTime):
+			}
 
-			if err := s.checkHealth(); err == nil {
+			if err := s.checkHealth(ctx); err == nil {
 				s.Logger.Printf("Modem recovery successful via D-Bus reset")
 				s.Health.MarkNormal()
-				s.GPSRecoveryCount = 0 // Reset GPS recovery counter on successful modem recovery
-				s.publishHealthState(context.Background())
+				s.GPSRecoveryCount = 0
+				s.publishHealthState(ctx)
 				return nil
 			}
 		}
@@ -310,16 +315,16 @@ func (s *Service) attemptRecovery() error {
 	if err := s.Modem.RecoverUSB(); err != nil {
 		s.Logger.Printf("USB recovery failed: %v", err)
 	} else {
-		// Wait for modem to come back up after USB recovery
-		ctx, cancel := context.WithTimeout(context.Background(), health.RecoveryWaitTime)
-		defer cancel()
+		usbCtx, usbCancel := context.WithTimeout(ctx, health.RecoveryWaitTime)
+		err := s.Modem.WaitForModem(usbCtx, s.Config.Interface)
+		usbCancel()
 
-		if err := s.Modem.WaitForModem(ctx, s.Config.Interface); err == nil {
-			if err := s.checkHealth(); err == nil {
+		if err == nil {
+			if err := s.checkHealth(ctx); err == nil {
 				s.Logger.Printf("Modem recovery successful via USB recovery")
 				s.Health.MarkNormal()
-				s.GPSRecoveryCount = 0 // Reset GPS recovery counter
-				s.publishHealthState(context.Background())
+				s.GPSRecoveryCount = 0
+				s.publishHealthState(ctx)
 				return nil
 			}
 		}
@@ -329,18 +334,17 @@ func (s *Service) attemptRecovery() error {
 	s.Logger.Printf("Attempting modem restart (GPIO with D-Bus fallback)...")
 	if err := s.Modem.RestartModem(); err != nil {
 		s.Logger.Printf("GPIO restart failed: %v", err)
-		// Don't return error immediately, try waiting longer
 	} else {
-		// Wait for modem to come back up
-		ctx, cancel := context.WithTimeout(context.Background(), health.RecoveryWaitTime)
-		defer cancel()
+		gpioCtx, gpioCancel := context.WithTimeout(ctx, health.RecoveryWaitTime)
+		err := s.Modem.WaitForModem(gpioCtx, s.Config.Interface)
+		gpioCancel()
 
-		if err := s.Modem.WaitForModem(ctx, s.Config.Interface); err == nil {
-			if err := s.checkHealth(); err == nil {
+		if err == nil {
+			if err := s.checkHealth(ctx); err == nil {
 				s.Logger.Printf("Modem recovery successful via GPIO restart")
 				s.Health.MarkNormal()
-				s.GPSRecoveryCount = 0 // Reset GPS recovery counter
-				s.publishHealthState(context.Background())
+				s.GPSRecoveryCount = 0
+				s.publishHealthState(ctx)
 				return nil
 			}
 		}
@@ -348,35 +352,37 @@ func (s *Service) attemptRecovery() error {
 
 	// Strategy 4: Just wait longer and hope the modem recovers
 	s.Logger.Printf("Hardware recovery uncertain, waiting additional time for modem to stabilize...")
-	time.Sleep(30 * time.Second)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(30 * time.Second):
+	}
 
-	// Check if modem recovered during the wait
-	if err := s.checkHealth(); err == nil {
+	if err := s.checkHealth(ctx); err == nil {
 		s.Logger.Printf("Modem recovered during extended wait")
 		s.Health.MarkNormal()
 		s.GPSRecoveryCount = 0
-		s.publishHealthState(context.Background())
+		s.publishHealthState(ctx)
 		return nil
 	}
 
-	// If we get here, this recovery attempt failed, but don't give up entirely
 	s.Logger.Printf("Recovery attempt %d failed, will retry", s.Health.RecoveryAttempts)
 	return fmt.Errorf("recovery attempt failed, will retry")
 }
 
 func (s *Service) publishHealthState(ctx context.Context) error {
-	return s.Redis.PublishInternetState("internet", "modem-health", s.Health.State)
+	return s.Redis.PublishInternetState("modem-health", s.Health.State)
 }
 
 // handleGPSFailure attempts GPS-specific recovery before escalating to modem recovery
-func (s *Service) handleGPSFailure(gpsErr error) error {
+func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
 	s.Logger.Printf("Attempting GPS-specific recovery for: %v", gpsErr)
 
 	// Try to restart GPS configuration without restarting the entire modem
 	if err := s.attemptGPSRecovery(); err != nil {
 		s.Logger.Printf("GPS-specific recovery failed: %v", err)
 		// Only escalate to modem recovery for severe GPS issues after GPS recovery fails
-		if recoveryErr := s.handleModemFailure(fmt.Sprintf("gps_stuck_after_gps_recovery: %v", gpsErr)); recoveryErr != nil {
+		if recoveryErr := s.handleModemFailure(ctx, fmt.Sprintf("gps_stuck_after_gps_recovery: %v", gpsErr)); recoveryErr != nil {
 			return fmt.Errorf("both GPS and modem recovery failed: %v", recoveryErr)
 		}
 	}
@@ -420,8 +426,7 @@ func (s *Service) attemptGPSRecovery() error {
 		s.LastGPSDataTime = time.Time{}
 		s.GPSEnabledTime = time.Time{}
 		s.WaitingForGPSLogged = false
-		s.Location.LastGPSTimestamp = time.Time{}
-		s.Location.LastGPSTimestampUpdate = time.Time{}
+		s.Location.ResetTimestampTracking()
 
 		// Wait longer before allowing monitor to re-enable GPS
 		time.Sleep(30 * time.Second)
@@ -444,8 +449,7 @@ func (s *Service) attemptGPSRecovery() error {
 	s.LastGPSDataTime = time.Time{}
 	s.GPSEnabledTime = time.Time{}
 	s.WaitingForGPSLogged = false
-	s.Location.LastGPSTimestamp = time.Time{}
-	s.Location.LastGPSTimestampUpdate = time.Time{}
+	s.Location.ResetTimestampTracking()
 
 	// Try to re-enable GPS
 	modemPath, err := s.Modem.FindModem()
@@ -470,7 +474,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	// NOTE: LastState.Status here refers to the overall internet connectivity, not the raw modem status.
 	if s.LastState.Status != internetStatus {
 		s.Logger.Printf("internet status: %s", internetStatus)
-		if err := s.Redis.PublishInternetState("internet", "status", internetStatus); err != nil {
+		if err := s.Redis.PublishInternetState("status", internetStatus); err != nil {
 			return err
 		}
 		s.LastState.Status = internetStatus // Store the published internet status
@@ -479,7 +483,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	// Publish the raw modem state (1:1 copy of currentState.Status)
 	if s.LastState.LastRawModemStatus != currentState.Status {
 		s.Logger.Printf("internet modem-state: %s", currentState.Status)
-		if err := s.Redis.PublishInternetState("internet", "modem-state", currentState.Status); err != nil {
+		if err := s.Redis.PublishInternetState("modem-state", currentState.Status); err != nil {
 			// Log error but don't necessarily fail the whole publish operation for this specific field
 			s.Logger.Printf("Failed to publish internet modem-state: %v", err)
 		}
@@ -489,7 +493,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	// Publish modem's reported IP address (might be present even if ping fails)
 	if s.LastState.IfIPAddr != currentState.IfIPAddr {
 		s.Logger.Printf("internet ip-address: %s", currentState.IfIPAddr)
-		if err := s.Redis.PublishInternetState("internet", "ip-address", currentState.IfIPAddr); err != nil {
+		if err := s.Redis.PublishInternetState("ip-address", currentState.IfIPAddr); err != nil {
 			return err
 		}
 		s.LastState.IfIPAddr = currentState.IfIPAddr
@@ -497,7 +501,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.AccessTech != currentState.AccessTech {
 		s.Logger.Printf("internet access-tech: %s", currentState.AccessTech)
-		if err := s.Redis.PublishInternetState("internet", "access-tech", currentState.AccessTech); err != nil {
+		if err := s.Redis.PublishInternetState("access-tech", currentState.AccessTech); err != nil {
 			return err
 		}
 		s.LastState.AccessTech = currentState.AccessTech
@@ -505,7 +509,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.SignalQuality != currentState.SignalQuality {
 		s.Logger.Printf("internet signal-quality: %d", currentState.SignalQuality)
-		if err := s.Redis.PublishInternetState("internet", "signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
+		if err := s.Redis.PublishInternetState("signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
 			return err
 		}
 		s.LastState.SignalQuality = currentState.SignalQuality
@@ -569,7 +573,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.IMEI != currentState.IMEI {
 		s.Logger.Printf("modem IMEI: %s", currentState.IMEI)
-		if err := s.Redis.PublishInternetState("internet", "sim-imei", currentState.IMEI); err != nil {
+		if err := s.Redis.PublishInternetState("sim-imei", currentState.IMEI); err != nil {
 			return err
 		}
 		s.LastState.IMEI = currentState.IMEI
@@ -577,7 +581,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.IMSI != currentState.IMSI {
 		s.Logger.Printf("SIM IMSI: %s", currentState.IMSI)
-		if err := s.Redis.PublishInternetState("internet", "sim-imsi", currentState.IMSI); err != nil {
+		if err := s.Redis.PublishInternetState("sim-imsi", currentState.IMSI); err != nil {
 			return err
 		}
 		s.LastState.IMSI = currentState.IMSI
@@ -585,7 +589,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	if s.LastState.ICCID != currentState.ICCID {
 		s.Logger.Printf("SIM ICCID: %s", currentState.ICCID)
-		if err := s.Redis.PublishInternetState("internet", "sim-iccid", currentState.ICCID); err != nil {
+		if err := s.Redis.PublishInternetState("sim-iccid", currentState.ICCID); err != nil {
 			return err
 		}
 		s.LastState.ICCID = currentState.ICCID
@@ -635,7 +639,7 @@ func (s *Service) syncClockFromGPS(t time.Time) {
 }
 
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
-	if err := s.checkHealth(); err != nil {
+	if err := s.checkHealth(ctx); err != nil {
 		s.Logger.Printf("Health check failed: %v", err)
 		// If health check fails, assume disconnected and publish minimal state
 		s.publishModemState(ctx, modem.NewState(), "disconnected")
@@ -678,7 +682,7 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 				s.Logger.Printf("Modem reports connected but internet check failed %d times, attempting recovery", s.connectivityFailures)
 				// Don't reset counter here - it will be reset on next successful connectivity check
 				// This ensures persistent connectivity issues are detected if recovery fails
-				recoveryErr := s.handleModemFailure("internet_connectivity_failed")
+				recoveryErr := s.handleModemFailure(ctx, "internet_connectivity_failed")
 				if recoveryErr != nil {
 					s.Logger.Printf("Failed to initiate modem recovery: %v", recoveryErr)
 				}
@@ -715,12 +719,13 @@ func (s *Service) checkGPSHealth() error {
 	}
 
 	// Check if GPS timestamp is stuck (timestamp hasn't changed for 180 seconds)
-	if !s.Location.LastGPSTimestampUpdate.IsZero() && now.Sub(s.Location.LastGPSTimestampUpdate) > location.GPSTimestampStaleness {
-		return fmt.Errorf("gps_timestamp_stuck: GPS timestamp hasn't changed for %v", now.Sub(s.Location.LastGPSTimestampUpdate))
+	lastTsUpdate := s.Location.LastGPSTimestampUpdate()
+	if !lastTsUpdate.IsZero() && now.Sub(lastTsUpdate) > location.GPSTimestampStaleness {
+		return fmt.Errorf("gps_timestamp_stuck: GPS timestamp hasn't changed for %v", now.Sub(lastTsUpdate))
 	}
 
 	// Check if GPS fix is taking too long (no fix for 300 seconds since GPS was enabled)
-	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix && now.Sub(s.GPSEnabledTime) > 300*time.Second {
+	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix() && now.Sub(s.GPSEnabledTime) > 300*time.Second {
 		return fmt.Errorf("gps_fix_timeout: no GPS fix established for %v", now.Sub(s.GPSEnabledTime))
 	}
 
@@ -768,7 +773,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 				// Check for GPS health issues and try GPS-specific recovery first
 				if err := s.checkGPSHealth(); err != nil {
 					s.Logger.Printf("GPS health check failed: %v", err)
-					if recoveryErr := s.handleGPSFailure(err); recoveryErr != nil {
+					if recoveryErr := s.handleGPSFailure(ctx, err); recoveryErr != nil {
 						s.Logger.Printf("GPS recovery failed: %v", recoveryErr)
 					}
 					continue
@@ -776,7 +781,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 
 				// Always publish GPS status, even without valid fix
 				gpsStatus := s.Location.GetGPSStatus()
-				hasValidFix := gpsStatus["active"].(bool)
+				hasValidFix, _ := gpsStatus["active"].(bool)
 
 				// Determine if we should publish GPS recovery notification
 				// Check current internet status from LastState
@@ -786,7 +791,8 @@ func (s *Service) monitorStatus(ctx context.Context) {
 				if hasValidFix {
 					// Set system time from GPS on first fix of this session
 					if !s.clockSynced {
-						s.syncClockFromGPS(s.Location.CurrentLoc.Timestamp)
+						currentLoc := s.Location.CurrentLoc()
+						s.syncClockFromGPS(currentLoc.Timestamp)
 						s.clockSynced = true
 					}
 
@@ -813,11 +819,12 @@ func (s *Service) monitorStatus(ctx context.Context) {
 
 					// Log GPS quality every 90 seconds (similar to signal quality)
 					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
-						s.Logger.Printf("gps quality: %.2f", gpsStatus["quality"].(float64))
+						qualVal, _ := gpsStatus["quality"].(float64)
+						s.Logger.Printf("gps quality: %.2f", qualVal)
 						s.LastGPSQualityLog = time.Now()
 					}
 
-					if err := s.publishLocationState(ctx, s.Location.CurrentLoc, publishRecovery); err != nil {
+					if err := s.publishLocationState(ctx, s.Location.CurrentLoc(), publishRecovery); err != nil {
 						s.Logger.Printf("Failed to publish location: %v", err)
 					}
 				} else {
@@ -827,7 +834,8 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					}
 
 					// Update GPS data timestamp even when no fix, if GPS is connected
-					if gpsStatus["connected"].(bool) {
+					isConnected, _ := gpsStatus["connected"].(bool)
+					if isConnected {
 						s.LastGPSDataTime = time.Now()
 					}
 

@@ -62,7 +62,7 @@ func (c *Client) Ping() error {
 }
 
 // PublishInternetState publishes internet state to Redis using SetIfChanged
-func (c *Client) PublishInternetState(key, field, value string) error {
+func (c *Client) PublishInternetState(field, value string) error {
 	_, err := c.client.Hash("internet").SetIfChanged(field, value)
 	if err != nil {
 		c.logger.Printf("Unable to set %s in redis: %v", field, err)
