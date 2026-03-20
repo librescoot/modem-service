@@ -723,9 +723,16 @@ func (s *Service) connectToGPSD() error {
 			return
 		}
 
+		s.stateMutex.Lock()
+		prevLoc := s.currentLoc
+		s.stateMutex.Unlock()
+
 		rawLocation := Location{
 			Latitude:  report.Lat,
 			Longitude: report.Lon,
+			Altitude:  prevLoc.Altitude,
+			Speed:     prevLoc.Speed,
+			Course:    prevLoc.Course,
 		}
 
 		if report.Alt != 0 {
