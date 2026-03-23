@@ -652,7 +652,7 @@ func (s *Service) syncClockFromGPS(t time.Time) {
 	if t.IsZero() {
 		return
 	}
-	timeStr := t.UTC().Format("02 Jan 2006 15:04:05")
+	timeStr := t.Local().Format("02 Jan 2006 15:04:05")
 	out, err := exec.Command("chronyc", "settime", timeStr).CombinedOutput()
 	if err != nil {
 		s.Logger.Printf("Failed to set system time from GPS: %v: %s", err, out)
