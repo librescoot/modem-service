@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"modem-service/internal/cell"
 	"modem-service/internal/config"
 	"modem-service/internal/health"
 	"modem-service/internal/location"
@@ -41,6 +42,12 @@ type Service struct {
 	connectivityFailures  int        // Consecutive internet connectivity check failures
 
 	clockSynced bool // True after system time has been set from GPS
+
+	// Location settings (from Redis)
+	gpsEnabled          bool
+	cellLocationEnabled bool
+	lastCellTower       *cell.CellTower
+	lastCellLoc         *cell.CellLocation
 
 	// Modem enable/disable state
 	modemEnabled      bool       // Target state: should modem be on?
@@ -76,8 +83,11 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
+		gpsEnabled:          true,  // default: GPS on
+		cellLocationEnabled: false, // default: cell location off
 	}
 
+	cell.SetVersion(version)
 	service.Logger.Printf("modem-service %s", version)
 
 	return service, nil
@@ -97,6 +107,19 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.Redis.StartVehicleStateWatcher(s.handleVehicleState); err != nil {
 		s.Logger.Printf("Failed to start vehicle state watcher: %v", err)
 	}
+
+	// Watch location settings
+	s.Redis.StartSettingsWatcher("modem.gps", func(value string) error {
+		s.gpsEnabled = value != "false"
+		s.Logger.Printf("GPS %s", map[bool]string{true: "enabled", false: "disabled"}[s.gpsEnabled])
+		return nil
+	})
+	s.Redis.StartSettingsWatcher("modem.cell-location", func(value string) error {
+		s.cellLocationEnabled = value == "true"
+		s.Logger.Printf("Cell location %s", map[bool]string{true: "enabled", false: "disabled"}[s.cellLocationEnabled])
+		return nil
+	})
+	s.Redis.StartSettingsWatching()
 
 	// Try to enable the modem if it's not present
 	if err := s.ensureModemEnabled(ctx); err != nil {
@@ -707,7 +730,62 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		return err
 	}
 
+
 	return nil
+}
+
+func (s *Service) queryCellLocation(ctx context.Context, state *modem.State) {
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		return
+	}
+
+	locationData, err := s.MMClient.GetLocation(modemPath)
+	if err != nil {
+		if s.Config.Debug {
+			s.Logger.Printf("Failed to get cell location data: %v", err)
+		}
+		return
+	}
+
+	tower, err := cell.ParseModemManagerLocation(locationData, state.AccessTech)
+	if err != nil {
+		if s.Config.Debug {
+			s.Logger.Printf("Failed to parse cell info: %v", err)
+		}
+		return
+	}
+
+	// Skip API call if cell tower hasn't changed and we have a cached result
+	if s.lastCellTower != nil && s.lastCellLoc != nil &&
+		tower.CellId == s.lastCellTower.CellId &&
+		tower.LocationAreaCode == s.lastCellTower.LocationAreaCode &&
+		tower.MobileNetworkCode == s.lastCellTower.MobileNetworkCode &&
+		tower.MobileCountryCode == s.lastCellTower.MobileCountryCode {
+		return
+	}
+
+	result, err := cell.Geolocate(ctx, []cell.CellTower{*tower})
+	if err != nil {
+		if s.Config.Debug {
+			s.Logger.Printf("BeaconDB lookup failed: %v", err)
+		}
+		return
+	}
+
+	s.lastCellTower = tower
+	s.lastCellLoc = result
+	s.Logger.Printf("Cell location: %.5f, %.5f (accuracy: %.0fm)", result.Latitude, result.Longitude, result.Accuracy)
+
+	data := map[string]interface{}{
+		"latitude":  fmt.Sprintf("%.6f", result.Latitude),
+		"longitude": fmt.Sprintf("%.6f", result.Longitude),
+		"accuracy":  fmt.Sprintf("%.0f", result.Accuracy),
+		"source":    "cell",
+	}
+	if err := s.Redis.PublishCellLocationState(data); err != nil {
+		s.Logger.Printf("Failed to publish cell location: %v", err)
+	}
 }
 
 func (s *Service) checkGPSHealth() error {
@@ -735,8 +813,10 @@ func (s *Service) checkGPSHealth() error {
 func (s *Service) monitorStatus(ctx context.Context) {
 	ticker := time.NewTicker(s.Config.InternetCheckTime)
 	gpsTimer := time.NewTicker(location.GPSUpdateInterval)
+	cellTimer := time.NewTicker(location.CellLocationUpdateInterval)
 	defer ticker.Stop()
 	defer gpsTimer.Stop()
+	defer cellTimer.Stop()
 
 	if err := s.checkAndPublishModemStatus(ctx); err != nil {
 		s.Logger.Printf("Initial modem status check failed: %v", err)
@@ -750,7 +830,14 @@ func (s *Service) monitorStatus(ctx context.Context) {
 			if err := s.checkAndPublishModemStatus(ctx); err != nil {
 				s.Logger.Printf("Periodic modem status check failed: %v", err)
 			}
+		case <-cellTimer.C:
+			if s.cellLocationEnabled && !s.Location.HasValidFix() && s.LastState.Status == "connected" {
+				s.queryCellLocation(ctx, s.LastState)
+			}
 		case <-gpsTimer.C:
+			if !s.gpsEnabled {
+				continue
+			}
 			if s.Health.State == health.StateNormal {
 				modemPath, err := s.Modem.FindModem()
 				if err != nil {

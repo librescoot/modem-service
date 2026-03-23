@@ -16,13 +16,14 @@ import (
 )
 
 const (
-	GPSUpdateInterval     = 1 * time.Second
-	GPSTimeout            = 10 * time.Minute
-	GPSTimestampStaleness = 180 * time.Second
-	MaxGPSRetries         = 10
-	GPSRetryInterval      = 5 * time.Second
-	GPSConfigTimeout      = 30 * time.Second
-	MaxConfigRetries      = 3
+	GPSUpdateInterval          = 1 * time.Second
+	CellLocationUpdateInterval = 5 * time.Second
+	GPSTimeout                 = 10 * time.Minute
+	GPSTimestampStaleness      = 180 * time.Second
+	MaxGPSRetries              = 10
+	GPSRetryInterval           = 5 * time.Second
+	GPSConfigTimeout           = 30 * time.Second
+	MaxConfigRetries           = 3
 )
 
 type Config struct {

@@ -15,12 +15,13 @@ const (
 
 // Client wraps the Redis IPC client
 type Client struct {
-	client       *ipc.Client
-	logger       *log.Logger
-	faultStream  *ipc.StreamPublisher
-	faultSet     *ipc.FaultSet
-	modemHandler *ipc.QueueHandler[string]
-	vehicleWatch *ipc.HashWatcher
+	client        *ipc.Client
+	logger        *log.Logger
+	faultStream   *ipc.StreamPublisher
+	faultSet      *ipc.FaultSet
+	modemHandler  *ipc.QueueHandler[string]
+	vehicleWatch  *ipc.HashWatcher
+	settingsWatch *ipc.HashWatcher
 }
 
 // ModemCommandHandler is called when modem enable/disable commands are received
@@ -106,6 +107,17 @@ func (c *Client) PublishLocationState(data map[string]interface{}, publishRecove
 	return nil
 }
 
+// PublishCellLocationState publishes cell tower geolocation to Redis.
+func (c *Client) PublishCellLocationState(data map[string]interface{}) error {
+	data["updated"] = time.Now().Format(time.RFC3339)
+	err := c.client.Hash("cell-location").SetMany(data, ipc.NoPublish())
+	if err != nil {
+		c.logger.Printf("Unable to set cell-location in redis: %v", err)
+		return fmt.Errorf("cannot write cell-location to redis: %v", err)
+	}
+	return nil
+}
+
 // StartModemCommandHandler starts listening for modem enable/disable commands on scooter:modem list
 func (c *Client) StartModemCommandHandler(handler ModemCommandHandler) error {
 	c.modemHandler = ipc.HandleRequests(c.client, "scooter:modem", func(cmd string) error {
@@ -124,6 +136,27 @@ func (c *Client) StartVehicleStateWatcher(handler VehicleStateHandler) error {
 	})
 	c.vehicleWatch.StartWithSync()
 	return nil
+}
+
+// SettingHandler is called when a setting changes
+type SettingHandler func(value string) error
+
+// StartSettingsWatcher starts watching settings hash for specific fields
+func (c *Client) StartSettingsWatcher(field string, handler SettingHandler) {
+	if c.settingsWatch == nil {
+		c.settingsWatch = c.client.NewHashWatcher("settings")
+	}
+	c.settingsWatch.OnField(field, func(value string) error {
+		c.logger.Printf("Setting %s changed: %s", field, value)
+		return handler(value)
+	})
+}
+
+// StartSettingsWatching begins watching after all fields are registered
+func (c *Client) StartSettingsWatching() {
+	if c.settingsWatch != nil {
+		c.settingsWatch.StartWithSync()
+	}
 }
 
 // LogFault logs a fault event to the events:faults stream
@@ -161,6 +194,9 @@ func (c *Client) Close() error {
 	}
 	if c.vehicleWatch != nil {
 		c.vehicleWatch.Stop()
+	}
+	if c.settingsWatch != nil {
+		c.settingsWatch.Stop()
 	}
 	return c.client.Close()
 }
