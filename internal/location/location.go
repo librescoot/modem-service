@@ -24,7 +24,32 @@ const (
 	GPSRetryInterval           = 5 * time.Second
 	GPSConfigTimeout           = 30 * time.Second
 	MaxConfigRetries           = 3
+
+	// gpsWeekRollover is the GPS week-number rollover period (1024 weeks ≈ 19.6 years).
+	// SIMCom GPS firmwares with a stale rollover epoch report timestamps this much
+	// behind the real time, e.g. April 2026 → April 2006.
+	gpsWeekRollover = 1024 * 7 * 24 * time.Hour
 )
+
+// MinValidGPSDate is the start of the current GPS week-number rollover epoch
+// (2019-04-07). Any GPS timestamp earlier than this is definitively wrong and
+// should be corrected by adding multiples of gpsWeekRollover.
+var MinValidGPSDate = time.Date(2019, 4, 7, 0, 0, 0, 0, time.UTC)
+
+// correctGPSWeekRollover compensates for receivers stuck in an older GPS week
+// rollover epoch by advancing the timestamp by 1024 weeks until it falls inside
+// the current epoch. Returns the (possibly unchanged) timestamp and whether a
+// correction was applied.
+func correctGPSWeekRollover(t time.Time) (time.Time, bool) {
+	if t.IsZero() {
+		return t, false
+	}
+	corrected := t
+	for corrected.Before(MinValidGPSDate) {
+		corrected = corrected.Add(gpsWeekRollover)
+	}
+	return corrected, !corrected.Equal(t)
+}
 
 type Config struct {
 	SuplServer     string
@@ -79,6 +104,8 @@ type Service struct {
 	configMutex      sync.Mutex    // Protects GPS configuration to prevent concurrent attempts
 	monitoringActive atomic.Bool   // True if monitoring goroutine is already running
 	stopChan         chan struct{} // Signals monitoring goroutine to stop
+
+	rolloverLogged sync.Once // Logs GPS week-rollover correction at most once per session
 }
 
 func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, suplServer string) *Service {
@@ -747,12 +774,21 @@ func (s *Service) connectToGPSD() error {
 		}
 
 		if !report.Time.IsZero() {
-			rawLocation.Timestamp = report.Time
+			gpsTime, corrected := correctGPSWeekRollover(report.Time)
+			if corrected {
+				s.rolloverLogged.Do(func() {
+					s.Logger.Printf("GPS week-rollover correction active: receiver reports %s, using %s",
+						report.Time.Format(time.RFC3339),
+						gpsTime.Format(time.RFC3339))
+				})
+			}
+			rawLocation.Timestamp = gpsTime
 
-			// Track GPS timestamp changes
+			// Track GPS timestamp changes (use corrected time so staleness
+			// detection still works after rollover compensation).
 			s.stateMutex.Lock()
-			if s.lastGPSTimestamp.IsZero() || !report.Time.Equal(s.lastGPSTimestamp) {
-				s.lastGPSTimestamp = report.Time
+			if s.lastGPSTimestamp.IsZero() || !gpsTime.Equal(s.lastGPSTimestamp) {
+				s.lastGPSTimestamp = gpsTime
 				s.lastGPSTimestampUpdate = time.Now()
 			}
 			s.stateMutex.Unlock()

@@ -23,6 +23,11 @@ var modemOnlineStates = map[string]bool{
 	"ready-to-drive": true,
 }
 
+// clockSyncInterval is how often we re-feed the system clock from rollover-corrected
+// GPS time. The scooter is typically offline (no NTP), so this sample stream is the
+// only way chrony can refine its drift estimate and discipline the local oscillator.
+const clockSyncInterval = 60 * time.Second
+
 type Service struct {
 	Config                *config.Config
 	Redis                 *redisClient.Client
@@ -41,7 +46,7 @@ type Service struct {
 	gpsRecoveryInProgress bool       // Tracks if GPS recovery is currently running
 	connectivityFailures  int        // Consecutive internet connectivity check failures
 
-	clockSynced bool // True after system time has been set from GPS
+	lastClockSync time.Time // Last time syncClockFromGPS successfully fed chrony
 
 	// Location settings (from Redis)
 	gpsEnabled          bool
@@ -648,17 +653,31 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 	return s.Redis.PublishLocationState(data, publishRecovery)
 }
 
-func (s *Service) syncClockFromGPS(t time.Time) {
+// syncClockFromGPS feeds chrony a single time sample via `chronyc settime`.
+// Returns true if chrony accepted the sample, false if the timestamp was
+// rejected or the command failed (so the caller can retry on the next tick
+// instead of waiting a full clockSyncInterval).
+func (s *Service) syncClockFromGPS(t time.Time) bool {
 	if t.IsZero() {
-		return
+		return false
+	}
+	// Defense in depth against GPS week-rollover bugs: refuse to set the
+	// system clock to a timestamp before the current rollover epoch. The TPV
+	// callback already corrects rollover, but we never want a stray bad
+	// value to roll a working system clock back ~20 years.
+	if t.Before(location.MinValidGPSDate) {
+		s.Logger.Printf("Refusing to set system time from GPS: %s is before the current GPS rollover epoch (%s)",
+			t.Format(time.RFC3339), location.MinValidGPSDate.Format(time.RFC3339))
+		return false
 	}
 	timeStr := t.Local().Format("02 Jan 2006 15:04:05")
 	out, err := exec.Command("chronyc", "settime", timeStr).CombinedOutput()
 	if err != nil {
 		s.Logger.Printf("Failed to set system time from GPS: %v: %s", err, out)
-		return
+		return false
 	}
 	s.Logger.Printf("System time set from GPS: %s", timeStr)
+	return true
 }
 
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
@@ -876,11 +895,14 @@ func (s *Service) monitorStatus(ctx context.Context) {
 				publishRecovery := false
 
 				if hasValidFix {
-					// Set system time from GPS on first fix of this session
-					if !s.clockSynced {
+					// Periodically feed chrony with rollover-corrected GPS time so it
+					// can discipline the local oscillator. The scooter is typically
+					// offline (no NTP), so this is the only continuous time reference.
+					if s.lastClockSync.IsZero() || time.Since(s.lastClockSync) >= clockSyncInterval {
 						currentLoc := s.Location.CurrentLoc()
-						s.syncClockFromGPS(currentLoc.Timestamp)
-						s.clockSynced = true
+						if s.syncClockFromGPS(currentLoc.Timestamp) {
+							s.lastClockSync = time.Now()
+						}
 					}
 
 					// GPS is now valid - check if this is a recovery event
