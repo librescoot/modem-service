@@ -24,8 +24,9 @@ var modemOnlineStates = map[string]bool{
 }
 
 // clockSyncInterval is how often we re-feed the system clock from rollover-corrected
-// GPS time. The scooter is typically offline (no NTP), so this sample stream is the
-// only way chrony can refine its drift estimate and discipline the local oscillator.
+// GPS time while the scooter is offline. When connectivity is available, chrony's
+// NTP pool takes over and we suppress manual settime samples to avoid competing
+// with the higher-precision source.
 const clockSyncInterval = 60 * time.Second
 
 type Service struct {
@@ -895,10 +896,15 @@ func (s *Service) monitorStatus(ctx context.Context) {
 				publishRecovery := false
 
 				if hasValidFix {
-					// Periodically feed chrony with rollover-corrected GPS time so it
-					// can discipline the local oscillator. The scooter is typically
-					// offline (no NTP), so this is the only continuous time reference.
-					if s.lastClockSync.IsZero() || time.Since(s.lastClockSync) >= clockSyncInterval {
+					// Bootstrap the system clock from GPS on the first fix of the
+					// session so it's close to right immediately, even if NTP is
+					// reachable but chrony hasn't synced yet. After bootstrap, only
+					// keep feeding chrony GPS samples while we're offline — when we
+					// have connectivity, the NTP pool is the more accurate source
+					// and we don't want manual settime samples competing with it.
+					needsClockSync := s.lastClockSync.IsZero() ||
+						(!hasInternet && time.Since(s.lastClockSync) >= clockSyncInterval)
+					if needsClockSync {
 						currentLoc := s.Location.CurrentLoc()
 						if s.syncClockFromGPS(currentLoc.Timestamp) {
 							s.lastClockSync = time.Now()
