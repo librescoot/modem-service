@@ -932,10 +932,11 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.GPSRecoveryCount = 0
 					}
 
-					// Log GPS quality every 90 seconds (similar to signal quality)
+					// Log GPS diagnostics every 90 seconds
 					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
-						qualVal, _ := gpsStatus["quality"].(float64)
-						s.Logger.Printf("gps quality: %.2f", qualVal)
+						s.Logger.Printf("gps eph=%.1fm hdop=%.1f vdop=%.1f pdop=%.1f snr=%.1fdBHz sats=%d/%d",
+							gpsStatus["eph"], gpsStatus["hdop"], gpsStatus["vdop"], gpsStatus["pdop"],
+							gpsStatus["snr"], gpsStatus["satellites-used"], gpsStatus["satellites-visible"])
 						s.LastGPSQualityLog = time.Now()
 					}
 
@@ -962,7 +963,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					// Publish just the status without location data (never publish recovery when no fix)
 					data := map[string]interface{}{
 						"fix":       gpsStatus["fix"],
-						"quality":   gpsStatus["quality"],
+						"snr":       gpsStatus["snr"],
 						"active":    gpsStatus["active"],
 						"connected": gpsStatus["connected"],
 						"state":     gpsStatus["state"],

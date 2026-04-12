@@ -81,7 +81,7 @@ type Service struct {
 	// Simple scalars use atomics; compound types (Location, time.Time) use stateMutex.
 	hasValidFix   atomic.Bool
 	fixMode       atomic.Value // string: "none", "2d", "3d"
-	quality       atomic.Value // float64: 1/hdop
+	snr           atomic.Value // float64: average SNR of used satellites (dBHz)
 	hdop          atomic.Value // float64
 	vdop          atomic.Value // float64
 	pdop          atomic.Value // float64
@@ -132,7 +132,7 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 	}
 	s.state.Store("off")
 	s.fixMode.Store("none")
-	s.quality.Store(float64(0))
+	s.snr.Store(float64(0))
 	s.hdop.Store(float64(0))
 	s.vdop.Store(float64(0))
 	s.pdop.Store(float64(0))
@@ -146,7 +146,7 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 
 func (s *Service) HasValidFix() bool      { return s.hasValidFix.Load() }
 func (s *Service) FixMode() string         { return s.fixMode.Load().(string) }
-func (s *Service) Quality() float64        { return s.quality.Load().(float64) }
+func (s *Service) SNR() float64            { return s.snr.Load().(float64) }
 func (s *Service) HDOP() float64           { return s.hdop.Load().(float64) }
 func (s *Service) VDOP() float64           { return s.vdop.Load().(float64) }
 func (s *Service) PDOP() float64           { return s.pdop.Load().(float64) }
@@ -724,19 +724,20 @@ func (s *Service) connectToGPSD() error {
 		s.hdop.Store(report.Hdop)
 		s.vdop.Store(report.Vdop)
 		s.pdop.Store(report.Pdop)
-		if report.Hdop > 0 {
-			s.quality.Store(1.0 / report.Hdop)
-		}
-
 		if len(report.Satellites) > 0 {
 			var used int32
+			var snrSum float64
 			for _, sat := range report.Satellites {
 				if sat.Used {
 					used++
+					snrSum += sat.Ss
 				}
 			}
 			s.satsUsed.Store(used)
 			s.satsVisible.Store(int32(len(report.Satellites)))
+			if used > 0 {
+				s.snr.Store(snrSum / float64(used))
+			}
 		}
 	})
 
@@ -866,7 +867,7 @@ func (s *Service) Close() {
 func (s *Service) GetGPSStatus() map[string]interface{} {
 	return map[string]interface{}{
 		"fix":              s.FixMode(),
-		"quality":          s.Quality(),
+		"snr":              s.SNR(),
 		"hdop":             s.HDOP(),
 		"vdop":             s.VDOP(),
 		"pdop":             s.PDOP(),

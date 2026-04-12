@@ -302,7 +302,7 @@ func TestPublishLocationState(t *testing.T) {
 			name: "GPS status without fix (no publish)",
 			data: map[string]interface{}{
 				"fix":       "no-fix",
-				"quality":   "0.0",
+				"snr":       "0.0",
 				"active":    false,
 				"connected": true,
 			},

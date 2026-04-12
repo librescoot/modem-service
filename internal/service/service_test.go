@@ -457,7 +457,7 @@ func TestGPSStatusMapping(t *testing.T) {
 	status := locService.GetGPSStatus()
 
 	// Verify all expected fields are present
-	expectedFields := []string{"fix", "quality", "hdop", "vdop", "pdop", "eph", "eps", "ept", "satellites-used", "satellites-visible", "active", "connected", "state"}
+	expectedFields := []string{"fix", "snr", "hdop", "vdop", "pdop", "eph", "eps", "ept", "satellites-used", "satellites-visible", "active", "connected", "state"}
 	for _, field := range expectedFields {
 		if _, ok := status[field]; !ok {
 			t.Errorf("Expected GPS status to contain field '%s'", field)
