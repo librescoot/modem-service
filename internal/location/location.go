@@ -728,14 +728,16 @@ func (s *Service) connectToGPSD() error {
 			s.quality.Store(1.0 / report.Hdop)
 		}
 
-		var used int32
-		for _, sat := range report.Satellites {
-			if sat.Used {
-				used++
+		if len(report.Satellites) > 0 {
+			var used int32
+			for _, sat := range report.Satellites {
+				if sat.Used {
+					used++
+				}
 			}
+			s.satsUsed.Store(used)
+			s.satsVisible.Store(int32(len(report.Satellites)))
 		}
-		s.satsUsed.Store(used)
-		s.satsVisible.Store(int32(len(report.Satellites)))
 	})
 
 	s.GpsdConn.AddFilter("TPV", func(r interface{}) {
