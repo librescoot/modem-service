@@ -81,12 +81,16 @@ type Service struct {
 	// Simple scalars use atomics; compound types (Location, time.Time) use stateMutex.
 	hasValidFix   atomic.Bool
 	fixMode       atomic.Value // string: "none", "2d", "3d"
-	quality       atomic.Value // float64
+	quality       atomic.Value // float64: 1/hdop
 	hdop          atomic.Value // float64
 	vdop          atomic.Value // float64
 	pdop          atomic.Value // float64
-	eph           atomic.Value // float64
-	gpsdConnected atomic.Bool
+	eph           atomic.Value // float64: horizontal position error (m)
+	eps           atomic.Value // float64: speed error (m/s)
+	ept           atomic.Value // float64: time precision (s)
+	satsUsed      atomic.Int32
+	satsVisible   atomic.Int32
+	gpsdConnected  atomic.Bool
 	state         atomic.Value // string: "off", "searching", "fix-established", "error"
 
 	// Protected by stateMutex — compound types that can't use atomics
@@ -133,6 +137,8 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 	s.vdop.Store(float64(0))
 	s.pdop.Store(float64(0))
 	s.eph.Store(float64(0))
+	s.eps.Store(float64(0))
+	s.ept.Store(float64(0))
 	return s
 }
 
@@ -145,6 +151,10 @@ func (s *Service) HDOP() float64           { return s.hdop.Load().(float64) }
 func (s *Service) VDOP() float64           { return s.vdop.Load().(float64) }
 func (s *Service) PDOP() float64           { return s.pdop.Load().(float64) }
 func (s *Service) EPH() float64            { return s.eph.Load().(float64) }
+func (s *Service) EPS() float64            { return s.eps.Load().(float64) }
+func (s *Service) EPT() float64            { return s.ept.Load().(float64) }
+func (s *Service) SatsUsed() int32         { return s.satsUsed.Load() }
+func (s *Service) SatsVisible() int32      { return s.satsVisible.Load() }
 func (s *Service) GpsdConnected() bool     { return s.gpsdConnected.Load() }
 func (s *Service) State() string           { return s.state.Load().(string) }
 
@@ -714,6 +724,18 @@ func (s *Service) connectToGPSD() error {
 		s.hdop.Store(report.Hdop)
 		s.vdop.Store(report.Vdop)
 		s.pdop.Store(report.Pdop)
+		if report.Hdop > 0 {
+			s.quality.Store(1.0 / report.Hdop)
+		}
+
+		var used int32
+		for _, sat := range report.Satellites {
+			if sat.Used {
+				used++
+			}
+		}
+		s.satsUsed.Store(used)
+		s.satsVisible.Store(int32(len(report.Satellites)))
 	})
 
 	s.GpsdConn.AddFilter("TPV", func(r interface{}) {
@@ -742,9 +764,10 @@ func (s *Service) connectToGPSD() error {
 			s.state.Store("fix-established")
 		}
 
-		// Update quality metrics from TPV report
-		s.quality.Store(report.Ept)
+		// Update error estimates from TPV report
 		s.eph.Store(report.Eph)
+		s.eps.Store(report.Eps)
+		s.ept.Store(report.Ept)
 
 		if report.Mode == 1 || report.Mode == 0 {
 			s.hasValidFix.Store(false)
@@ -840,15 +863,19 @@ func (s *Service) Close() {
 
 func (s *Service) GetGPSStatus() map[string]interface{} {
 	return map[string]interface{}{
-		"fix":       s.FixMode(),
-		"quality":   s.Quality(),
-		"hdop":      s.HDOP(),
-		"vdop":      s.VDOP(),
-		"pdop":      s.PDOP(),
-		"eph":       s.EPH(),
-		"active":    s.HasValidFix(),
-		"connected": s.GpsdConnected(),
-		"state":     s.State(),
+		"fix":              s.FixMode(),
+		"quality":          s.Quality(),
+		"hdop":             s.HDOP(),
+		"vdop":             s.VDOP(),
+		"pdop":             s.PDOP(),
+		"eph":              s.EPH(),
+		"eps":              s.EPS(),
+		"ept":              s.EPT(),
+		"satellites-used":  s.SatsUsed(),
+		"satellites-visible": s.SatsVisible(),
+		"active":           s.HasValidFix(),
+		"connected":        s.GpsdConnected(),
+		"state":            s.State(),
 	}
 }
 
