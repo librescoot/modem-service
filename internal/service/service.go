@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"os/exec"
 	"sync"
 	"time"
@@ -498,140 +499,145 @@ func (s *Service) attemptGPSRecovery() error {
 // publishModemState publishes the detailed modem and derived internet state to Redis.
 // It now takes the determined internetStatus as an argument.
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State, internetStatus string) error {
-	// Publish the actual internet connectivity status
-	// Compare with LastState.Status which now stores the *last published internet status*
-	// NOTE: LastState.Status here refers to the overall internet connectivity, not the raw modem status.
+	// Track which fields changed for consolidated logging
+	var internetChanges, modemChanges []string
+
+	// Publish internet state fields
 	if s.LastState.Status != internetStatus {
-		s.Logger.Printf("internet status=%s", internetStatus)
 		if err := s.Redis.PublishInternetState("status", internetStatus); err != nil {
 			return err
 		}
-		s.LastState.Status = internetStatus // Store the published internet status
+		internetChanges = append(internetChanges, fmt.Sprintf("status=%s", internetStatus))
+		s.LastState.Status = internetStatus
 	}
 
-	// Publish the raw modem state (1:1 copy of currentState.Status)
 	if s.LastState.LastRawModemStatus != currentState.Status {
-		s.Logger.Printf("internet modem-state=%s", currentState.Status)
 		if err := s.Redis.PublishInternetState("modem-state", currentState.Status); err != nil {
-			// Log error but don't necessarily fail the whole publish operation for this specific field
 			s.Logger.Printf("Failed to publish internet modem-state: %v", err)
 		}
-		s.LastState.LastRawModemStatus = currentState.Status // Store the published raw modem status
+		internetChanges = append(internetChanges, fmt.Sprintf("modem-state=%s", currentState.Status))
+		s.LastState.LastRawModemStatus = currentState.Status
 	}
 
-	// Publish modem's reported IP address (might be present even if ping fails)
 	if s.LastState.IfIPAddr != currentState.IfIPAddr {
-		s.Logger.Printf("internet ip-address=%s", currentState.IfIPAddr)
 		if err := s.Redis.PublishInternetState("ip-address", currentState.IfIPAddr); err != nil {
 			return err
 		}
+		internetChanges = append(internetChanges, fmt.Sprintf("ip=%s", currentState.IfIPAddr))
 		s.LastState.IfIPAddr = currentState.IfIPAddr
 	}
 
 	if s.LastState.AccessTech != currentState.AccessTech {
-		s.Logger.Printf("internet access-tech=%s", currentState.AccessTech)
 		if err := s.Redis.PublishInternetState("access-tech", currentState.AccessTech); err != nil {
 			return err
 		}
+		internetChanges = append(internetChanges, fmt.Sprintf("tech=%s", currentState.AccessTech))
 		s.LastState.AccessTech = currentState.AccessTech
 	}
 
 	if s.LastState.SignalQuality != currentState.SignalQuality {
-		s.Logger.Printf("internet signal-quality=%d", currentState.SignalQuality)
 		if err := s.Redis.PublishInternetState("signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
 			return err
 		}
+		internetChanges = append(internetChanges, fmt.Sprintf("signal=%d", currentState.SignalQuality))
 		s.LastState.SignalQuality = currentState.SignalQuality
 	}
 
-	if s.LastState.PowerState != currentState.PowerState {
-		s.Logger.Printf("modem power-state=%s", currentState.PowerState)
-		if err := s.Redis.PublishModemState("power-state", currentState.PowerState); err != nil {
-			return err
-		}
-		s.LastState.PowerState = currentState.PowerState
-	}
-
-	if s.LastState.SIMState != currentState.SIMState {
-		s.Logger.Printf("modem sim-state=%s", currentState.SIMState)
-		if err := s.Redis.PublishModemState("sim-state", currentState.SIMState); err != nil {
-			return err
-		}
-		s.LastState.SIMState = currentState.SIMState
-	}
-
-	if s.LastState.SIMLockStatus != currentState.SIMLockStatus {
-		s.Logger.Printf("modem sim-lock=%s", currentState.SIMLockStatus)
-		if err := s.Redis.PublishModemState("sim-lock", currentState.SIMLockStatus); err != nil {
-			return err
-		}
-		s.LastState.SIMLockStatus = currentState.SIMLockStatus
-	}
-
-	if s.LastState.OperatorName != currentState.OperatorName {
-		s.Logger.Printf("operator name=%s", currentState.OperatorName)
-		if err := s.Redis.PublishModemState("operator-name", currentState.OperatorName); err != nil {
-			return err
-		}
-		s.LastState.OperatorName = currentState.OperatorName
-	}
-
-	if s.LastState.OperatorCode != currentState.OperatorCode {
-		s.Logger.Printf("operator code=%s", currentState.OperatorCode)
-		if err := s.Redis.PublishModemState("operator-code", currentState.OperatorCode); err != nil {
-			return err
-		}
-		s.LastState.OperatorCode = currentState.OperatorCode
-	}
-
-	if s.LastState.IsRoaming != currentState.IsRoaming {
-		s.Logger.Printf("roaming=%t", currentState.IsRoaming)
-		if err := s.Redis.PublishModemState("is-roaming", fmt.Sprintf("%t", currentState.IsRoaming)); err != nil {
-			return err
-		}
-		s.LastState.IsRoaming = currentState.IsRoaming
-	}
-
-	if s.LastState.RegistrationFail != currentState.RegistrationFail {
-		s.Logger.Printf("registration-fail=%s", currentState.RegistrationFail)
-		if err := s.Redis.PublishModemState("registration-fail", currentState.RegistrationFail); err != nil {
-			return err
-		}
-		s.LastState.RegistrationFail = currentState.RegistrationFail
-	}
-
 	if s.LastState.IMEI != currentState.IMEI {
-		s.Logger.Printf("modem IMEI=%s", currentState.IMEI)
 		if err := s.Redis.PublishInternetState("sim-imei", currentState.IMEI); err != nil {
 			return err
 		}
+		internetChanges = append(internetChanges, fmt.Sprintf("imei=%s", currentState.IMEI))
 		s.LastState.IMEI = currentState.IMEI
 	}
 
 	if s.LastState.IMSI != currentState.IMSI {
-		s.Logger.Printf("SIM IMSI=%s", currentState.IMSI)
 		if err := s.Redis.PublishInternetState("sim-imsi", currentState.IMSI); err != nil {
 			return err
 		}
+		internetChanges = append(internetChanges, fmt.Sprintf("imsi=%s", currentState.IMSI))
 		s.LastState.IMSI = currentState.IMSI
 	}
 
 	if s.LastState.ICCID != currentState.ICCID {
-		s.Logger.Printf("SIM ICCID=%s", currentState.ICCID)
 		if err := s.Redis.PublishInternetState("sim-iccid", currentState.ICCID); err != nil {
 			return err
 		}
+		internetChanges = append(internetChanges, fmt.Sprintf("iccid=%s", currentState.ICCID))
 		s.LastState.ICCID = currentState.ICCID
 	}
 
-	// Publish the consolidated error state
+	// Publish modem state fields
+	if s.LastState.PowerState != currentState.PowerState {
+		if err := s.Redis.PublishModemState("power-state", currentState.PowerState); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("power=%s", currentState.PowerState))
+		s.LastState.PowerState = currentState.PowerState
+	}
+
+	if s.LastState.SIMState != currentState.SIMState {
+		if err := s.Redis.PublishModemState("sim-state", currentState.SIMState); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("sim=%s", currentState.SIMState))
+		s.LastState.SIMState = currentState.SIMState
+	}
+
+	if s.LastState.SIMLockStatus != currentState.SIMLockStatus {
+		if err := s.Redis.PublishModemState("sim-lock", currentState.SIMLockStatus); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("sim-lock=%s", currentState.SIMLockStatus))
+		s.LastState.SIMLockStatus = currentState.SIMLockStatus
+	}
+
+	if s.LastState.OperatorName != currentState.OperatorName {
+		if err := s.Redis.PublishModemState("operator-name", currentState.OperatorName); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("operator=%s", currentState.OperatorName))
+		s.LastState.OperatorName = currentState.OperatorName
+	}
+
+	if s.LastState.OperatorCode != currentState.OperatorCode {
+		if err := s.Redis.PublishModemState("operator-code", currentState.OperatorCode); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("mcc-mnc=%s", currentState.OperatorCode))
+		s.LastState.OperatorCode = currentState.OperatorCode
+	}
+
+	if s.LastState.IsRoaming != currentState.IsRoaming {
+		if err := s.Redis.PublishModemState("is-roaming", fmt.Sprintf("%t", currentState.IsRoaming)); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("roaming=%t", currentState.IsRoaming))
+		s.LastState.IsRoaming = currentState.IsRoaming
+	}
+
+	if s.LastState.RegistrationFail != currentState.RegistrationFail {
+		if err := s.Redis.PublishModemState("registration-fail", currentState.RegistrationFail); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("reg-fail=%s", currentState.RegistrationFail))
+		s.LastState.RegistrationFail = currentState.RegistrationFail
+	}
+
 	if s.LastState.ErrorState != currentState.ErrorState {
-		s.Logger.Printf("modem error-state=%s", currentState.ErrorState)
 		if err := s.Redis.PublishModemState("error-state", currentState.ErrorState); err != nil {
-			// Log error but don't necessarily fail the whole publish operation
 			s.Logger.Printf("Failed to publish modem error-state: %v", err)
 		}
+		modemChanges = append(modemChanges, fmt.Sprintf("error=%s", currentState.ErrorState))
 		s.LastState.ErrorState = currentState.ErrorState
+	}
+
+	// Log consolidated changes
+	if len(internetChanges) > 0 {
+		s.Logger.Printf("internet %s", strings.Join(internetChanges, " "))
+	}
+	if len(modemChanges) > 0 {
+		s.Logger.Printf("modem %s", strings.Join(modemChanges, " "))
 	}
 
 	return nil
