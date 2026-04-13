@@ -6,12 +6,12 @@ import (
 )
 
 type Config struct {
-	RedisURL            string
-	InternetCheckTime   time.Duration
-	Interface           string
-	GpsdServer          string
-	SuplServer          string
-	Debug bool
+	RedisURL          string
+	InternetCheckTime time.Duration
+	Interface         string
+	GpsdServer        string
+	SuplServer        string
+	Debug             bool
 }
 
 func New() *Config {
@@ -26,4 +26,3 @@ func New() *Config {
 
 	return cfg
 }
-

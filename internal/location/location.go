@@ -90,7 +90,7 @@ type Service struct {
 	ept           atomic.Value // float64: time precision (s)
 	satsUsed      atomic.Int32
 	satsVisible   atomic.Int32
-	gpsdConnected  atomic.Bool
+	gpsdConnected atomic.Bool
 	state         atomic.Value // string: "off", "searching", "fix-established", "error"
 
 	// Protected by stateMutex — compound types that can't use atomics
@@ -144,19 +144,19 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 
 // Accessor methods for atomic fields
 
-func (s *Service) HasValidFix() bool      { return s.hasValidFix.Load() }
-func (s *Service) FixMode() string         { return s.fixMode.Load().(string) }
-func (s *Service) SNR() float64            { return s.snr.Load().(float64) }
-func (s *Service) HDOP() float64           { return s.hdop.Load().(float64) }
-func (s *Service) VDOP() float64           { return s.vdop.Load().(float64) }
-func (s *Service) PDOP() float64           { return s.pdop.Load().(float64) }
-func (s *Service) EPH() float64            { return s.eph.Load().(float64) }
-func (s *Service) EPS() float64            { return s.eps.Load().(float64) }
-func (s *Service) EPT() float64            { return s.ept.Load().(float64) }
-func (s *Service) SatsUsed() int32         { return s.satsUsed.Load() }
-func (s *Service) SatsVisible() int32      { return s.satsVisible.Load() }
-func (s *Service) GpsdConnected() bool     { return s.gpsdConnected.Load() }
-func (s *Service) State() string           { return s.state.Load().(string) }
+func (s *Service) HasValidFix() bool   { return s.hasValidFix.Load() }
+func (s *Service) FixMode() string     { return s.fixMode.Load().(string) }
+func (s *Service) SNR() float64        { return s.snr.Load().(float64) }
+func (s *Service) HDOP() float64       { return s.hdop.Load().(float64) }
+func (s *Service) VDOP() float64       { return s.vdop.Load().(float64) }
+func (s *Service) PDOP() float64       { return s.pdop.Load().(float64) }
+func (s *Service) EPH() float64        { return s.eph.Load().(float64) }
+func (s *Service) EPS() float64        { return s.eps.Load().(float64) }
+func (s *Service) EPT() float64        { return s.ept.Load().(float64) }
+func (s *Service) SatsUsed() int32     { return s.satsUsed.Load() }
+func (s *Service) SatsVisible() int32  { return s.satsVisible.Load() }
+func (s *Service) GpsdConnected() bool { return s.gpsdConnected.Load() }
+func (s *Service) State() string       { return s.state.Load().(string) }
 
 func (s *Service) CurrentLoc() Location {
 	s.stateMutex.RLock()
@@ -866,19 +866,19 @@ func (s *Service) Close() {
 
 func (s *Service) GetGPSStatus() map[string]interface{} {
 	return map[string]interface{}{
-		"fix":              s.FixMode(),
-		"snr":              s.SNR(),
-		"hdop":             s.HDOP(),
-		"vdop":             s.VDOP(),
-		"pdop":             s.PDOP(),
-		"eph":              s.EPH(),
-		"eps":              s.EPS(),
-		"ept":              s.EPT(),
-		"satellites-used":  s.SatsUsed(),
+		"fix":                s.FixMode(),
+		"snr":                s.SNR(),
+		"hdop":               s.HDOP(),
+		"vdop":               s.VDOP(),
+		"pdop":               s.PDOP(),
+		"eph":                s.EPH(),
+		"eps":                s.EPS(),
+		"ept":                s.EPT(),
+		"satellites-used":    s.SatsUsed(),
 		"satellites-visible": s.SatsVisible(),
-		"active":           s.HasValidFix(),
-		"connected":        s.GpsdConnected(),
-		"state":            s.State(),
+		"active":             s.HasValidFix(),
+		"connected":          s.GpsdConnected(),
+		"state":              s.State(),
 	}
 }
 

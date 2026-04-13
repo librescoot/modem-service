@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -755,7 +755,6 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		s.Logger.Printf("Failed to publish health state: %v", err)
 		return err
 	}
-
 
 	return nil
 }
