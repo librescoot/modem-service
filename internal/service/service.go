@@ -537,7 +537,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.SignalQuality != currentState.SignalQuality {
-		s.Logger.Printf("internet signal-quality: %d", currentState.SignalQuality)
+		s.Logger.Printf("internet signal-quality=%d", currentState.SignalQuality)
 		if err := s.Redis.PublishInternetState("signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
 			return err
 		}
@@ -934,7 +934,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 
 					// Log GPS diagnostics every 90 seconds
 					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
-						s.Logger.Printf("gps eph=%.1fm hdop=%.1f vdop=%.1f pdop=%.1f snr=%.1fdBHz sats=%d/%d",
+						s.Logger.Printf("GPS eph=%.1fm hdop=%.1f vdop=%.1f pdop=%.1f snr=%.1fdBHz sats=%d/%d",
 							gpsStatus["eph"], gpsStatus["hdop"], gpsStatus["vdop"], gpsStatus["pdop"],
 							gpsStatus["snr"], gpsStatus["satellites-used"], gpsStatus["satellites-visible"])
 						s.LastGPSQualityLog = time.Now()
