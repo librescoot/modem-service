@@ -131,7 +131,7 @@ func (c *Client) StartModemCommandHandler(handler ModemCommandHandler) error {
 func (c *Client) StartVehicleStateWatcher(handler VehicleStateHandler) error {
 	c.vehicleWatch = c.client.NewHashWatcher("vehicle")
 	c.vehicleWatch.OnField("state", func(value string) error {
-		c.logger.Printf("Vehicle state changed: %s", value)
+		c.logger.Printf("vehicle state=%s", value)
 		return handler(value)
 	})
 	c.vehicleWatch.StartWithSync()
