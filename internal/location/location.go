@@ -441,9 +441,9 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	case <-time.After(1 * time.Second):
 	}
 
-	// Disable automatic GPS start and standalone mode
+	// Disable GPS auto-start on boot; auto-fall back to standalone if AGPS is unreachable
 	s.sendATCommand(ctx, "AT+CGPSAUTO=0", false)
-	s.sendATCommand(ctx, "AT+CGPSMSB=0", false)
+	s.sendATCommand(ctx, "AT+CGPSMSB=1", false)
 
 	// Set accuracy threshold (50 meters - higher = faster fix)
 	accuracyMeters := int(s.Config.AccuracyThresh)
