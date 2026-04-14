@@ -146,7 +146,7 @@ type Service struct {
 
 func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, suplServer string) *Service {
 	if suplServer == "" {
-		suplServer = "supl.google.com:7275"
+		suplServer = "supl.google.com:7276"
 	}
 
 	s := &Service{
