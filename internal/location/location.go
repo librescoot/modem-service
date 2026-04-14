@@ -31,6 +31,37 @@ const (
 	gpsWeekRollover = 1024 * 7 * 24 * time.Hour
 )
 
+// GPSMode selects how the receiver acquires satellites.
+// Standalone uses satellite signals only. UEBased additionally pulls assistance
+// data from a SUPL server (faster TTFF when cellular is available); it falls
+// back to standalone automatically when the server is unreachable, so it's
+// safe even during brief network loss — but on persistently offline scooters
+// we switch explicitly to standalone to avoid futile SUPL attempts.
+type GPSMode int
+
+const (
+	ModeStandalone GPSMode = iota
+	ModeUEBased
+)
+
+func (m GPSMode) String() string {
+	switch m {
+	case ModeStandalone:
+		return "standalone"
+	case ModeUEBased:
+		return "ue-based"
+	}
+	return fmt.Sprintf("unknown(%d)", int(m))
+}
+
+// cgpsArg returns the second argument for AT+CGPS=1,<arg>.
+func (m GPSMode) cgpsArg() string {
+	if m == ModeUEBased {
+		return "2"
+	}
+	return "1"
+}
+
 // MinValidGPSDate is the start of the current GPS week-number rollover epoch
 // (2019-04-07). Any GPS timestamp earlier than this is definitively wrong and
 // should be corrected by adding multiples of gpsWeekRollover.
@@ -106,6 +137,7 @@ type Service struct {
 	GPSFreshInit bool      // True if GPS has just been initialized
 
 	configMutex      sync.Mutex    // Protects GPS configuration to prevent concurrent attempts
+	currentMode      GPSMode       // Current GPS mode; protected by configMutex
 	monitoringActive atomic.Bool   // True if monitoring goroutine is already running
 	stopChan         chan struct{} // Signals monitoring goroutine to stop
 
@@ -498,16 +530,102 @@ func (s *Service) configureAntennaPower(ctx context.Context) error {
 	// Update GPS clock after antenna power up
 	s.syncGPSClock(ctx)
 
-	// Check if GPS is enabled, start it if needed
+	// Check if GPS is enabled, start it in standalone mode if needed.
+	// Online scooters will be transitioned to UE-Based by SetGPSMode once the
+	// connectivity classifier stabilizes; starting standalone is the safe
+	// default that works even if we never reach SUPL.
 	response, err := s.sendATCommand(ctx, "AT+CGPS?", false)
-	if err == nil && !strings.Contains(response, "+CGPS: 1,1") && !strings.Contains(response, "+CGPS:1,1") {
+	if err == nil && !gpsRunning(response) {
 		s.sendATCommand(ctx, "AT+CGPS=1,1", false)
-		s.Logger.Printf("GPS started")
+		s.currentMode = ModeStandalone
+		s.Logger.Printf("GPS started in standalone mode")
+	} else if err == nil {
+		// GPS already running — record the mode we observe so a no-op
+		// SetGPSMode(same) doesn't tear it down.
+		s.currentMode = parseCGPSMode(response)
 	}
 
 	// Set GPS notification mode
 	s.sendATCommand(ctx, "AT+CGPSNOTIFY=0", false)
 
+	return nil
+}
+
+// gpsRunning returns true when the AT+CGPS? response indicates GPS is on
+// in any mode (1,1 standalone / 1,2 UE-based / 1,3 UE-assisted).
+func gpsRunning(resp string) bool {
+	return strings.Contains(resp, "+CGPS: 1,") || strings.Contains(resp, "+CGPS:1,")
+}
+
+// parseCGPSMode extracts the current mode from AT+CGPS? output. Defaults to
+// standalone on any parse failure.
+func parseCGPSMode(resp string) GPSMode {
+	if strings.Contains(resp, "+CGPS: 1,2") || strings.Contains(resp, "+CGPS:1,2") {
+		return ModeUEBased
+	}
+	return ModeStandalone
+}
+
+// SetGPSMode reconfigures the GPS for the requested mode. If GPS is already
+// running in that mode, it's a no-op. Otherwise GPS is stopped, mode-specific
+// AT commands are issued, and GPS is restarted.
+//
+// Safe to call from a state-change handler; serialized on the same mutex as
+// initial configuration via configMutex.
+func (s *Service) SetGPSMode(ctx context.Context, mode GPSMode) error {
+	s.configMutex.Lock()
+	defer s.configMutex.Unlock()
+
+	resp, err := s.sendATCommand(ctx, "AT+CGPS?", false)
+	if err == nil && gpsRunning(resp) && parseCGPSMode(resp) == mode {
+		s.currentMode = mode
+		return nil
+	}
+
+	s.Logger.Printf("Switching GPS to %s mode", mode)
+
+	s.sendATCommand(ctx, "AT+CGPS=0", false)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(3 * time.Second):
+		// Per AT manual: must wait 2-30s between CGPS=0 and CGPS=1.
+	}
+
+	if mode == ModeUEBased {
+		s.sendATCommand(ctx, fmt.Sprintf(`AT+CGPSURL="%s"`, s.Config.SuplServer), false)
+		s.sendATCommand(ctx, "AT+CGPSSSL=0", false)
+		// CGPSMSB=1: fall back to standalone automatically if SUPL becomes
+		// unreachable mid-session. Essential for a scooter that drops signal
+		// in tunnels and garages.
+		s.sendATCommand(ctx, "AT+CGPSMSB=1", false)
+	}
+
+	// On SIM7100E, AT+CGPS=1,X sometimes reports "Unknown error" even when
+	// the mode was actually applied. Re-query to confirm rather than
+	// trusting the start command's return value.
+	startCmd := fmt.Sprintf("AT+CGPS=1,%s", mode.cgpsArg())
+	startErr := (error)(nil)
+	if _, err := s.sendATCommand(ctx, startCmd, false); err != nil {
+		startErr = err
+	}
+
+	verifyResp, verifyErr := s.sendATCommand(ctx, "AT+CGPS?", false)
+	if verifyErr != nil {
+		if startErr != nil {
+			return fmt.Errorf("start %s mode: %v; verify failed: %v", mode, startErr, verifyErr)
+		}
+		return fmt.Errorf("verify %s mode: %v", mode, verifyErr)
+	}
+	if !gpsRunning(verifyResp) || parseCGPSMode(verifyResp) != mode {
+		return fmt.Errorf("start %s mode failed (CGPS? = %q); start error: %v",
+			mode, strings.TrimSpace(verifyResp), startErr)
+	}
+	if startErr != nil {
+		s.Logger.Printf("GPS start command reported %v but CGPS? confirms %s mode", startErr, mode)
+	}
+	s.currentMode = mode
+	s.Logger.Printf("GPS running in %s mode", mode)
 	return nil
 }
 

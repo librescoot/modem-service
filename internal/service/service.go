@@ -503,6 +503,27 @@ func (s *Service) attemptGPSRecovery() error {
 	return nil
 }
 
+// requestGPSModeForConnectivity kicks off a GPS mode change to match the new
+// connectivity state. Runs asynchronously because the AT stop/start dance
+// takes several seconds; we don't want to stall the modem state loop. The
+// location service serializes mode changes internally via configMutex.
+func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connectivity.State) {
+	var mode location.GPSMode
+	switch conn {
+	case connectivity.Online:
+		mode = location.ModeUEBased
+	default:
+		// offline, no-sim, unknown → standalone, the self-sufficient mode
+		mode = location.ModeStandalone
+	}
+
+	go func() {
+		if err := s.Location.SetGPSMode(ctx, mode); err != nil {
+			s.Logger.Printf("Failed to switch GPS to %s mode: %v", mode, err)
+		}
+	}()
+}
+
 // publishModemState publishes the detailed modem and derived internet state to Redis.
 // It now takes the determined internetStatus as an argument.
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State, internetStatus string) error {
@@ -654,6 +675,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("connectivity=%s", conn))
 		s.lastPubConn = conn
+		s.requestGPSModeForConnectivity(ctx, conn)
 	}
 
 	// Log consolidated changes
