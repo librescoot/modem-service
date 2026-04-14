@@ -538,6 +538,8 @@ func (s *Service) configureAntennaPower(ctx context.Context) error {
 	// connectivity classifier stabilizes; starting standalone is the safe
 	// default that works even if we never reach SUPL.
 	response, err := s.sendATCommand(ctx, "AT+CGPS?", false)
+	s.Logger.Printf("configureAntennaPower: CGPS?=%q prevMode=%s",
+		strings.TrimSpace(response), s.currentMode)
 	if err == nil && !gpsRunning(response) {
 		s.sendATCommand(ctx, "AT+CGPS=1,1", false)
 		s.currentMode = ModeStandalone
@@ -664,6 +666,11 @@ func (s *Service) SetGPSMode(ctx context.Context, mode GPSMode) error {
 		s.Logger.Printf("GPS start command reported %v but CGPS? confirms %s mode", startErr, mode)
 	}
 	s.currentMode = mode
+	// Reset the GPS-timestamp staleness clock. Our CGPS=0 / sleep 3s /
+	// CGPS=1,X dance briefly silences gpsd; without this reset, a pre-
+	// existing aging timestamp could trip checkGPSHealth's 180s stuck
+	// window mid-session and cause a self-inflicted recovery.
+	s.SetLastGPSTimestampUpdate(time.Now())
 	s.Logger.Printf("GPS running in %s mode", mode)
 	return nil
 }

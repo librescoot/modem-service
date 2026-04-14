@@ -423,7 +423,7 @@ func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
 	s.Logger.Printf("Attempting GPS-specific recovery for: %v", gpsErr)
 
 	// Try to restart GPS configuration without restarting the entire modem
-	if err := s.attemptGPSRecovery(); err != nil {
+	if err := s.attemptGPSRecovery(gpsErr); err != nil {
 		s.Logger.Printf("GPS-specific recovery failed: %v", err)
 		// Only escalate to modem recovery for severe GPS issues after GPS recovery fails
 		if recoveryErr := s.handleModemFailure(ctx, fmt.Sprintf("gps_stuck_after_gps_recovery: %v", gpsErr)); recoveryErr != nil {
@@ -434,8 +434,11 @@ func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
 	return nil
 }
 
-// attemptGPSRecovery tries to recover GPS without restarting the modem
-func (s *Service) attemptGPSRecovery() error {
+// attemptGPSRecovery tries to recover GPS without restarting the modem.
+// trigger is the underlying failure that caused recovery to be requested
+// (e.g. gps_data_stale, gps_timestamp_stuck, gps_fix_timeout). Logged so
+// we can correlate unexpected GPS restarts with the triggering check.
+func (s *Service) attemptGPSRecovery(trigger error) error {
 	// Acquire lock to prevent concurrent GPS recovery attempts
 	s.gpsRecoveryMutex.Lock()
 	defer s.gpsRecoveryMutex.Unlock()
@@ -453,7 +456,7 @@ func (s *Service) attemptGPSRecovery() error {
 	}()
 
 	s.GPSRecoveryCount++
-	s.Logger.Printf("Attempting GPS recovery (attempt %d)...", s.GPSRecoveryCount)
+	s.Logger.Printf("Attempting GPS recovery (attempt %d, trigger=%v)", s.GPSRecoveryCount, trigger)
 
 	// If we've tried GPS recovery too many times, do a full reset and wait longer
 	if s.GPSRecoveryCount > 3 {
