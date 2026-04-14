@@ -274,6 +274,9 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 							s.stateMutex.RUnlock()
 							if lastData.After(time.Now().Add(-5 * time.Second)) {
 								s.Logger.Printf("GPS already running, reusing existing connection")
+								// Probe so currentMode reflects the actual
+								// modem state instead of a zero-value default.
+								s.ProbeGPSMode(context.Background())
 								s.GPSFreshInit = false
 								attempt = 0
 								continue
@@ -581,6 +584,27 @@ func (s *Service) CurrentGPSMode() GPSMode {
 	return s.currentMode
 }
 
+// ProbeGPSMode queries the modem with AT+CGPS? and records whatever mode
+// it's currently running. Used at service startup when GPS is already running
+// from a previous service instance, so we don't default to a wrong mode.
+// Safe to call even if ModemPath isn't set (returns silently).
+func (s *Service) ProbeGPSMode(ctx context.Context) {
+	if s.ModemPath == "" {
+		return
+	}
+	s.configMutex.Lock()
+	defer s.configMutex.Unlock()
+	resp, err := s.sendATCommand(ctx, "AT+CGPS?", false)
+	if err != nil || !gpsRunning(resp) {
+		return
+	}
+	mode := parseCGPSMode(resp)
+	if mode != s.currentMode {
+		s.Logger.Printf("GPS mode probe: %s (from modem state)", mode)
+		s.currentMode = mode
+	}
+}
+
 func (s *Service) SetGPSMode(ctx context.Context, mode GPSMode) error {
 	s.configMutex.Lock()
 	defer s.configMutex.Unlock()
@@ -608,6 +632,12 @@ func (s *Service) SetGPSMode(ctx context.Context, mode GPSMode) error {
 		// unreachable mid-session. Essential for a scooter that drops signal
 		// in tunnels and garages.
 		s.sendATCommand(ctx, "AT+CGPSMSB=1", false)
+	} else {
+		// Switching to standalone: the modem rejects AT+CGPS=1,1 (bare
+		// ERROR, mode marker stays at 2) if UE-Based session state is
+		// still resident. Clear CGPSURL and CGPSMSB first to release it.
+		s.sendATCommand(ctx, `AT+CGPSURL=""`, false)
+		s.sendATCommand(ctx, "AT+CGPSMSB=0", false)
 	}
 
 	// On SIM7100E, AT+CGPS=1,X sometimes reports "Unknown error" even when
