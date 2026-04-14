@@ -65,6 +65,13 @@ type Service struct {
 	// raw modem state with hysteresis to avoid thrashing on coverage flickers.
 	connClassifier *connectivity.Classifier
 	lastPubConn    connectivity.State // last value published to Redis
+
+	// TTFF measurement. ttffStart is the moment we went from "no fix" to
+	// "actively searching" — either because GPS was enabled or the fix
+	// was lost. ttffMode is the GPS mode active when searching began.
+	ttffStart time.Time
+	ttffMode  location.GPSMode
+	lastPubGPSMode location.GPSMode // last value of gps.mode published to Redis
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -508,20 +515,41 @@ func (s *Service) attemptGPSRecovery() error {
 // takes several seconds; we don't want to stall the modem state loop. The
 // location service serializes mode changes internally via configMutex.
 func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connectivity.State) {
-	var mode location.GPSMode
+	var desired location.GPSMode
 	switch conn {
 	case connectivity.Online:
-		mode = location.ModeUEBased
+		desired = location.ModeUEBased
 	default:
 		// offline, no-sim, unknown → standalone, the self-sufficient mode
-		mode = location.ModeStandalone
+		desired = location.ModeStandalone
 	}
 
+	prev := s.Location.CurrentGPSMode()
+	s.Logger.Printf("gps-transition request from=%s to=%s connectivity=%s", prev, desired, conn)
+
 	go func() {
-		if err := s.Location.SetGPSMode(ctx, mode); err != nil {
-			s.Logger.Printf("Failed to switch GPS to %s mode: %v", mode, err)
+		if err := s.Location.SetGPSMode(ctx, desired); err != nil {
+			s.Logger.Printf("Failed to switch GPS to %s mode: %v", desired, err)
+			return
 		}
+		s.publishGPSMode()
 	}()
+}
+
+// publishGPSMode updates the gps.mode Redis field if the current mode has
+// changed since the last publish.
+func (s *Service) publishGPSMode() {
+	mode := s.Location.CurrentGPSMode()
+	if mode == s.lastPubGPSMode {
+		return
+	}
+	if err := s.Redis.PublishLocationState(map[string]interface{}{
+		"mode": mode.String(),
+	}, false); err != nil {
+		s.Logger.Printf("Failed to publish gps mode: %v", err)
+		return
+	}
+	s.lastPubGPSMode = mode
 }
 
 // publishModemState publishes the detailed modem and derived internet state to Redis.
@@ -983,6 +1011,22 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.GPSRecoveryCount = 0
 					}
 
+					// TTFF: if a search was in progress, stop the clock
+					// and publish.
+					if !s.ttffStart.IsZero() {
+						ttff := time.Since(s.ttffStart)
+						s.ttffStart = time.Time{}
+						snr, _ := gpsStatus["snr"].(float64)
+						satsUsed, _ := gpsStatus["satellites-used"].(int32)
+						satsVisible, _ := gpsStatus["satellites-visible"].(int32)
+						s.Logger.Printf("gps ttff=%.1fs mode=%s snr=%.1fdBHz sats=%d/%d",
+							ttff.Seconds(), s.ttffMode, snr, satsUsed, satsVisible)
+						s.Redis.PublishLocationState(map[string]interface{}{
+							"last_ttff_seconds": fmt.Sprintf("%.1f", ttff.Seconds()),
+							"last_ttff_mode":    s.ttffMode.String(),
+						}, false)
+					}
+
 					// Log GPS diagnostics every 90 seconds
 					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
 						s.Logger.Printf("gps eph=%.1fm hdop=%.1f vdop=%.1f pdop=%.1f snr=%.1fdBHz sats=%d/%d",
@@ -1009,6 +1053,11 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					if !s.WaitingForGPSLogged {
 						s.Logger.Printf("Waiting for valid GPS fix...")
 						s.WaitingForGPSLogged = true
+						// Start (or re-start) the TTFF clock. Capture the
+						// mode active at search start so TTFF is attributed
+						// correctly even if the mode changes mid-search.
+						s.ttffStart = time.Now()
+						s.ttffMode = s.Location.CurrentGPSMode()
 					}
 
 					// Publish just the status without location data (never publish recovery when no fix)

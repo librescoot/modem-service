@@ -572,6 +572,15 @@ func parseCGPSMode(resp string) GPSMode {
 //
 // Safe to call from a state-change handler; serialized on the same mutex as
 // initial configuration via configMutex.
+// CurrentGPSMode returns the last-known GPS mode without issuing AT commands.
+// This reflects what SetGPSMode set or what configureAntennaPower observed at
+// startup; it may lag reality briefly during a mode transition.
+func (s *Service) CurrentGPSMode() GPSMode {
+	s.configMutex.Lock()
+	defer s.configMutex.Unlock()
+	return s.currentMode
+}
+
 func (s *Service) SetGPSMode(ctx context.Context, mode GPSMode) error {
 	s.configMutex.Lock()
 	defer s.configMutex.Unlock()
