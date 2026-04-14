@@ -373,11 +373,6 @@ func (s *Service) doGPSConfiguration(ctx context.Context) error {
 		s.Logger.Printf("Warning: Failed to disable conflicting sources: %v", err)
 	}
 
-	// Configure SUPL server
-	if err := s.configureSuplServer(ctx, status); err != nil {
-		return fmt.Errorf("failed to configure SUPL server: %v", err)
-	}
-
 	// Enable required location sources
 	if err := s.enableLocationSources(ctx, enabledSources); err != nil {
 		return fmt.Errorf("failed to enable location sources: %v", err)
@@ -441,9 +436,8 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	case <-time.After(1 * time.Second):
 	}
 
-	// Disable GPS auto-start on boot; auto-fall back to standalone if AGPS is unreachable
+	// Disable GPS auto-start on boot; mode is set explicitly on each start.
 	s.sendATCommand(ctx, "AT+CGPSAUTO=0", false)
-	s.sendATCommand(ctx, "AT+CGPSMSB=1", false)
 
 	// Set accuracy threshold (50 meters - higher = faster fix)
 	accuracyMeters := int(s.Config.AccuracyThresh)
@@ -462,16 +456,14 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	s.sendATCommand(ctx, `AT+CGDCONT=1,"IP","internet"`, false)
 	s.sendATCommand(ctx, `AT+CGSOCKCONT=1,"IP","internet"`, false)
 
-	// Enable GPS XTRA assisted GPS (faster fix)
+	// Enable GPS XTRA assisted GPS (faster fix). XDAUTO triggers auto-download
+	// on GPS start; any XD=0 one-shot would be redundant.
 	s.sendATCommand(ctx, "AT+CGPSXE=1", false)
-	s.sendATCommand(ctx, "AT+CGPSSSL=0", false)
-	s.sendATCommand(ctx, "AT+CGPSXD=0", false)
 	s.sendATCommand(ctx, "AT+CGPSXDAUTO=1", false)
 	s.Logger.Printf("GPS XTRA assisted GPS enabled")
 
-	// Configure NMEA and positioning mode
+	// Configure NMEA sentence set.
 	s.sendATCommand(ctx, "AT+CGPSNMEA=511", false)
-	s.sendATCommand(ctx, "AT+CGPSPMD=7", false)
 	return nil
 }
 
@@ -542,7 +534,6 @@ func (s *Service) setGPSRefreshRate(ctx context.Context) error {
 // LocationStatus holds the location configuration status
 type LocationStatus struct {
 	EnabledSources uint32
-	SuplServer     string
 }
 
 func (s *Service) getLocationStatusWithTimeout(ctx context.Context) (*LocationStatus, error) {
@@ -560,11 +551,8 @@ func (s *Service) getLocationStatusWithTimeout(ctx context.Context) (*LocationSt
 			return
 		}
 
-		supl, _ := s.MMClient.GetSuplServer(s.ModemPath)
-
 		done <- result{&LocationStatus{
 			EnabledSources: enabled,
-			SuplServer:     supl,
 		}, nil}
 	}()
 
@@ -592,52 +580,17 @@ func (s *Service) disableConflictingSources(ctx context.Context, enabledSources 
 	return nil
 }
 
-func (s *Service) configureSuplServer(ctx context.Context, status *LocationStatus) error {
-	currentSuplServer := ""
-	if status != nil {
-		currentSuplServer = status.SuplServer
-		s.Logger.Printf("Current SUPL server: %s", currentSuplServer)
-	}
-
-	if currentSuplServer != s.Config.SuplServer {
-		s.Logger.Printf("Setting SUPL server to %s", s.Config.SuplServer)
-
-		// Disable all sources before setting SUPL server (required by ModemManager)
-		if err := s.MMClient.SetupLocation(s.ModemPath, 0, false); err != nil {
-			s.Logger.Printf("Warning: Failed to disable all sources: %v", err)
-		}
-
-		// Small delay before setting SUPL server
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-
-		// Set SUPL server via D-Bus
-		if err := s.MMClient.SetSuplServer(s.ModemPath, s.Config.SuplServer); err != nil {
-			return fmt.Errorf("failed to set SUPL server: %v", err)
-		}
-	} else {
-		s.Logger.Printf("SUPL server already set correctly")
-	}
-
-	return nil
-}
-
 func (s *Service) enableLocationSources(ctx context.Context, currentSources uint32) error {
-	// Required sources: 3gpp-lac-ci, agps-msb, gps-unmanaged
+	// Required sources: 3gpp-lac-ci (cell-tower fallback), gps-unmanaged (we drive GPS via AT).
+	// agps-msb is not included — the SimTech MM plugin does not act on it, and
+	// we configure SUPL ourselves via AT commands when online.
 	requiredSources := mm.MMModemLocationSource3gppLacCi |
-		mm.MMModemLocationSourceAgpsMsb |
 		mm.MMModemLocationSourceGpsUnmanaged
 
 	// Check which sources need to be enabled
 	missingSourcesDisplay := []string{}
 	if currentSources&mm.MMModemLocationSource3gppLacCi == 0 {
 		missingSourcesDisplay = append(missingSourcesDisplay, "3gpp-lac-ci")
-	}
-	if currentSources&mm.MMModemLocationSourceAgpsMsb == 0 {
-		missingSourcesDisplay = append(missingSourcesDisplay, "agps-msb")
 	}
 	if currentSources&mm.MMModemLocationSourceGpsUnmanaged == 0 {
 		missingSourcesDisplay = append(missingSourcesDisplay, "gps-unmanaged")

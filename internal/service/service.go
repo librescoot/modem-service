@@ -15,6 +15,7 @@ import (
 	"modem-service/internal/location"
 	"modem-service/internal/mm"
 	"modem-service/internal/modem"
+	"modem-service/internal/modem/connectivity"
 	redisClient "modem-service/internal/redis"
 )
 
@@ -59,6 +60,11 @@ type Service struct {
 	// Modem enable/disable state
 	modemEnabled      bool       // Target state: should modem be on?
 	modemEnabledMutex sync.Mutex // Protects modemEnabled
+
+	// Connectivity classifier derives online/searching/offline/no-sim from
+	// raw modem state with hysteresis to avoid thrashing on coverage flickers.
+	connClassifier *connectivity.Classifier
+	lastPubConn    connectivity.State // last value published to Redis
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -92,6 +98,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		WaitingForGPSLogged: false,
 		gpsEnabled:          true,  // default: GPS on
 		cellLocationEnabled: false, // default: cell location off
+		connClassifier:      connectivity.New(),
 	}
 
 	cell.SetVersion(version)
@@ -616,6 +623,14 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		s.LastState.IsRoaming = currentState.IsRoaming
 	}
 
+	if s.LastState.Registration != currentState.Registration {
+		if err := s.Redis.PublishModemState("registration", currentState.Registration); err != nil {
+			s.Logger.Printf("Failed to publish modem registration: %v", err)
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("reg=%s", currentState.Registration))
+		s.LastState.Registration = currentState.Registration
+	}
+
 	if s.LastState.RegistrationFail != currentState.RegistrationFail {
 		if err := s.Redis.PublishModemState("registration-fail", currentState.RegistrationFail); err != nil {
 			return err
@@ -630,6 +645,15 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("error=%s", currentState.ErrorState))
 		s.LastState.ErrorState = currentState.ErrorState
+	}
+
+	conn := s.connClassifier.Classify(currentState.Status, currentState.SIMState)
+	if conn != s.lastPubConn {
+		if err := s.Redis.PublishModemState("connectivity", string(conn)); err != nil {
+			s.Logger.Printf("Failed to publish modem connectivity: %v", err)
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("connectivity=%s", conn))
+		s.lastPubConn = conn
 	}
 
 	// Log consolidated changes
