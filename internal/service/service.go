@@ -520,13 +520,22 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 // connectivity state. Runs asynchronously because the AT stop/start dance
 // takes several seconds; we don't want to stall the modem state loop. The
 // location service serializes mode changes internally via configMutex.
+//
+// UE-Based mode is disabled for now. In the field (2026-04-15) we observed a
+// fleet scooter on Telefónica DE hang for 180 s in UE-Based after a switch,
+// with no NMEA timestamp updates, until the stuck-timestamp recovery path
+// fired. The stall overlapped with the user unlocking and starting to ride.
+// Until we can verify UE-Based is reliable across carriers and firmware (and
+// given XTRA is dead on SIM7100E anyway), stay in standalone always. The
+// classifier + plumbing are kept so flipping this back on is one constant.
+const enableUEBasedMode = false
+
 func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connectivity.State) {
 	var desired location.GPSMode
-	switch conn {
-	case connectivity.Online:
+	switch {
+	case enableUEBasedMode && conn == connectivity.Online:
 		desired = location.ModeUEBased
 	default:
-		// offline, no-sim, unknown → standalone, the self-sufficient mode
 		desired = location.ModeStandalone
 	}
 
