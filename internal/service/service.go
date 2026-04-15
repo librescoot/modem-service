@@ -67,10 +67,10 @@ type Service struct {
 	lastPubConn    connectivity.State // last value published to Redis
 
 	// TTFF measurement. ttffStart is the moment we went from "no fix" to
-	// "actively searching" — either because GPS was enabled or the fix
-	// was lost. ttffMode is the GPS mode active when searching began.
+	// "actively searching". Mode is read at fix time rather than wait-start,
+	// because startup paths sometimes don't know the real modem mode until
+	// ProbeGPSMode has run — capturing at wait-start gave misleading labels.
 	ttffStart time.Time
-	ttffMode  location.GPSMode
 	lastPubGPSMode location.GPSMode // last value of gps.mode published to Redis
 }
 
@@ -348,6 +348,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 				s.Logger.Printf("Modem recovery successful via D-Bus reset")
 				s.Health.MarkNormal()
 				s.GPSRecoveryCount = 0
+				s.resetGPSStalenessAfterModemRecovery()
 				s.publishHealthState(ctx)
 				return nil
 			}
@@ -368,6 +369,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 				s.Logger.Printf("Modem recovery successful via USB recovery")
 				s.Health.MarkNormal()
 				s.GPSRecoveryCount = 0
+				s.resetGPSStalenessAfterModemRecovery()
 				s.publishHealthState(ctx)
 				return nil
 			}
@@ -388,6 +390,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 				s.Logger.Printf("Modem recovery successful via GPIO restart")
 				s.Health.MarkNormal()
 				s.GPSRecoveryCount = 0
+				s.resetGPSStalenessAfterModemRecovery()
 				s.publishHealthState(ctx)
 				return nil
 			}
@@ -890,6 +893,18 @@ func (s *Service) queryCellLocation(ctx context.Context, state *modem.State) {
 	}
 }
 
+// resetGPSStalenessAfterModemRecovery pushes the GPS staleness clocks
+// forward to "now" so checkGPSHealth doesn't immediately fire a cascading
+// GPS recovery just because the modem reset briefly silenced gpsd. Without
+// this, a D-Bus modem reset (typically ~60s of no GPS data) reliably trips
+// gps_data_stale's 30s threshold and triggers an unnecessary GPS recovery.
+func (s *Service) resetGPSStalenessAfterModemRecovery() {
+	now := time.Now()
+	s.LastGPSDataTime = now
+	s.Location.SetLastGPSTimestampUpdate(now)
+	// GPSEnabledTime's 300s threshold is loose enough not to need a reset.
+}
+
 func (s *Service) checkGPSHealth() error {
 	now := time.Now()
 
@@ -1015,18 +1030,22 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					}
 
 					// TTFF: if a search was in progress, stop the clock
-					// and publish.
+					// and publish. Mode is read here (at fix time) rather
+					// than at wait-start because ProbeGPSMode may correct
+					// our in-memory currentMode in the window between
+					// wait-start and fix-established.
 					if !s.ttffStart.IsZero() {
 						ttff := time.Since(s.ttffStart)
 						s.ttffStart = time.Time{}
+						mode := s.Location.CurrentGPSMode()
 						snr, _ := gpsStatus["snr"].(float64)
 						satsUsed, _ := gpsStatus["satellites-used"].(int32)
 						satsVisible, _ := gpsStatus["satellites-visible"].(int32)
 						s.Logger.Printf("gps ttff=%.1fs mode=%s snr=%.1fdBHz sats=%d/%d",
-							ttff.Seconds(), s.ttffMode, snr, satsUsed, satsVisible)
+							ttff.Seconds(), mode, snr, satsUsed, satsVisible)
 						s.Redis.PublishLocationState(map[string]interface{}{
 							"last_ttff_seconds": fmt.Sprintf("%.1f", ttff.Seconds()),
-							"last_ttff_mode":    s.ttffMode.String(),
+							"last_ttff_mode":    mode.String(),
 						}, false)
 					}
 
@@ -1056,11 +1075,9 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					if !s.WaitingForGPSLogged {
 						s.Logger.Printf("Waiting for valid GPS fix...")
 						s.WaitingForGPSLogged = true
-						// Start (or re-start) the TTFF clock. Capture the
-						// mode active at search start so TTFF is attributed
-						// correctly even if the mode changes mid-search.
+						// Start (or re-start) the TTFF clock. Mode will be
+						// read at fix-establish time rather than here.
 						s.ttffStart = time.Now()
-						s.ttffMode = s.Location.CurrentGPSMode()
 					}
 
 					// Publish just the status without location data (never publish recovery when no fix)
