@@ -39,7 +39,10 @@ func ParseModemManagerLocation(locationData map[uint32]dbus.Variant, radioType s
 		return nil, fmt.Errorf("parse mnc %q: %w", parts[1], err)
 	}
 
-	lac, _ := strconv.ParseInt(parts[2], 16, 64)
+	lac, err := strconv.ParseInt(parts[2], 16, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse lac %q: %w", parts[2], err)
+	}
 	cid, err := strconv.ParseInt(parts[3], 16, 64)
 	if err != nil {
 		return nil, fmt.Errorf("parse cid %q: %w", parts[3], err)
