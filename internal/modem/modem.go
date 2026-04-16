@@ -479,31 +479,37 @@ func (m *Manager) IsModemPresent() bool {
 	return err == nil
 }
 
-// WaitForModem waits for the modem to come up
+// WaitForModem waits for the modem to come up. The USB network interface
+// (e.g. wwu1i5) appears before ModemManager finishes probing the device
+// on D-Bus, so we wait for both: interface present AND D-Bus registration.
 func (m *Manager) WaitForModem(ctx context.Context, interfaceName string) error {
 	m.logger.Printf("Waiting for modem to come up...")
 
 	ticker := time.NewTicker(CheckInterval)
 	defer ticker.Stop()
 
+	interfaceUp := false
 	count := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if IsInterfacePresent(interfaceName) {
-				m.logger.Printf("Modem interface %s is now present", interfaceName)
-				return nil
+			if !interfaceUp && IsInterfacePresent(interfaceName) {
+				m.logger.Printf("Modem interface %s is now present, waiting for ModemManager...", interfaceName)
+				interfaceUp = true
 			}
 
 			if m.IsModemPresent() {
-				m.logger.Printf("Modem is now present via D-Bus")
+				m.logger.Printf("Modem registered on D-Bus")
 				return nil
 			}
 
 			count++
 			if count >= MaxStartChecks {
+				if interfaceUp {
+					return fmt.Errorf("modem interface present but ModemManager did not register it after %d checks", MaxStartChecks)
+				}
 				return fmt.Errorf("modem did not come up after %d checks", MaxStartChecks)
 			}
 		}

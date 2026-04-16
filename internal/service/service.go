@@ -219,14 +219,19 @@ func (s *Service) disableModem() {
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
-	if modem.IsInterfacePresent(s.Config.Interface) {
-		s.Logger.Printf("Modem interface %s is already present", s.Config.Interface)
-		return nil
-	}
-
 	if s.Modem.IsModemPresent() {
 		s.Logger.Printf("Modem is already present via D-Bus")
 		return nil
+	}
+
+	if modem.IsInterfacePresent(s.Config.Interface) {
+		s.Logger.Printf("Modem interface %s is present, waiting for ModemManager...", s.Config.Interface)
+		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := s.Modem.WaitForModem(waitCtx, s.Config.Interface); err == nil {
+			return nil
+		}
+		s.Logger.Printf("ModemManager did not register modem, proceeding to GPIO recovery")
 	}
 
 	s.Logger.Printf("Modem not detected, will attempt to enable via GPIO")
