@@ -62,9 +62,11 @@ func (c *Client) Ping() error {
 	return c.client.Ping()
 }
 
-// PublishInternetState publishes internet state to Redis using SetIfChanged
+// PublishInternetState publishes an internet-state field to Redis. Callers
+// (service.Service) perform their own change detection against the in-memory
+// LastState, so this only writes and notifies — no GET round-trip.
 func (c *Client) PublishInternetState(field, value string) error {
-	_, err := c.client.Hash("internet").SetIfChanged(field, value)
+	err := c.client.Hash("internet").Set(field, value)
 	if err != nil {
 		c.logger.Printf("Unable to set %s in redis: %v", field, err)
 		return fmt.Errorf("cannot write to redis: %v", err)
@@ -72,9 +74,10 @@ func (c *Client) PublishInternetState(field, value string) error {
 	return nil
 }
 
-// PublishModemState publishes modem state to Redis under modem hash using SetIfChanged
+// PublishModemState publishes a modem-state field to Redis. Callers perform
+// change detection against LastState; this is a plain Set + notify.
 func (c *Client) PublishModemState(field, value string) error {
-	_, err := c.client.Hash("modem").SetIfChanged(field, value)
+	err := c.client.Hash("modem").Set(field, value)
 	if err != nil {
 		c.logger.Printf("Unable to set modem.%s in redis: %v", field, err)
 		return fmt.Errorf("cannot write to redis: %v", err)
