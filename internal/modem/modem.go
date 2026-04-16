@@ -75,11 +75,10 @@ type State struct {
 
 // Manager manages modem operations via D-Bus
 type Manager struct {
-	client    *mm.Client
-	gpio      *gpio.PowerController
-	usb       *usb.Recovery
-	logger    *log.Logger
-	modemPath dbus.ObjectPath
+	client *mm.Client
+	gpio   *gpio.PowerController
+	usb    *usb.Recovery
+	logger *log.Logger
 }
 
 // NewManager creates a new modem manager
@@ -136,21 +135,10 @@ func NewState() *State {
 	}
 }
 
-// FindModem finds the modem via D-Bus, using cached path if available
+// FindModem finds the modem via D-Bus. Always does a fresh lookup since
+// the modem path changes across resets (e.g. /Modem/3 → /Modem/4).
 func (m *Manager) FindModem() (dbus.ObjectPath, error) {
-	if m.modemPath != "" {
-		return m.modemPath, nil
-	}
-	path, err := m.client.FindModem()
-	if err == nil {
-		m.modemPath = path
-	}
-	return path, err
-}
-
-// InvalidateModemPath clears the cached modem path, forcing a fresh lookup
-func (m *Manager) InvalidateModemPath() {
-	m.modemPath = ""
+	return m.client.FindModem()
 }
 
 // GetModemInfo gets comprehensive modem information
@@ -166,11 +154,8 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		return state, err
 	}
 
-	// Get power state - if this fails with cached path, invalidate cache
 	powerVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "PowerState")
 	if err != nil {
-		// Modem path may be stale, invalidate cache for next lookup
-		m.InvalidateModemPath()
 		state.Status = "no-modem"
 		state.ErrorState = "modem-disappeared"
 		return state, fmt.Errorf("modem at %s not responding: %v", modemPath, err)
@@ -348,13 +333,12 @@ func GetInterfaceIP(interfaceName string) (string, error) {
 
 // CheckPrimaryPort checks if the primary port is correct
 func (m *Manager) CheckPrimaryPort() error {
-	if m.modemPath == "" {
-		if _, err := m.FindModem(); err != nil {
-			return err
-		}
+	modemPath, err := m.FindModem()
+	if err != nil {
+		return err
 	}
 
-	portVar, err := m.client.GetProperty(m.modemPath, mm.ModemInterface, "PrimaryPort")
+	portVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "PrimaryPort")
 	if err != nil {
 		return err
 	}
@@ -370,13 +354,12 @@ func (m *Manager) CheckPrimaryPort() error {
 
 // CheckPowerState checks if the power state is correct
 func (m *Manager) CheckPowerState() error {
-	if m.modemPath == "" {
-		if _, err := m.FindModem(); err != nil {
-			return err
-		}
+	modemPath, err := m.FindModem()
+	if err != nil {
+		return err
 	}
 
-	powerVar, err := m.client.GetProperty(m.modemPath, mm.ModemInterface, "PowerState")
+	powerVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "PowerState")
 	if err != nil {
 		return err
 	}
@@ -415,7 +398,6 @@ func (m *Manager) PowerOffModem() error {
 	}
 	defer m.gpio.Close()
 
-	m.InvalidateModemPath()
 	return m.gpio.PowerOff()
 }
 
@@ -430,17 +412,15 @@ func (m *Manager) RestartModem() error {
 	}
 	defer m.gpio.Close()
 
-	// Invalidate cached path since modem will get new D-Bus path after restart
-	m.InvalidateModemPath()
-
 	// Full power cycle
 	if err := m.gpio.Cycle(); err != nil {
 		// Fallback to D-Bus reset
 		m.logger.Printf("GPIO power cycle failed, attempting D-Bus reset...")
-		if _, err := m.FindModem(); err != nil {
+		modemPath, err := m.FindModem()
+		if err != nil {
 			return fmt.Errorf("GPIO failed and cannot find modem: %v", err)
 		}
-		return m.client.Reset(m.modemPath)
+		return m.client.Reset(modemPath)
 	}
 
 	return nil
@@ -448,22 +428,15 @@ func (m *Manager) RestartModem() error {
 
 // ResetModem resets the modem via D-Bus
 func (m *Manager) ResetModem() error {
-	if m.modemPath == "" {
-		if _, err := m.FindModem(); err != nil {
-			return err
-		}
+	modemPath, err := m.FindModem()
+	if err != nil {
+		return err
 	}
-
-	err := m.client.Reset(m.modemPath)
-	// Invalidate cached path since modem will get new D-Bus path after reset
-	m.InvalidateModemPath()
-	return err
+	return m.client.Reset(modemPath)
 }
 
 // RecoverUSB performs USB recovery
 func (m *Manager) RecoverUSB() error {
-	// Invalidate cached path since modem will get new D-Bus path after recovery
-	m.InvalidateModemPath()
 	return m.usb.Recover()
 }
 
