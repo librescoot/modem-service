@@ -39,6 +39,12 @@ jobs:
           sha256sum "${STAGED}" > "${STAGED}.sha256"
           echo "artifact=${STAGED}" >> "$GITHUB_OUTPUT"
 
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: modem-service-linux-armv7
+          path: bin/modem-service
+
       - name: Create GitHub release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2.4.2
