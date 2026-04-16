@@ -46,10 +46,16 @@ func (r *Recovery) Unbind() error {
 	if err != nil {
 		return errors.Wrap(err, "failed to open unbind path")
 	}
-	defer f.Close()
-
 	if _, err := f.WriteString(r.device); err != nil {
+		f.Close()
 		return errors.Wrap(err, "failed to write to unbind")
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return errors.Wrap(err, "failed to sync unbind")
+	}
+	if err := f.Close(); err != nil {
+		return errors.Wrap(err, "failed to close unbind")
 	}
 
 	r.log("USB device unbound, waiting %dms...", UnbindWaitMS)
@@ -66,16 +72,31 @@ func (r *Recovery) Bind() error {
 	if err != nil {
 		return errors.Wrap(err, "failed to open bind path")
 	}
-	defer f.Close()
-
 	if _, err := f.WriteString(r.device); err != nil {
+		f.Close()
 		return errors.Wrap(err, "failed to write to bind")
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return errors.Wrap(err, "failed to sync bind")
+	}
+	if err := f.Close(); err != nil {
+		return errors.Wrap(err, "failed to close bind")
+	}
 
-	r.log("USB device bound, waiting %dms for enumeration...", BindWaitMS)
-	time.Sleep(time.Duration(BindWaitMS) * time.Millisecond)
+	r.log("USB device bound, waiting up to %dms for enumeration...", BindWaitMS)
 
-	return nil
+	// Poll for device to re-enumerate (up to BindWaitMS)
+	deadline := time.Now().Add(time.Duration(BindWaitMS) * time.Millisecond)
+	devicePath := "/sys/bus/usb/devices/" + r.device
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(devicePath); err == nil {
+			r.log("USB device %s re-enumerated", r.device)
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return errors.Errorf("USB device %s did not re-enumerate within %dms", r.device, BindWaitMS)
 }
 
 // Recover performs a full USB recovery (unbind + bind)
