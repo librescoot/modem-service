@@ -436,7 +436,14 @@ func (s *Service) doGPSConfiguration(ctx context.Context) error {
 	return nil
 }
 
-// sendATCommand is a helper to send AT commands with context and logging support
+// sendATCommand is a helper to send AT commands with context and logging support.
+//
+// When ctx is cancelled while a command is in flight we return immediately,
+// but the inner goroutine keeps running until the underlying D-Bus
+// SendCommand call completes (bounded by its 10-second timeout) — there is
+// no interruptible D-Bus call on godbus, so we accept that bounded drift.
+// The done channel is buffered so the goroutine never blocks on send even
+// after the caller has given up, guaranteeing it exits within the timeout.
 func (s *Service) sendATCommand(ctx context.Context, command string, logResponse bool) (string, error) {
 	done := make(chan struct {
 		response string
