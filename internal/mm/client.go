@@ -1,6 +1,7 @@
 package mm
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -207,7 +208,7 @@ func (c *Client) GetSuplServer(modemPath dbus.ObjectPath) (string, error) {
 }
 
 // WatchModems sets up signal watching for modem added/removed
-func (c *Client) WatchModems(onAdded func(dbus.ObjectPath), onRemoved func(dbus.ObjectPath)) error {
+func (c *Client) WatchModems(ctx context.Context, onAdded func(dbus.ObjectPath), onRemoved func(dbus.ObjectPath)) error {
 	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
 	signals := make(chan *dbus.Signal, 100)
 	c.conn.Signal(signals)
@@ -226,30 +227,40 @@ func (c *Client) WatchModems(onAdded func(dbus.ObjectPath), onRemoved func(dbus.
 	}
 
 	go func() {
-		for signal := range signals {
-			switch signal.Name {
-			case DBusObjectManager + ".InterfacesAdded":
-				if len(signal.Body) >= 2 {
-					if path, ok := signal.Body[0].(dbus.ObjectPath); ok {
-						if interfaces, ok := signal.Body[1].(map[string]map[string]dbus.Variant); ok {
-							if _, hasModem := interfaces[ModemInterface]; hasModem {
-								c.log("Modem added: %s", path)
-								if onAdded != nil {
-									onAdded(path)
+		defer c.conn.RemoveSignal(signals)
+		defer close(signals)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case signal, ok := <-signals:
+				if !ok {
+					return
+				}
+				switch signal.Name {
+				case DBusObjectManager + ".InterfacesAdded":
+					if len(signal.Body) >= 2 {
+						if path, ok := signal.Body[0].(dbus.ObjectPath); ok {
+							if interfaces, ok := signal.Body[1].(map[string]map[string]dbus.Variant); ok {
+								if _, hasModem := interfaces[ModemInterface]; hasModem {
+									c.log("Modem added: %s", path)
+									if onAdded != nil {
+										onAdded(path)
+									}
 								}
 							}
 						}
 					}
-				}
-			case DBusObjectManager + ".InterfacesRemoved":
-				if len(signal.Body) >= 2 {
-					if path, ok := signal.Body[0].(dbus.ObjectPath); ok {
-						if interfaces, ok := signal.Body[1].([]string); ok {
-							for _, iface := range interfaces {
-								if iface == ModemInterface {
-									c.log("Modem removed: %s", path)
-									if onRemoved != nil {
-										onRemoved(path)
+				case DBusObjectManager + ".InterfacesRemoved":
+					if len(signal.Body) >= 2 {
+						if path, ok := signal.Body[0].(dbus.ObjectPath); ok {
+							if interfaces, ok := signal.Body[1].([]string); ok {
+								for _, iface := range interfaces {
+									if iface == ModemInterface {
+										c.log("Modem removed: %s", path)
+										if onRemoved != nil {
+											onRemoved(path)
+										}
 									}
 								}
 							}
@@ -264,7 +275,7 @@ func (c *Client) WatchModems(onAdded func(dbus.ObjectPath), onRemoved func(dbus.
 }
 
 // WatchPropertyChanges watches for property changes on a modem
-func (c *Client) WatchPropertyChanges(modemPath dbus.ObjectPath, onChange func(string, string, dbus.Variant)) error {
+func (c *Client) WatchPropertyChanges(ctx context.Context, modemPath dbus.ObjectPath, onChange func(string, string, dbus.Variant)) error {
 	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
 	signals := make(chan *dbus.Signal, 100)
 	c.conn.Signal(signals)
@@ -277,15 +288,25 @@ func (c *Client) WatchPropertyChanges(modemPath dbus.ObjectPath, onChange func(s
 	}
 
 	go func() {
-		for signal := range signals {
-			if signal.Name == DBusPropertiesInterface+".PropertiesChanged" && signal.Path == modemPath {
-				if len(signal.Body) >= 2 {
-					if iface, ok := signal.Body[0].(string); ok {
-						if changed, ok := signal.Body[1].(map[string]dbus.Variant); ok {
-							for prop, value := range changed {
-								c.log("Property changed: %s.%s = %v", iface, prop, value.Value())
-								if onChange != nil {
-									onChange(iface, prop, value)
+		defer c.conn.RemoveSignal(signals)
+		defer close(signals)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case signal, ok := <-signals:
+				if !ok {
+					return
+				}
+				if signal.Name == DBusPropertiesInterface+".PropertiesChanged" && signal.Path == modemPath {
+					if len(signal.Body) >= 2 {
+						if iface, ok := signal.Body[0].(string); ok {
+							if changed, ok := signal.Body[1].(map[string]dbus.Variant); ok {
+								for prop, value := range changed {
+									c.log("Property changed: %s.%s = %v", iface, prop, value.Value())
+									if onChange != nil {
+										onChange(iface, prop, value)
+									}
 								}
 							}
 						}
