@@ -81,11 +81,11 @@ type Manager struct {
 	logger *log.Logger
 }
 
-// NewManager creates a new modem manager
-func NewManager(logger *log.Logger, debug bool) (*Manager, error) {
-	client, err := mm.NewClient(debug, logger.Printf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ModemManager client: %v", err)
+// NewManager creates a new modem manager that shares the given mm.Client.
+// The caller owns the client's lifecycle; Manager.Close does not close it.
+func NewManager(client *mm.Client, logger *log.Logger) (*Manager, error) {
+	if client == nil {
+		return nil, fmt.Errorf("mm.Client is required")
 	}
 
 	gpioCtrl, err := gpio.NewPowerController(logger.Printf)
@@ -103,13 +103,11 @@ func NewManager(logger *log.Logger, debug bool) (*Manager, error) {
 	}, nil
 }
 
-// Close closes the manager and releases resources
+// Close releases resources owned by the Manager. The shared mm.Client is
+// closed by whoever created it (typically service.Service).
 func (m *Manager) Close() error {
 	if m.gpio != nil {
 		m.gpio.Close()
-	}
-	if m.client != nil {
-		return m.client.Close()
 	}
 	return nil
 }
@@ -387,8 +385,9 @@ func (m *Manager) StartModem() error {
 	return m.gpio.PowerOn()
 }
 
-// PowerOffModem turns off the modem via GPIO
-func (m *Manager) PowerOffModem() error {
+// PowerOffModem turns off the modem via GPIO. ctx is used to interrupt the
+// 12-second post-pulse wait if the service is shutting down.
+func (m *Manager) PowerOffModem(ctx context.Context) error {
 	if m.gpio == nil {
 		return fmt.Errorf("GPIO controller not initialized")
 	}
@@ -398,11 +397,11 @@ func (m *Manager) PowerOffModem() error {
 	}
 	defer m.gpio.Close()
 
-	return m.gpio.PowerOff()
+	return m.gpio.PowerOff(ctx)
 }
 
 // RestartModem restarts the modem (power cycle)
-func (m *Manager) RestartModem() error {
+func (m *Manager) RestartModem(ctx context.Context) error {
 	if m.gpio == nil {
 		return fmt.Errorf("GPIO controller not initialized")
 	}
@@ -413,7 +412,7 @@ func (m *Manager) RestartModem() error {
 	defer m.gpio.Close()
 
 	// Full power cycle
-	if err := m.gpio.Cycle(); err != nil {
+	if err := m.gpio.Cycle(ctx); err != nil {
 		// Fallback to D-Bus reset
 		m.logger.Printf("GPIO power cycle failed, attempting D-Bus reset...")
 		modemPath, err := m.FindModem()

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"modem-service/internal/cell"
@@ -47,19 +48,26 @@ type Service struct {
 	LastGPSQualityLog     time.Time  // Last time GPS quality was logged
 	gpsRecoveryMutex      sync.Mutex // Prevents concurrent GPS recovery/configuration attempts
 	gpsRecoveryInProgress bool       // Tracks if GPS recovery is currently running
+	gpsRecoveryUntil      time.Time  // Protected by gpsRecoveryMutex; monitor skips EnableGPS until this passes
 	connectivityFailures  int        // Consecutive internet connectivity check failures
 
 	lastClockSync time.Time // Last time syncClockFromGPS successfully fed chrony
 
-	// Settings (from Redis)
-	gpsEnabled          bool
-	cellLocationEnabled bool
+	// Settings (from Redis) — atomic so the Redis watcher goroutine can
+	// update them without racing the monitor goroutine that reads them.
+	gpsEnabled          atomic.Bool
+	cellLocationEnabled atomic.Bool
 	lastCellTower       *cell.CellTower
 	lastCellLoc         *cell.CellLocation
 
-	// Modem enable/disable state
-	modemEnabled      bool       // Target state: should modem be on?
-	modemEnabledMutex sync.Mutex // Protects modemEnabled
+	// Modem enable/disable target state. Atomic because it's read from the
+	// monitor goroutine and written from the Redis command/vehicle-state
+	// watcher goroutines.
+	modemEnabled atomic.Bool
+
+	// Service-level context, captured in Run() so handlers spawned from
+	// Redis watchers (e.g. disableModem goroutine) can respect shutdown.
+	ctx context.Context
 
 	// Connectivity classifier derives online/searching/offline/no-sim from
 	// raw modem state with hysteresis to avoid thrashing on coverage flickers.
@@ -71,7 +79,12 @@ type Service struct {
 	// because startup paths sometimes don't know the real modem mode until
 	// ProbeGPSMode has run — capturing at wait-start gave misleading labels.
 	ttffStart time.Time
-	lastPubGPSMode location.GPSMode // last value of gps.mode published to Redis
+
+	// lastPubGPSMode is the last value of gps.mode published to Redis.
+	// Guarded by modePubMu because requestGPSModeForConnectivity can spawn
+	// overlapping goroutines on rapid connectivity changes.
+	modePubMu      sync.Mutex
+	lastPubGPSMode location.GPSMode
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -86,8 +99,8 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		return nil, fmt.Errorf("failed to create ModemManager client: %v", err)
 	}
 
-	// Create modem manager
-	modemMgr, err := modem.NewManager(logger, cfg.Debug)
+	// Create modem manager, sharing the same D-Bus client.
+	modemMgr, err := modem.NewManager(mmClient, logger)
 	if err != nil {
 		mmClient.Close()
 		return nil, fmt.Errorf("failed to create modem manager: %v", err)
@@ -103,10 +116,11 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
-		gpsEnabled:          true,  // default: GPS on
-		cellLocationEnabled: false, // default: cell location off
 		connClassifier:      connectivity.New(),
 	}
+	service.gpsEnabled.Store(true)           // default: GPS on
+	service.cellLocationEnabled.Store(false) // default: cell location off
+	service.modemEnabled.Store(true)         // default: modem on until pm-service says otherwise
 
 	cell.SetVersion(version)
 	service.Logger.Printf("modem-service %s", version)
@@ -115,6 +129,10 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	// Capture the service context so handlers spawned from Redis watchers
+	// (e.g. the disableModem goroutine) can respect shutdown.
+	s.ctx = ctx
+
 	if err := s.Redis.Ping(); err != nil {
 		return fmt.Errorf("redis connection failed: %v", err)
 	}
@@ -131,13 +149,15 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// Watch location settings
 	s.Redis.StartSettingsWatcher("modem.gps", func(value string) error {
-		s.gpsEnabled = value != "false"
-		s.Logger.Printf("GPS %s", map[bool]string{true: "enabled", false: "disabled"}[s.gpsEnabled])
+		enabled := value != "false"
+		s.gpsEnabled.Store(enabled)
+		s.Logger.Printf("GPS %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
 		return nil
 	})
 	s.Redis.StartSettingsWatcher("modem.cell-location", func(value string) error {
-		s.cellLocationEnabled = value == "true"
-		s.Logger.Printf("Cell location %s", map[bool]string{true: "enabled", false: "disabled"}[s.cellLocationEnabled])
+		enabled := value == "true"
+		s.cellLocationEnabled.Store(enabled)
+		s.Logger.Printf("Cell location %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
 		return nil
 	})
 	s.Redis.StartSettingsWatching()
@@ -158,27 +178,51 @@ func (s *Service) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 
+	// Graceful shutdown: keep last lat/lng in Redis as a useful fallback
+	// for consumers, but clear the fix indicators so nobody treats the
+	// stale coords as a current position.
 	s.Location.Close()
-	s.Redis.PublishLocationState(map[string]interface{}{"state": "off"}, false)
+	s.Redis.PublishLocationState(map[string]interface{}{
+		"state":              "off",
+		"fix":                "none",
+		"active":             false,
+		"connected":          false,
+		"snr":                float64(0),
+		"hdop":               float64(0),
+		"vdop":               float64(0),
+		"pdop":               float64(0),
+		"eph":                float64(0),
+		"satellites-used":    int32(0),
+		"satellites-visible": int32(0),
+	}, false)
+
+	// Release service-owned resources. Modem.Close does not close the
+	// shared mm.Client — service owns it and closes it below.
+	if err := s.Modem.Close(); err != nil {
+		s.Logger.Printf("Error closing modem manager: %v", err)
+	}
+	if err := s.MMClient.Close(); err != nil {
+		s.Logger.Printf("Error closing ModemManager D-Bus client: %v", err)
+	}
+	if err := s.Redis.Close(); err != nil {
+		s.Logger.Printf("Error closing Redis client: %v", err)
+	}
 
 	return nil
 }
 
 // handleModemCommand handles enable/disable commands from pm-service
 func (s *Service) handleModemCommand(command string) error {
-	s.modemEnabledMutex.Lock()
-	defer s.modemEnabledMutex.Unlock()
-
 	switch command {
 	case "enable":
 		s.Logger.Printf("Received modem enable command")
-		s.modemEnabled = true
+		s.modemEnabled.Store(true)
 		// Modem will be enabled by ensureModemEnabled or monitor loop
 	case "disable":
 		s.Logger.Printf("Received modem disable command")
-		s.modemEnabled = false
+		s.modemEnabled.Store(false)
 		// Disable the modem
-		go s.disableModem()
+		go s.disableModem(s.ctx)
 	default:
 		s.Logger.Printf("Unknown modem command: %s", command)
 	}
@@ -188,30 +232,40 @@ func (s *Service) handleModemCommand(command string) error {
 // handleVehicleState handles vehicle state changes to auto-enable modem
 func (s *Service) handleVehicleState(state string) error {
 	if modemOnlineStates[state] {
-		s.modemEnabledMutex.Lock()
-		if !s.modemEnabled {
+		if s.modemEnabled.CompareAndSwap(false, true) {
 			s.Logger.Printf("Vehicle state '%s' - enabling modem", state)
-			s.modemEnabled = true
 		}
-		s.modemEnabledMutex.Unlock()
 	}
 	return nil
 }
 
 // disableModem turns off the modem and publishes the off state
-func (s *Service) disableModem() {
+func (s *Service) disableModem(ctx context.Context) {
 	s.Logger.Printf("Disabling modem...")
 
-	// Close GPS first
+	// Close GPS first. Preserve last lat/lng but clear the fix indicators
+	// so consumers don't treat stale coords as a current position.
 	s.Location.Close()
-	s.Redis.PublishLocationState(map[string]interface{}{"state": "off"}, false)
+	s.Redis.PublishLocationState(map[string]interface{}{
+		"state":              "off",
+		"fix":                "none",
+		"active":             false,
+		"connected":          false,
+		"snr":                float64(0),
+		"hdop":               float64(0),
+		"vdop":               float64(0),
+		"pdop":               float64(0),
+		"eph":                float64(0),
+		"satellites-used":    int32(0),
+		"satellites-visible": int32(0),
+	}, false)
 
 	// Publish off states
 	s.Redis.PublishInternetState("status", "disconnected")
 	s.Redis.PublishInternetState("modem-state", "off")
 	s.Redis.PublishModemState("power-state", "off")
 
-	if err := s.Modem.PowerOffModem(); err != nil {
+	if err := s.Modem.PowerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
 	}
 
@@ -280,23 +334,43 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	return fmt.Errorf("modem failed to come up after multiple attempts, marked as potentially defective")
 }
 
+// probeHealth checks whether the modem is currently healthy on D-Bus without
+// triggering any recovery machinery. Used inside attemptRecovery to verify a
+// strategy succeeded; going through checkHealth there would re-enter
+// handleModemFailure and collapse the escalation sequence.
+func (s *Service) probeHealth() bool {
+	if _, err := s.Modem.FindModem(); err != nil {
+		return false
+	}
+	if err := s.Modem.CheckPrimaryPort(); err != nil {
+		return false
+	}
+	if err := s.Modem.CheckPowerState(); err != nil {
+		return false
+	}
+	return true
+}
+
+// recoverySucceeded is the shared post-strategy bookkeeping: mark healthy,
+// reset GPS, clear the fault. Called whenever probeHealth returns true after
+// a recovery strategy.
+func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
+	s.Logger.Printf("Modem recovery successful via %s", strategy)
+	s.Health.MarkNormal()
+	s.GPSRecoveryCount = 0
+	s.resetGPSAfterModemRecovery()
+	s.publishHealthState(ctx)
+	s.Redis.RemoveFault(redisClient.FaultCodeModemRecoveryFailed)
+}
+
 func (s *Service) checkHealth(ctx context.Context) error {
 	// Skip health check if we're in a terminal state
 	if s.Health.IsTerminal() {
 		return fmt.Errorf("modem in terminal state: %s", s.Health.State)
 	}
 
-	_, err := s.Modem.FindModem()
-	if err != nil {
-		return s.handleModemFailure(ctx, fmt.Sprintf("no_modem_found: %v", err))
-	}
-
-	if err := s.Modem.CheckPrimaryPort(); err != nil {
-		return s.handleModemFailure(ctx, fmt.Sprintf("wrong_primary_port: %v", err))
-	}
-
-	if err := s.Modem.CheckPowerState(); err != nil {
-		return s.handleModemFailure(ctx, fmt.Sprintf("wrong_power_state: %v", err))
+	if !s.probeHealth() {
+		return s.handleModemFailure(ctx, "probe_failed")
 	}
 
 	s.Health.MarkNormal()
@@ -312,16 +386,26 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 		return fmt.Errorf("recovery in progress")
 	}
 
-	// Be more forgiving - instead of entering terminal state, just wait longer
+	// Exhausted retries: publish terminal Wait state, back off 2 minutes,
+	// then reset and allow recovery to try again on the next failure.
+	// StatePermanentFailure is reached only from ensureModemEnabled when
+	// the modem never responded at all.
 	if !s.Health.CanRecover() {
-		s.Logger.Printf("Max recovery attempts reached, waiting before reset...")
+		s.Health.MarkRecoveryFailed()
+		s.publishHealthState(ctx)
+		s.Redis.LogFault("internet", redisClient.FaultCodeModemRecoveryFailed,
+			fmt.Sprintf("Max recovery attempts (%d) exhausted, entering recovery-failed-wait", health.MaxRecoveryAttempts))
+		s.Redis.AddFault(redisClient.FaultCodeModemRecoveryFailed)
+		s.Logger.Printf("Max recovery attempts reached, entering %s state", s.Health.State)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(2 * time.Minute):
 		}
 		s.Health.RecoveryAttempts = 0
-		s.Logger.Printf("Recovery attempts reset, will try again")
+		s.Health.MarkNormal()
+		s.publishHealthState(ctx)
+		s.Logger.Printf("Recovery-failed-wait expired, will retry on next failure")
 		return nil
 	}
 
@@ -349,12 +433,8 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 			case <-time.After(health.RecoveryWaitTime):
 			}
 
-			if err := s.checkHealth(ctx); err == nil {
-				s.Logger.Printf("Modem recovery successful via D-Bus reset")
-				s.Health.MarkNormal()
-				s.GPSRecoveryCount = 0
-				s.resetGPSAfterModemRecovery()
-				s.publishHealthState(ctx)
+			if s.probeHealth() {
+				s.recoverySucceeded(ctx, "D-Bus reset")
 				return nil
 			}
 		}
@@ -369,36 +449,24 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		err := s.Modem.WaitForModem(usbCtx, s.Config.Interface)
 		usbCancel()
 
-		if err == nil {
-			if err := s.checkHealth(ctx); err == nil {
-				s.Logger.Printf("Modem recovery successful via USB recovery")
-				s.Health.MarkNormal()
-				s.GPSRecoveryCount = 0
-				s.resetGPSAfterModemRecovery()
-				s.publishHealthState(ctx)
-				return nil
-			}
+		if err == nil && s.probeHealth() {
+			s.recoverySucceeded(ctx, "USB recovery")
+			return nil
 		}
 	}
 
 	// Strategy 3: Try hardware reset via GPIO
 	s.Logger.Printf("Attempting modem restart (GPIO with D-Bus fallback)...")
-	if err := s.Modem.RestartModem(); err != nil {
+	if err := s.Modem.RestartModem(ctx); err != nil {
 		s.Logger.Printf("GPIO restart failed: %v", err)
 	} else {
 		gpioCtx, gpioCancel := context.WithTimeout(ctx, health.RecoveryWaitTime)
 		err := s.Modem.WaitForModem(gpioCtx, s.Config.Interface)
 		gpioCancel()
 
-		if err == nil {
-			if err := s.checkHealth(ctx); err == nil {
-				s.Logger.Printf("Modem recovery successful via GPIO restart")
-				s.Health.MarkNormal()
-				s.GPSRecoveryCount = 0
-				s.resetGPSAfterModemRecovery()
-				s.publishHealthState(ctx)
-				return nil
-			}
+		if err == nil && s.probeHealth() {
+			s.recoverySucceeded(ctx, "GPIO restart")
+			return nil
 		}
 	}
 
@@ -410,12 +478,8 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 	case <-time.After(30 * time.Second):
 	}
 
-	if err := s.checkHealth(ctx); err == nil {
-		s.Logger.Printf("Modem recovered during extended wait")
-		s.Health.MarkNormal()
-		s.GPSRecoveryCount = 0
-		s.resetGPSAfterModemRecovery()
-		s.publishHealthState(ctx)
+	if s.probeHealth() {
+		s.recoverySucceeded(ctx, "extended wait")
 		return nil
 	}
 
@@ -447,27 +511,31 @@ func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
 // trigger is the underlying failure that caused recovery to be requested
 // (e.g. gps_data_stale, gps_timestamp_stuck, gps_fix_timeout). Logged so
 // we can correlate unexpected GPS restarts with the triggering check.
+//
+// Pacing is handled via s.gpsRecoveryUntil (see the monitor loop) — this
+// function does not sleep while holding any mutex.
 func (s *Service) attemptGPSRecovery(trigger error) error {
 	// Acquire lock to prevent concurrent GPS recovery attempts
 	s.gpsRecoveryMutex.Lock()
-	defer s.gpsRecoveryMutex.Unlock()
-
 	// Check if recovery is already in progress
 	if s.gpsRecoveryInProgress {
+		s.gpsRecoveryMutex.Unlock()
 		s.Logger.Printf("GPS recovery already in progress, skipping duplicate attempt")
 		return nil
 	}
-
-	// Mark recovery as in progress
 	s.gpsRecoveryInProgress = true
+	s.gpsRecoveryMutex.Unlock()
 	defer func() {
+		s.gpsRecoveryMutex.Lock()
 		s.gpsRecoveryInProgress = false
+		s.gpsRecoveryMutex.Unlock()
 	}()
 
 	s.GPSRecoveryCount++
 	s.Logger.Printf("Attempting GPS recovery (attempt %d, trigger=%v)", s.GPSRecoveryCount, trigger)
 
-	// If we've tried GPS recovery too many times, do a full reset and wait longer
+	// If we've tried GPS recovery too many times, do a full reset and gate
+	// the monitor loop for 30 seconds before it's allowed to re-enable GPS.
 	if s.GPSRecoveryCount > 3 {
 		s.Logger.Printf("GPS recovery attempted %d times, performing full reset with longer break", s.GPSRecoveryCount)
 		s.GPSRecoveryCount = 0
@@ -484,9 +552,11 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 		s.WaitingForGPSLogged = false
 		s.Location.ResetTimestampTracking()
 
-		// Wait longer before allowing monitor to re-enable GPS
-		time.Sleep(30 * time.Second)
-		s.Logger.Printf("GPS break complete, monitor will re-enable")
+		// Gate the monitor loop rather than sleeping under the mutex.
+		s.gpsRecoveryMutex.Lock()
+		s.gpsRecoveryUntil = time.Now().Add(30 * time.Second)
+		s.gpsRecoveryMutex.Unlock()
+		s.Logger.Printf("GPS break complete, monitor will re-enable after 30s")
 		return nil
 	}
 
@@ -497,9 +567,12 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 		// Continue with recovery even if gpsd stop fails
 	}
 
-	// Close existing GPS connection
+	// Close existing GPS connection; gate the monitor for 2 seconds so
+	// it doesn't re-enable while gpsd is still tearing down.
 	s.Location.Close()
-	time.Sleep(2 * time.Second)
+	s.gpsRecoveryMutex.Lock()
+	s.gpsRecoveryUntil = time.Now().Add(2 * time.Second)
+	s.gpsRecoveryMutex.Unlock()
 
 	// Reset GPS state tracking
 	s.LastGPSDataTime = time.Time{}
@@ -558,9 +631,15 @@ func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connec
 }
 
 // publishGPSMode updates the gps.mode Redis field if the current mode has
-// changed since the last publish.
+// changed since the last publish. Serialized via modePubMu because
+// requestGPSModeForConnectivity can spawn overlapping goroutines when
+// connectivity flickers.
 func (s *Service) publishGPSMode() {
 	mode := s.Location.CurrentGPSMode()
+
+	s.modePubMu.Lock()
+	defer s.modePubMu.Unlock()
+
 	if mode == s.lastPubGPSMode {
 		return
 	}
@@ -959,15 +1038,24 @@ func (s *Service) monitorStatus(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if !s.modemEnabled.Load() {
+				continue
+			}
 			if err := s.checkAndPublishModemStatus(ctx); err != nil {
 				s.Logger.Printf("Periodic modem status check failed: %v", err)
 			}
 		case <-cellTimer.C:
-			if s.cellLocationEnabled && !s.Location.HasValidFix() && s.LastState.Status == "connected" {
+			if !s.modemEnabled.Load() {
+				continue
+			}
+			if s.cellLocationEnabled.Load() && !s.Location.HasValidFix() && s.LastState.Status == "connected" {
 				s.queryCellLocation(ctx, s.LastState)
 			}
 		case <-gpsTimer.C:
-			if !s.gpsEnabled {
+			if !s.modemEnabled.Load() {
+				continue
+			}
+			if !s.gpsEnabled.Load() {
 				continue
 			}
 			if s.Health.State == health.StateNormal {
@@ -976,12 +1064,18 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					continue
 				}
 
-				// Check if GPS recovery is in progress before attempting to enable GPS
+				// Check if GPS recovery is in progress or the monitor is
+				// gated waiting for recovery to settle.
 				s.gpsRecoveryMutex.Lock()
 				recoveryInProgress := s.gpsRecoveryInProgress
+				gatedUntil := s.gpsRecoveryUntil
 				s.gpsRecoveryMutex.Unlock()
 
-				if !s.Location.Enabled && !recoveryInProgress {
+				if recoveryInProgress || time.Now().Before(gatedUntil) {
+					continue
+				}
+
+				if !s.Location.Enabled {
 					if err := s.Location.EnableGPS(modemPath); err != nil {
 						s.Logger.Printf("Failed to enable GPS: %v", err)
 						continue
@@ -1108,13 +1202,22 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.LastGPSQualityLog = time.Now()
 					}
 
-					// Publish just the status without location data (never publish recovery when no fix)
+					// Publish just the status without location data (never
+					// publish recovery when no fix). Explicitly zero the
+					// quality/satellite fields so consumers don't see stale
+					// DOP/sats numbers lingering from the last good fix.
 					data := map[string]interface{}{
-						"fix":       gpsStatus["fix"],
-						"snr":       gpsStatus["snr"],
-						"active":    gpsStatus["active"],
-						"connected": gpsStatus["connected"],
-						"state":     gpsStatus["state"],
+						"fix":                gpsStatus["fix"],
+						"snr":                gpsStatus["snr"],
+						"active":             gpsStatus["active"],
+						"connected":          gpsStatus["connected"],
+						"state":              gpsStatus["state"],
+						"hdop":               float64(0),
+						"vdop":               float64(0),
+						"pdop":               float64(0),
+						"eph":                float64(0),
+						"satellites-used":    int32(0),
+						"satellites-visible": int32(0),
 					}
 					if err := s.Redis.PublishLocationState(data, false); err != nil {
 						s.Logger.Printf("Failed to publish GPS status: %v", err)
