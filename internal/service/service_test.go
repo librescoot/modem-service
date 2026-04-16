@@ -444,7 +444,7 @@ func TestLocationServiceInitialization(t *testing.T) {
 		t.Error("Expected HasValidFix to be false initially")
 	}
 
-	if !locService.GPSFreshInit {
+	if !locService.GPSFreshInit() {
 		t.Error("Expected GPSFreshInit to be true initially")
 	}
 }

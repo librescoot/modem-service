@@ -1027,7 +1027,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					publishRecovery = s.Location.ShouldPublishRecovery(hasInternet)
 					if publishRecovery {
 						// Clear the fresh init flag after first successful publish
-						s.Location.GPSFreshInit = false
+						s.Location.SetGPSFreshInit(false)
 					}
 
 					// Reset GPS lost time since we have a fix now

@@ -133,13 +133,15 @@ type Service struct {
 	lastGPSTimestampUpdate time.Time // When we last saw the GPS timestamp change
 
 	// Accessed only from the main goroutine or under explicit coordination
-	GPSLostTime  time.Time // Time when GPS fix was lost
-	GPSFreshInit bool      // True if GPS has just been initialized
+	GPSLostTime  time.Time   // Time when GPS fix was lost
+	gpsFreshInit atomic.Bool // True if GPS has just been initialized
 
 	configMutex      sync.Mutex    // Protects GPS configuration to prevent concurrent attempts
 	currentMode      GPSMode       // Current GPS mode; protected by configMutex
 	monitoringActive atomic.Bool   // True if monitoring goroutine is already running
 	stopChan         chan struct{} // Signals monitoring goroutine to stop
+
+	closeMu sync.Mutex // Serializes stopChan create/close so Close() can be called concurrently without double-closing
 
 	rolloverLogged sync.Once // Logs GPS week-rollover correction at most once per session
 }
@@ -156,12 +158,12 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 			AccuracyThresh: 50.0,
 			AntennaVoltage: 3.05,
 		},
-		MMClient:     mmClient,
-		Logger:       logger,
-		GpsdServer:   gpsdServer,
-		Done:         make(chan bool),
-		GPSFreshInit: true,
+		MMClient:   mmClient,
+		Logger:     logger,
+		GpsdServer: gpsdServer,
+		Done:       make(chan bool),
 	}
+	s.gpsFreshInit.Store(true)
 	s.state.Store("off")
 	s.fixMode.Store("none")
 	s.snr.Store(float64(0))
@@ -189,6 +191,11 @@ func (s *Service) SatsUsed() int32     { return s.satsUsed.Load() }
 func (s *Service) SatsVisible() int32  { return s.satsVisible.Load() }
 func (s *Service) GpsdConnected() bool { return s.gpsdConnected.Load() }
 func (s *Service) State() string       { return s.state.Load().(string) }
+func (s *Service) GPSFreshInit() bool  { return s.gpsFreshInit.Load() }
+
+func (s *Service) SetGPSFreshInit(v bool) {
+	s.gpsFreshInit.Store(v)
+}
 
 func (s *Service) CurrentLoc() Location {
 	s.stateMutex.RLock()
@@ -231,7 +238,10 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 	}
 
 	s.monitoringActive.Store(true)
+	s.closeMu.Lock()
 	s.stopChan = make(chan struct{})
+	stopChan := s.stopChan
+	s.closeMu.Unlock()
 
 	go func() {
 		defer func() {
@@ -242,7 +252,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 		for {
 			// Check both Enabled flag and stop channel for shutdown
 			select {
-			case <-s.stopChan:
+			case <-stopChan:
 				return
 			default:
 			}
@@ -256,7 +266,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 				if s.GpsdConn == nil {
 					// On first attempt, try connecting to gpsd without reconfiguring GPS
 					// (GPS might already be running from previous service instance)
-					if attempt == 0 && s.GPSFreshInit {
+					if attempt == 0 && s.gpsFreshInit.Load() {
 						s.Logger.Printf("Trying to connect to existing gpsd...")
 						if err := s.connectToGPSD(); err == nil {
 							s.Logger.Printf("Connected to gpsd, checking for GPS data...")
@@ -264,7 +274,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 
 							// Wait briefly to see if we get GPS data
 							select {
-							case <-s.stopChan:
+							case <-stopChan:
 								return
 							case <-time.After(3 * time.Second):
 							}
@@ -277,7 +287,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 								// Probe so currentMode reflects the actual
 								// modem state instead of a zero-value default.
 								s.ProbeGPSMode(context.Background())
-								s.GPSFreshInit = false
+								s.gpsFreshInit.Store(false)
 								attempt = 0
 								continue
 							}
@@ -290,7 +300,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 								s.GpsdConn = nil
 							}
 						}
-						s.GPSFreshInit = false
+						s.gpsFreshInit.Store(false)
 					}
 
 					s.Logger.Printf("Configuring GPS (attempt %d)", attempt+1)
@@ -299,7 +309,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 						s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
 						s.configMutex.Unlock()
 						select {
-						case <-s.stopChan:
+						case <-stopChan:
 							return
 						case <-time.After(GPSRetryInterval):
 						}
@@ -311,7 +321,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 						s.Logger.Printf("Failed to connect to gpsd: %v", err)
 						s.configMutex.Unlock()
 						select {
-						case <-s.stopChan:
+						case <-stopChan:
 							return
 						case <-time.After(GPSRetryInterval):
 						}
@@ -341,7 +351,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 			}
 
 			select {
-			case <-s.stopChan:
+			case <-stopChan:
 				return
 			case <-time.After(GPSRetryInterval):
 			}
@@ -492,9 +502,11 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	return nil
 }
 
-// configureAntennaPower configures the GPS antenna power supply
-// CRITICAL: This can reset to 2950mV after reboot which prevents GPS from working
-// Must be called on every GPS enable, not just initial configuration
+// configureAntennaPower configures the GPS antenna power supply.
+// CRITICAL: Can reset to 2950mV after reboot, preventing GPS from working.
+// Must be called on every GPS enable, not just initial configuration.
+// Caller must hold s.configMutex — this function reads and writes s.currentMode
+// without locking, relying on that invariant.
 func (s *Service) configureAntennaPower(ctx context.Context) error {
 	voltageMillivolts := int(s.Config.AntennaVoltage * 1000)
 
@@ -807,6 +819,15 @@ func (s *Service) connectToGPSD() error {
 		s.Logger.Printf("Closing existing gpsd connection")
 		s.GpsdConn.Close()
 		s.GpsdConn = nil
+		// Wait for the prior Watch goroutine to exit before overwriting
+		// s.Done on reconnect — otherwise it leaks one goroutine per cycle.
+		if s.Done != nil {
+			select {
+			case <-s.Done:
+			case <-time.After(2 * time.Second):
+				s.Logger.Printf("Warning: prior gpsd Watch goroutine did not exit within 2s")
+			}
+		}
 	}
 
 	s.Logger.Printf("Connecting to gpsd on %s", s.GpsdServer)
@@ -957,12 +978,17 @@ func (s *Service) StopGPSD() error {
 }
 
 func (s *Service) Close() {
-	// Signal monitoring goroutine to stop
+	s.closeMu.Lock()
 	if s.stopChan != nil {
 		close(s.stopChan)
 		s.stopChan = nil
 	}
+	s.closeMu.Unlock()
+
 	s.Enabled = false
+	// Mark disconnected first so concurrent GetGPSStatus() never observes
+	// state="off" while connected=true.
+	s.gpsdConnected.Store(false)
 	s.state.Store("off")
 	s.configMutex.Lock()
 	if s.GpsdConn != nil {
@@ -970,7 +996,6 @@ func (s *Service) Close() {
 		s.GpsdConn = nil
 	}
 	s.configMutex.Unlock()
-	s.gpsdConnected.Store(false)
 }
 
 func (s *Service) GetGPSStatus() map[string]interface{} {
@@ -999,7 +1024,7 @@ func (s *Service) ShouldPublishRecovery(hasInternetConnection bool) bool {
 		return false
 	}
 
-	if s.GPSFreshInit {
+	if s.gpsFreshInit.Load() {
 		return true
 	}
 
