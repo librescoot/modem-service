@@ -1036,6 +1036,10 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.WaitingForGPSLogged = false
 						// Reset recovery counter since GPS is now working
 						s.GPSRecoveryCount = 0
+						// Disarm the cold-start timeout — it only guards
+						// against "never got a fix"; the data-stale and
+						// timestamp-stuck checks handle ongoing monitoring.
+						s.GPSEnabledTime = time.Time{}
 					}
 
 					// TTFF: if a search was in progress, stop the clock
@@ -1060,7 +1064,8 @@ func (s *Service) monitorStatus(ctx context.Context) {
 
 					// Log GPS diagnostics every 90 seconds
 					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
-						s.Logger.Printf("gps eph=%.1fm hdop=%.1f vdop=%.1f pdop=%.1f snr=%.1fdBHz sats=%d/%d",
+						s.Logger.Printf("gps state=%s fix=%s eph=%.1fm hdop=%.1f vdop=%.1f pdop=%.1f snr=%.1fdBHz sats=%d/%d",
+							gpsStatus["state"], gpsStatus["fix"],
 							gpsStatus["eph"], gpsStatus["hdop"], gpsStatus["vdop"], gpsStatus["pdop"],
 							gpsStatus["snr"], gpsStatus["satellites-used"], gpsStatus["satellites-visible"])
 						s.LastGPSQualityLog = time.Now()
@@ -1087,6 +1092,14 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						// Start (or re-start) the TTFF clock. Mode will be
 						// read at fix-establish time rather than here.
 						s.ttffStart = time.Now()
+					}
+
+					// Log GPS diagnostics every 90 seconds while searching
+					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
+						s.Logger.Printf("gps state=%s fix=%s snr=%.1fdBHz sats=%d/%d",
+							gpsStatus["state"], gpsStatus["fix"],
+							gpsStatus["snr"], gpsStatus["satellites-used"], gpsStatus["satellites-visible"])
+						s.LastGPSQualityLog = time.Now()
 					}
 
 					// Publish just the status without location data (never publish recovery when no fix)

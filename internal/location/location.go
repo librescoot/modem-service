@@ -890,7 +890,9 @@ func (s *Service) connectToGPSD() error {
 		s.ept.Store(report.Ept)
 
 		if report.Mode == 1 || report.Mode == 0 {
-			s.hasValidFix.Store(false)
+			if s.hasValidFix.Swap(false) {
+				s.Logger.Printf("GPS fix lost: tpv mode=%d", report.Mode)
+			}
 			return
 		}
 
