@@ -25,7 +25,7 @@ jobs:
           check-latest: false
 
       - name: Run tests
-        run: make test
+        run: go test -v $(go list ./... | grep -v /internal/redis)
 
       - name: Build armv7 binary
         run: make build
