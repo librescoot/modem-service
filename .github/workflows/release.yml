@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.7"
+          check-latest: false
+
+      - name: Run tests
+        run: make test
+
+      - name: Build armv7 binary
+        run: make build
+
+      - name: Stage release artifact
+        id: stage
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          STAGED="modem-service-${VERSION}-linux-armv7"
+          cp bin/modem-service "${STAGED}"
+          sha256sum "${STAGED}" > "${STAGED}.sha256"
+          echo "artifact=${STAGED}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2.4.2
+        with:
+          name: "modem-service ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            ${{ steps.stage.outputs.artifact }}
+            ${{ steps.stage.outputs.artifact }}.sha256
+          body: |
+            LibreScoot modem-service ${{ github.ref_name }}
+
+            Monitors SIM7100E cellular modem via ModemManager D-Bus API
+            and forwards GPS data from gpsd. Publishes state to Redis.
+
+            **Target:** `linux/armv7` (i.MX6, cortexa9t2hf_neon_imx)
+
+            Built from commit ${{ github.sha }}.
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
