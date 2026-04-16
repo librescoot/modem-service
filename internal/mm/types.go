@@ -146,6 +146,8 @@ func RegistrationStateToString(state uint32) string {
 		return "searching"
 	case MMModem3gppRegistrationStateDenied:
 		return "denied"
+	case MMModem3gppRegistrationStateUnknown:
+		return "unknown"
 	case MMModem3gppRegistrationStateRoaming:
 		return "roaming"
 	default:
