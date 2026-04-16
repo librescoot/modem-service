@@ -526,7 +526,7 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 // with no NMEA timestamp updates, until the stuck-timestamp recovery path
 // fired. The stall overlapped with the user unlocking and starting to ride.
 // Until we can verify UE-Based is reliable across carriers and firmware (and
-// given XTRA is dead on SIM7100E anyway), stay in standalone always. The
+// given XTRA is broken on SIM7100E), stay in standalone always. The
 // classifier + plumbing are kept so flipping this back on is one constant.
 const enableUEBasedMode = false
 

@@ -456,8 +456,8 @@ func (s *Service) sendATCommand(ctx context.Context, command string, logResponse
 }
 
 // configureGPSViaATCommands configures GPS using AT commands for optimal performance
-// Uses direct modem AT commands for comprehensive GPS setup including antenna power,
-// XTRA assisted GPS, and accuracy thresholds for faster and more reliable GPS fixes
+// Uses direct modem AT commands for comprehensive GPS setup including antenna power
+// and accuracy thresholds for faster and more reliable GPS fixes
 func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	s.Logger.Printf("Configuring GPS via AT commands...")
 
@@ -490,12 +490,6 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	// Configure APN and socket context (optional)
 	s.sendATCommand(ctx, `AT+CGDCONT=1,"IP","internet"`, false)
 	s.sendATCommand(ctx, `AT+CGSOCKCONT=1,"IP","internet"`, false)
-
-	// Enable GPS XTRA assisted GPS (faster fix). XDAUTO triggers auto-download
-	// on GPS start; any XD=0 one-shot would be redundant.
-	s.sendATCommand(ctx, "AT+CGPSXE=1", false)
-	s.sendATCommand(ctx, "AT+CGPSXDAUTO=1", false)
-	s.Logger.Printf("GPS XTRA assisted GPS enabled")
 
 	// Configure NMEA sentence set.
 	s.sendATCommand(ctx, "AT+CGPSNMEA=511", false)
