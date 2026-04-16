@@ -353,7 +353,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 				s.Logger.Printf("Modem recovery successful via D-Bus reset")
 				s.Health.MarkNormal()
 				s.GPSRecoveryCount = 0
-				s.resetGPSStalenessAfterModemRecovery()
+				s.resetGPSAfterModemRecovery()
 				s.publishHealthState(ctx)
 				return nil
 			}
@@ -374,7 +374,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 				s.Logger.Printf("Modem recovery successful via USB recovery")
 				s.Health.MarkNormal()
 				s.GPSRecoveryCount = 0
-				s.resetGPSStalenessAfterModemRecovery()
+				s.resetGPSAfterModemRecovery()
 				s.publishHealthState(ctx)
 				return nil
 			}
@@ -395,7 +395,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 				s.Logger.Printf("Modem recovery successful via GPIO restart")
 				s.Health.MarkNormal()
 				s.GPSRecoveryCount = 0
-				s.resetGPSStalenessAfterModemRecovery()
+				s.resetGPSAfterModemRecovery()
 				s.publishHealthState(ctx)
 				return nil
 			}
@@ -414,6 +414,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		s.Logger.Printf("Modem recovered during extended wait")
 		s.Health.MarkNormal()
 		s.GPSRecoveryCount = 0
+		s.resetGPSAfterModemRecovery()
 		s.publishHealthState(ctx)
 		return nil
 	}
@@ -907,16 +908,16 @@ func (s *Service) queryCellLocation(ctx context.Context, state *modem.State) {
 	}
 }
 
-// resetGPSStalenessAfterModemRecovery pushes the GPS staleness clocks
-// forward to "now" so checkGPSHealth doesn't immediately fire a cascading
-// GPS recovery just because the modem reset briefly silenced gpsd. Without
-// this, a D-Bus modem reset (typically ~60s of no GPS data) reliably trips
-// gps_data_stale's 30s threshold and triggers an unnecessary GPS recovery.
-func (s *Service) resetGPSStalenessAfterModemRecovery() {
-	now := time.Now()
-	s.LastGPSDataTime = now
-	s.Location.SetLastGPSTimestampUpdate(now)
-	// GPSEnabledTime's 300s threshold is loose enough not to need a reset.
+// resetGPSAfterModemRecovery tears down the GPS subsystem so the monitor
+// loop reconfigures it from scratch on the next tick. A modem reset
+// invalidates the AT command state, gpsd connection, and GPS timestamps,
+// so a fresh EnableGPS is cleaner than trying to paper over stale clocks.
+func (s *Service) resetGPSAfterModemRecovery() {
+	s.Location.Close()
+	s.LastGPSDataTime = time.Time{}
+	s.GPSEnabledTime = time.Time{}
+	s.WaitingForGPSLogged = false
+	s.Location.ResetTimestampTracking()
 }
 
 func (s *Service) checkGPSHealth() error {
