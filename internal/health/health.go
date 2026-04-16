@@ -47,7 +47,7 @@ func (h *Health) MarkNormal() {
 
 // MarkRecoveryFailed marks the health as recovery failed
 func (h *Health) MarkRecoveryFailed() {
-	if h.RecoveryAttempts == MaxRecoveryAttempts {
+	if h.RecoveryAttempts >= MaxRecoveryAttempts {
 		h.State = StateRecoveryFailedWait
 	} else {
 		h.State = StatePermanentFailure
