@@ -14,6 +14,10 @@ const (
 	requestTimeout = 5 * time.Second
 )
 
+var httpClient = &http.Client{
+	Timeout: requestTimeout,
+}
+
 var userAgent string
 
 func SetVersion(version string) {
@@ -68,7 +72,7 @@ func Geolocate(ctx context.Context, towers []CellTower) (*CellLocation, error) {
 		req.Header.Set("User-Agent", userAgent)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -81,6 +85,10 @@ func Geolocate(ctx context.Context, towers []CellTower) (*CellLocation, error) {
 	var result geolocateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Location.Lat == 0 && result.Location.Lng == 0 {
+		return nil, fmt.Errorf("beacondb returned zero coordinates")
 	}
 
 	return &CellLocation{
