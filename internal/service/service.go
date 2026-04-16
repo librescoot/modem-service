@@ -51,7 +51,7 @@ type Service struct {
 
 	lastClockSync time.Time // Last time syncClockFromGPS successfully fed chrony
 
-	// Location settings (from Redis)
+	// Settings (from Redis)
 	gpsEnabled          bool
 	cellLocationEnabled bool
 	lastCellTower       *cell.CellTower

@@ -487,10 +487,6 @@ func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
 	// Set GPS clock from system time
 	s.syncGPSClock(ctx)
 
-	// Configure APN and socket context (optional)
-	s.sendATCommand(ctx, `AT+CGDCONT=1,"IP","internet"`, false)
-	s.sendATCommand(ctx, `AT+CGSOCKCONT=1,"IP","internet"`, false)
-
 	// Configure NMEA sentence set.
 	s.sendATCommand(ctx, "AT+CGPSNMEA=511", false)
 	return nil
