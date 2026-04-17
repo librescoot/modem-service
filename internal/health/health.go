@@ -81,18 +81,33 @@ func (h *Health) String() string {
 	return fmt.Sprintf("Health{State: %s, RecoveryAttempts: %d}", h.State, h.RecoveryAttempts)
 }
 
-// CheckInternetConnectivity attempts to connect to an external host via the specified interface.
-// Uses TCP connect to Google DNS (8.8.8.8:53) with interface binding.
-func CheckInternetConnectivity(ctx context.Context, interfaceName string) (bool, error) {
-	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
+// connectivityTargets are tried in order by CheckInternetConnectivity. A
+// single target can be filtered or deprioritised on a given carrier, so we
+// spread the check across multiple providers — any one success means we
+// have a data path to the public internet. TCP port 53 is almost universally
+// open, even on networks that block ICMP or filter HTTPS.
+var connectivityTargets = []string{
+	"8.8.8.8:53",        // Google Public DNS
+	"1.1.1.1:53",        // Cloudflare
+	"9.9.9.9:53",        // Quad9
+	"208.67.222.222:53", // OpenDNS
+}
 
+const connectivityDialTimeout = 2 * time.Second
+
+// CheckInternetConnectivity attempts TCP:53 connections to a short list of
+// public DNS resolvers via the given modem interface. Returns true if any
+// target is reachable. Returns false with the accumulated errors if all of
+// them fail, so the caller can log what was tried.
+func CheckInternetConnectivity(ctx context.Context, interfaceName string) (bool, error) {
 	dialer := &net.Dialer{
-		Timeout: 2 * time.Second,
+		Timeout: connectivityDialTimeout,
 		Control: func(network, address string, c syscall.RawConn) error {
 			var sockErr error
 			err := c.Control(func(fd uintptr) {
-				// Bind socket to interface using SO_BINDTODEVICE
+				// Bind socket to interface using SO_BINDTODEVICE so the
+				// probe traffic never escapes via the wifi/wired path that
+				// the MDB might also have.
 				sockErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, interfaceName)
 			})
 			if err != nil {
@@ -102,15 +117,17 @@ func CheckInternetConnectivity(ctx context.Context, interfaceName string) (bool,
 		},
 	}
 
-	// Try to establish TCP connection to Google DNS
-	conn, err := dialer.DialContext(checkCtx, "tcp", "8.8.8.8:53")
-	if err != nil {
-		if checkCtx.Err() == context.DeadlineExceeded {
-			return false, fmt.Errorf("connection timed out: %w", err)
+	var errs []string
+	for _, target := range connectivityTargets {
+		if err := ctx.Err(); err != nil {
+			return false, err
 		}
-		return false, fmt.Errorf("connection failed: %w", err)
+		conn, err := dialer.DialContext(ctx, "tcp", target)
+		if err == nil {
+			conn.Close()
+			return true, nil
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v", target, err))
 	}
-	conn.Close()
-
-	return true, nil
+	return false, fmt.Errorf("all connectivity targets unreachable: %s", errs)
 }
