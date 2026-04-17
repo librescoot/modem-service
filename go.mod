@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/godbus/dbus/v5 v5.2.2
-	github.com/librescoot/redis-ipc v0.10.3
+	github.com/librescoot/redis-ipc v0.11.3
 	github.com/pkg/errors v0.9.1
 	github.com/stratoberry/go-gpsd v1.3.0
 	github.com/warthog618/go-gpiocdev v0.9.1
