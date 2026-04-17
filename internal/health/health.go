@@ -40,9 +40,16 @@ func (h *Health) StartRecovery() {
 	h.LastRecoveryTime = time.Now()
 }
 
-// MarkNormal marks the health as normal
+// MarkNormal marks the health as normal and zeros the recovery counter.
+// The counter tracks sequential failed recovery rounds, so any success — a
+// strategy that actually worked, a healthy probe, or the terminal-wait
+// cooldown expiring — clears it. Otherwise a service that survives 5
+// unrelated recovery events over its lifetime would drift into the
+// recovery-failed-wait terminal state even though every one of them fixed
+// itself on strategy 1.
 func (h *Health) MarkNormal() {
 	h.State = StateNormal
+	h.RecoveryAttempts = 0
 }
 
 // MarkRecoveryFailed marks the health as recovery failed

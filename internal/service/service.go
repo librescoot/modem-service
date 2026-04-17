@@ -435,8 +435,7 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 			return ctx.Err()
 		case <-time.After(2 * time.Minute):
 		}
-		s.Health.RecoveryAttempts = 0
-		s.Health.MarkNormal()
+		s.Health.MarkNormal() // clears both state and RecoveryAttempts
 		s.publishHealthState(ctx)
 		s.Logger.Printf("Recovery-failed-wait expired, will retry on next failure")
 		return nil
