@@ -190,7 +190,11 @@ func (c *Client) ClearFaults() error {
 	return c.faultSet.Clear()
 }
 
-// Close closes the Redis client and stops all handlers
+// Close closes the Redis client and stops all handlers with a tight timeout.
+// redis-ipc's default Close is 30s × 2 phases = 60s worst case, which is more
+// than we need for a local Redis instance — 10s is plenty and keeps shutdown
+// snappy enough to stay well under systemd's default 90s TimeoutStopSec even
+// when other shutdown work is queued behind us.
 func (c *Client) Close() error {
 	if c.modemHandler != nil {
 		c.modemHandler.Stop()
@@ -201,5 +205,5 @@ func (c *Client) Close() error {
 	if c.settingsWatch != nil {
 		c.settingsWatch.Stop()
 	}
-	return c.client.Close()
+	return c.client.CloseWithTimeout(10 * time.Second)
 }

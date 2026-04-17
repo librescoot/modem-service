@@ -100,6 +100,13 @@ type Service struct {
 	// overlapping goroutines on rapid connectivity changes.
 	modePubMu      sync.Mutex
 	lastPubGPSMode location.GPSMode
+
+	// monitorDone is closed by monitorStatus when it returns, so Run() can
+	// wait for it before closing MMClient/Modem/Redis. Prevents the "D-Bus
+	// call fails mid-shutdown" noise where the monitor goroutine is in the
+	// middle of an AT command when its transport gets closed out from under
+	// it.
+	monitorDone chan struct{}
 }
 
 func New(cfg *config.Config, logger *log.Logger, version string) (*Service, error) {
@@ -132,6 +139,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
 		connClassifier:      connectivity.New(),
+		monitorDone:         make(chan struct{}),
 	}
 	service.gpsEnabled.Store(true)           // default: GPS on
 	service.cellLocationEnabled.Store(false) // default: cell location off
@@ -192,6 +200,16 @@ func (s *Service) Run(ctx context.Context) error {
 	go s.monitorStatus(ctx)
 
 	<-ctx.Done()
+
+	// Give the monitor goroutine a chance to exit its current tick before
+	// we tear down MMClient/Modem/Redis. Without this, an AT command or
+	// D-Bus call in-flight will error out when its transport is closed,
+	// producing noise in the journal. Bounded so shutdown stays snappy.
+	select {
+	case <-s.monitorDone:
+	case <-time.After(10 * time.Second):
+		s.Logger.Printf("Monitor goroutine did not exit within 10s; proceeding with shutdown")
+	}
 
 	// Graceful shutdown: keep last lat/lng in Redis as a useful fallback
 	// for consumers, but clear the fix indicators so nobody treats the
@@ -455,6 +473,10 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Strategy 2: Try USB unbind/bind recovery
 	s.Logger.Printf("Attempting USB recovery (unbind/bind)...")
 	if err := s.Modem.RecoverUSB(); err != nil {
@@ -470,6 +492,10 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// Strategy 3: Try hardware reset via GPIO
 	s.Logger.Printf("Attempting modem restart (GPIO with D-Bus fallback)...")
 	if err := s.Modem.RestartModem(ctx); err != nil {
@@ -483,6 +509,10 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 			s.recoverySucceeded(ctx, "GPIO restart")
 			return nil
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Strategy 4: Just wait longer and hope the modem recovers
@@ -1088,6 +1118,7 @@ func (s *Service) checkGPSHealth() error {
 }
 
 func (s *Service) monitorStatus(ctx context.Context) {
+	defer close(s.monitorDone)
 	ticker := time.NewTicker(s.Config.InternetCheckTime)
 	gpsTimer := time.NewTicker(location.GPSUpdateInterval)
 	cellTimer := time.NewTicker(location.CellLocationUpdateInterval)
