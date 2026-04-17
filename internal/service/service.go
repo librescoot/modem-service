@@ -32,6 +32,13 @@ var modemOnlineStates = map[string]bool{
 // with the higher-precision source.
 const clockSyncInterval = 60 * time.Second
 
+// dataSessionStallTimeout is how long the modem is allowed to stay in a
+// non-"connected" status while still registered to the carrier before we
+// force a recovery cycle. Tuned generously so tunnels, underground parking,
+// and normal handoffs don't trigger spurious resets; only truly wedged data
+// sessions should cross this threshold.
+const dataSessionStallTimeout = 15 * time.Minute
+
 type Service struct {
 	Config                *config.Config
 	Redis                 *redisClient.Client
@@ -50,6 +57,14 @@ type Service struct {
 	gpsRecoveryInProgress bool       // Tracks if GPS recovery is currently running
 	gpsRecoveryUntil      time.Time  // Protected by gpsRecoveryMutex; monitor skips EnableGPS until this passes
 	connectivityFailures  int        // Consecutive internet connectivity check failures
+
+	// disconnectedSince is set on the first tick where the modem reports
+	// status != "connected" (zero otherwise). When we're still registered to
+	// the carrier but the data session hasn't come back after
+	// dataSessionStallTimeout, we escalate to handleModemFailure. Without this
+	// path nothing triggers recovery if the modem says "disconnected" — the
+	// TCP-probe counter only runs while status == "connected".
+	disconnectedSince time.Time
 
 	lastClockSync time.Time // Last time syncClockFromGPS successfully fed chrony
 
@@ -861,6 +876,29 @@ func (s *Service) syncClockFromGPS(t time.Time) bool {
 	return true
 }
 
+// shouldEscalateDisconnection decides whether the data-session stall watchdog
+// should force a recovery cycle. We only escalate when the modem is still
+// talking to the carrier (reg=home/roaming) and the error state isn't
+// something a modem reset can't fix (SIM locked/missing, registration denied
+// or outright failed). Searching/idle are left alone — those are signal or
+// coverage issues, and power-cycling the modem won't conjure a tower.
+func (s *Service) shouldEscalateDisconnection(state *modem.State) bool {
+	if s.disconnectedSince.IsZero() {
+		return false
+	}
+	if time.Since(s.disconnectedSince) < dataSessionStallTimeout {
+		return false
+	}
+	if state.Registration != modem.RegistrationHome && state.Registration != modem.RegistrationRoaming {
+		return false
+	}
+	switch state.ErrorState {
+	case "sim-locked", "sim-missing", "registration-denied", "registration-failed":
+		return false
+	}
+	return true
+}
+
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	if err := s.checkHealth(ctx); err != nil {
 		s.Logger.Printf("Health check failed: %v", err)
@@ -885,7 +923,8 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		connected, connErr := health.CheckInternetConnectivity(ctx, s.Config.Interface)
 		if connected {
 			internetStatus = "connected"
-			s.connectivityFailures = 0 // Reset on success
+			s.connectivityFailures = 0        // Reset on success
+			s.disconnectedSince = time.Time{} // Reset the stall watchdog
 		} else {
 			s.connectivityFailures++
 			if connErr != nil {
@@ -917,6 +956,33 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	} else {
 		internetStatus = "disconnected"
 		s.connectivityFailures = 0 // Reset if modem not connected
+
+		// Data-session stall watchdog: if we're registered to the carrier
+		// but the modem's data session has been down for too long, force a
+		// recovery cycle. Without this path nothing ever triggers recovery
+		// for a wedged PDP context — the TCP probe above only runs while
+		// status == "connected".
+		if s.disconnectedSince.IsZero() {
+			s.disconnectedSince = time.Now()
+		}
+		if s.shouldEscalateDisconnection(currentState) {
+			stall := time.Since(s.disconnectedSince)
+			// Publish the disconnected state first so consumers see it
+			// before the recovery path runs.
+			if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
+				s.Logger.Printf("Failed to publish disconnected state before stall recovery: %v", err)
+			}
+			s.Logger.Printf("Data session stalled for %v with reg=%s error=%s, attempting recovery",
+				stall.Round(time.Second), currentState.Registration, currentState.ErrorState)
+			// Reset the clock so we don't re-trigger on the next tick while
+			// recovery is working; handleModemFailure success will also
+			// clear it naturally via the "connected" branch.
+			s.disconnectedSince = time.Now()
+			if recoveryErr := s.handleModemFailure(ctx, "data_session_stalled"); recoveryErr != nil {
+				s.Logger.Printf("Failed to initiate stall recovery: %v", recoveryErr)
+			}
+			return nil
+		}
 	}
 
 	if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {

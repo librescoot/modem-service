@@ -477,3 +477,45 @@ func TestGPSStatusMapping(t *testing.T) {
 		t.Errorf("Expected state to be 'off', got '%s'", status["state"])
 	}
 }
+
+// TestShouldEscalateDisconnection exercises the data-session stall watchdog's
+// inclusion/exclusion logic. The watchdog must fire only when the modem is
+// still registered to the carrier (home/roaming) and the error state isn't
+// something a reset can't fix.
+func TestShouldEscalateDisconnection(t *testing.T) {
+	stale := time.Now().Add(-(dataSessionStallTimeout + time.Minute))
+	fresh := time.Now().Add(-1 * time.Minute)
+
+	cases := []struct {
+		name              string
+		disconnectedSince time.Time
+		reg               string
+		errorState        string
+		want              bool
+	}{
+		{"zero disconnectedSince never escalates", time.Time{}, modem.RegistrationHome, "ok", false},
+		{"fresh disconnect below threshold", fresh, modem.RegistrationHome, "ok", false},
+		{"stale + home + ok -> escalate", stale, modem.RegistrationHome, "ok", true},
+		{"stale + roaming + ok -> escalate", stale, modem.RegistrationRoaming, "ok", true},
+		{"stale + searching -> no escalation", stale, "searching", "ok", false},
+		{"stale + idle -> no escalation", stale, "idle", "ok", false},
+		{"stale + denied -> no escalation", stale, modem.RegistrationDenied, "registration-denied", false},
+		{"stale + failed -> no escalation", stale, modem.RegistrationFailed, "registration-failed", false},
+		{"stale + home but sim-locked -> no escalation", stale, modem.RegistrationHome, "sim-locked", false},
+		{"stale + home but sim-missing -> no escalation", stale, modem.RegistrationHome, "sim-missing", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Service{disconnectedSince: tc.disconnectedSince}
+			state := &modem.State{
+				Registration: tc.reg,
+				ErrorState:   tc.errorState,
+			}
+			got := s.shouldEscalateDisconnection(state)
+			if got != tc.want {
+				t.Errorf("shouldEscalateDisconnection() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
