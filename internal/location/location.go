@@ -67,6 +67,15 @@ func (m GPSMode) cgpsArg() string {
 // should be corrected by adding multiples of gpsWeekRollover.
 var MinValidGPSDate = time.Date(2019, 4, 7, 0, 0, 0, 0, time.UTC)
 
+// age formats a time.Time as a human-readable age relative to now. Returns
+// "never" for zero values so log output doesn't show absurd durations.
+func age(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	return time.Since(t).Round(time.Millisecond).String()
+}
+
 // correctGPSWeekRollover compensates for receivers stuck in an older GPS week
 // rollover epoch by advancing the timestamp by 1024 weeks until it falls inside
 // the current epoch. Returns the (possibly unchanged) timestamp and whether a
@@ -265,25 +274,47 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 				// Double-check after acquiring lock (another goroutine might have configured it)
 				if s.GpsdConn == nil {
 					// On first attempt, try connecting to gpsd without reconfiguring GPS
-					// (GPS might already be running from previous service instance)
+					// (GPS might already be running from previous service instance).
+					// We require an actual valid fix — not just any TPV — because
+					// a no-fix TPV (mode=1) can arrive from a half-configured chip
+					// and would wrongly convince us to skip full reconfiguration.
 					if attempt == 0 && s.gpsFreshInit.Load() {
 						s.Logger.Printf("Trying to connect to existing gpsd...")
 						if err := s.connectToGPSD(); err == nil {
-							s.Logger.Printf("Connected to gpsd, checking for GPS data...")
+							s.Logger.Printf("Connected to gpsd, probing chip state and waiting for valid fix (up to 5s)...")
 							s.configMutex.Unlock()
 
-							// Wait briefly to see if we get GPS data
-							select {
-							case <-stopChan:
-								return
-							case <-time.After(3 * time.Second):
+							// Log current chip state so post-hibernation half-configured
+							// cases are visible in the journal.
+							probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+							s.probeChipState(probeCtx)
+							probeCancel()
+
+							// Poll every 500ms for up to 5s — exit early once
+							// we see a valid fix instead of always waiting 5s.
+							probeDeadline := time.Now().Add(5 * time.Second)
+							haveFix := false
+							for time.Now().Before(probeDeadline) {
+								if s.hasValidFix.Load() {
+									haveFix = true
+									break
+								}
+								select {
+								case <-stopChan:
+									return
+								case <-time.After(500 * time.Millisecond):
+								}
 							}
 
 							s.stateMutex.RLock()
 							lastData := s.lastDataReceived
+							lastFix := s.lastFix
 							s.stateMutex.RUnlock()
-							if lastData.After(time.Now().Add(-5 * time.Second)) {
-								s.Logger.Printf("GPS already running, reusing existing connection")
+							s.Logger.Printf("reuse probe: haveFix=%v lastData=%s lastFix=%s",
+								haveFix, age(lastData), age(lastFix))
+
+							if haveFix {
+								s.Logger.Printf("GPS already running with valid fix, reusing existing connection")
 								// Probe so currentMode reflects the actual
 								// modem state instead of a zero-value default.
 								s.ProbeGPSMode(context.Background())
@@ -292,8 +323,8 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 								continue
 							}
 
-							// No data, need to reconfigure
-							s.Logger.Printf("No GPS data received from gpsd, will reconfigure")
+							// No valid fix, need to reconfigure
+							s.Logger.Printf("No valid fix from existing gpsd, will reconfigure")
 							s.configMutex.Lock()
 							if s.GpsdConn != nil {
 								s.GpsdConn.Close()
@@ -595,6 +626,28 @@ func (s *Service) CurrentGPSMode() GPSMode {
 	return s.currentMode
 }
 
+// probeChipState logs the current GPS chip configuration: AT+CGPS? (enabled
+// and mode), AT+CVAUXV? (antenna voltage), AT+CVAUXS? (antenna power enable).
+// Used to make post-hibernation half-configured states visible in the journal
+// when we'd otherwise reuse an existing gpsd connection without reconfiguring.
+// Safe to call even if ModemPath isn't set (returns silently).
+func (s *Service) probeChipState(ctx context.Context) {
+	if s.ModemPath == "" {
+		return
+	}
+	probe := func(label, cmd string) {
+		resp, err := s.sendATCommand(ctx, cmd, false)
+		if err != nil {
+			s.Logger.Printf("chip probe: %s=%s err=%v", label, cmd, err)
+			return
+		}
+		s.Logger.Printf("chip probe: %s -> %s", label, strings.TrimSpace(resp))
+	}
+	probe("cgps", "AT+CGPS?")
+	probe("cvauxv", "AT+CVAUXV?")
+	probe("cvauxs", "AT+CVAUXS?")
+}
+
 // ProbeGPSMode queries the modem with AT+CGPS? and records whatever mode
 // it's currently running. Used at service startup when GPS is already running
 // from a previous service instance, so we don't default to a wrong mode.
@@ -889,17 +942,26 @@ func (s *Service) connectToGPSD() error {
 		s.lastDataReceived = time.Now()
 		s.stateMutex.Unlock()
 
-		// Update fix status
+		// Update fix status; log mode transitions so silent "stuck at mode=1"
+		// windows are visible even before a valid fix is ever established.
+		prevMode := s.fixMode.Load().(string)
+		var newMode string
 		switch report.Mode {
 		case 0, 1:
-			s.fixMode.Store("none")
+			newMode = "none"
 			s.state.Store("searching")
 		case 2:
-			s.fixMode.Store("2d")
+			newMode = "2d"
 			s.state.Store("fix-established")
 		case 3:
-			s.fixMode.Store("3d")
+			newMode = "3d"
 			s.state.Store("fix-established")
+		}
+		if newMode != "" {
+			s.fixMode.Store(newMode)
+			if newMode != prevMode {
+				s.Logger.Printf("tpv mode transition: %s -> %s (raw=%d)", prevMode, newMode, report.Mode)
+			}
 		}
 
 		// Update error estimates from TPV report
