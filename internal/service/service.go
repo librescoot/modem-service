@@ -875,7 +875,13 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 		data[k] = v
 	}
 
-	return s.Redis.PublishLocationState(data, publishRecovery)
+	if err := s.Redis.PublishLocationState(data, publishRecovery); err != nil {
+		return err
+	}
+	if err := s.Redis.PublishGPSSnapshot(data); err != nil {
+		s.Logger.Printf("Failed to publish GPS snapshot: %v", err)
+	}
+	return nil
 }
 
 // syncClockFromGPS feeds chrony a single time sample via `chronyc settime`.
@@ -1317,6 +1323,26 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					}
 					if err := s.Redis.PublishLocationState(data, false); err != nil {
 						s.Logger.Printf("Failed to publish GPS status: %v", err)
+					}
+
+					// Pub/sub snapshot includes the (stale) last-known location
+					// alongside zeroed quality fields. Subscribers key off
+					// active=false to ignore the position; including it keeps
+					// the snapshot a complete view of the hash state.
+					loc := s.Location.CurrentLoc()
+					snapshot := map[string]interface{}{
+						"latitude":  fmt.Sprintf("%.6f", loc.Latitude),
+						"longitude": fmt.Sprintf("%.6f", loc.Longitude),
+						"altitude":  fmt.Sprintf("%.6f", loc.Altitude),
+						"speed":     fmt.Sprintf("%.6f", loc.Speed*3.6),
+						"course":    fmt.Sprintf("%.6f", loc.Course),
+						"timestamp": loc.Timestamp.Format(time.RFC3339),
+					}
+					for k, v := range data {
+						snapshot[k] = v
+					}
+					if err := s.Redis.PublishGPSSnapshot(snapshot); err != nil {
+						s.Logger.Printf("Failed to publish GPS snapshot: %v", err)
 					}
 				}
 			}

@@ -1,12 +1,19 @@
 package redis
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
 )
+
+// GPSSnapshotChannel is the pub/sub channel that carries full GPS TPV snapshots
+// as JSON. Consumers can subscribe here to receive pushed updates instead of
+// polling the `gps` hash. The hash is still maintained for backward-compatible
+// readers; this channel is purely additive.
+const GPSSnapshotChannel = "gps:tpv"
 
 // Fault codes for modem issues
 const (
@@ -109,6 +116,24 @@ func (c *Client) PublishLocationState(data map[string]interface{}, publishRecove
 	if err != nil {
 		c.logger.Printf("Unable to set location in redis: %v", err)
 		return fmt.Errorf("cannot write location to redis: %v", err)
+	}
+	return nil
+}
+
+// PublishGPSSnapshot publishes a full TPV snapshot to the gps:tpv pub/sub
+// channel as JSON. Subscribers get the complete current GPS state in one
+// message — no HGETALL roundtrip needed. Async (fire-and-forget); send loss
+// on a wedged Redis is acceptable because the next tick will publish again
+// and any polling consumer can still read the hash.
+func (c *Client) PublishGPSSnapshot(data map[string]interface{}) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		c.logger.Printf("Unable to encode GPS snapshot: %v", err)
+		return fmt.Errorf("encode gps snapshot: %v", err)
+	}
+	if _, err := c.client.Publish(GPSSnapshotChannel, payload); err != nil {
+		c.logger.Printf("Unable to publish GPS snapshot: %v", err)
+		return fmt.Errorf("publish gps snapshot: %v", err)
 	}
 	return nil
 }
