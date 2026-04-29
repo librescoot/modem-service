@@ -1308,8 +1308,10 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					// publish recovery when no fix). All SKY-derived fields
 					// (sat counts, SNR, DOPs) pass through the cached atomics
 					// — they stay meaningful during search and show
-					// acquisition progress. EPH is TPV/fix-specific so it
-					// stays zeroed to avoid lingering last-good-fix values.
+					// acquisition progress. EPH/EPS/EPT are TPV/fix-specific
+					// (horizontal/speed/time error estimates of the current
+					// fix) so they're zeroed to avoid lingering last-good-fix
+					// values in the hash and pub/sub snapshot.
 					data := map[string]interface{}{
 						"fix":                gpsStatus["fix"],
 						"snr":                gpsStatus["snr"],
@@ -1320,6 +1322,8 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						"vdop":               gpsStatus["vdop"],
 						"pdop":               gpsStatus["pdop"],
 						"eph":                float64(0),
+						"eps":                float64(0),
+						"ept":                float64(0),
 						"satellites-used":    gpsStatus["satellites-used"],
 						"satellites-visible": gpsStatus["satellites-visible"],
 					}
