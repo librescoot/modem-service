@@ -1305,21 +1305,23 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					}
 
 					// Publish just the status without location data (never
-					// publish recovery when no fix). Explicitly zero the
-					// quality/satellite fields so consumers don't see stale
-					// DOP/sats numbers lingering from the last good fix.
+					// publish recovery when no fix). All SKY-derived fields
+					// (sat counts, SNR, DOPs) pass through the cached atomics
+					// — they stay meaningful during search and show
+					// acquisition progress. EPH is TPV/fix-specific so it
+					// stays zeroed to avoid lingering last-good-fix values.
 					data := map[string]interface{}{
 						"fix":                gpsStatus["fix"],
 						"snr":                gpsStatus["snr"],
 						"active":             gpsStatus["active"],
 						"connected":          gpsStatus["connected"],
 						"state":              gpsStatus["state"],
-						"hdop":               float64(0),
-						"vdop":               float64(0),
-						"pdop":               float64(0),
+						"hdop":               gpsStatus["hdop"],
+						"vdop":               gpsStatus["vdop"],
+						"pdop":               gpsStatus["pdop"],
 						"eph":                float64(0),
-						"satellites-used":    int32(0),
-						"satellites-visible": int32(0),
+						"satellites-used":    gpsStatus["satellites-used"],
+						"satellites-visible": gpsStatus["satellites-visible"],
 					}
 					if err := s.Redis.PublishLocationState(data, false); err != nil {
 						s.Logger.Printf("Failed to publish GPS status: %v", err)
