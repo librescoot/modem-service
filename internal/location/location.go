@@ -914,17 +914,32 @@ func (s *Service) connectToGPSD() error {
 		s.pdop.Store(report.Pdop)
 		if len(report.Satellites) > 0 {
 			var used int32
-			var snrSum float64
+			var usedSnrSum, visSnrSum float64
+			var visCount int
 			for _, sat := range report.Satellites {
 				if sat.Used {
 					used++
-					snrSum += sat.Ss
+					usedSnrSum += sat.Ss
+				}
+				if sat.Ss > 0 {
+					visSnrSum += sat.Ss
+					visCount++
 				}
 			}
 			s.satsUsed.Store(used)
 			s.satsVisible.Store(int32(len(report.Satellites)))
-			if used > 0 {
-				s.snr.Store(snrSum / float64(used))
+			// Prefer the average SNR over satellites used in the fix; if
+			// none are used (typical during search), fall back to the
+			// average over visible birds with measurable signal so the
+			// reading stays live instead of sticking at the last fix's
+			// value indefinitely.
+			switch {
+			case used > 0:
+				s.snr.Store(usedSnrSum / float64(used))
+			case visCount > 0:
+				s.snr.Store(visSnrSum / float64(visCount))
+			default:
+				s.snr.Store(float64(0))
 			}
 		}
 	})
