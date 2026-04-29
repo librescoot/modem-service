@@ -942,12 +942,23 @@ func (s *Service) connectToGPSD() error {
 		s.lastDataReceived = time.Now()
 		s.stateMutex.Unlock()
 
+		// gpsd Mode==0 (NoValueSeen) means the report carries no mode/fix
+		// info — typically a cycle-continuation TPV or a partial JSON update
+		// where the mode field wasn't repeated. Treating it as "no fix" (as
+		// we used to) caused spurious fix-loss flicker because every such
+		// TPV would flip hasValidFix=false until the next mode==3 arrived,
+		// taking the no-fix publish branch with it. Preserve state instead:
+		// no field updates, no fix-state change.
+		if report.Mode == 0 {
+			return
+		}
+
 		// Update fix status; log mode transitions so silent "stuck at mode=1"
 		// windows are visible even before a valid fix is ever established.
 		prevMode := s.fixMode.Load().(string)
 		var newMode string
 		switch report.Mode {
-		case 0, 1:
+		case 1:
 			newMode = "none"
 			s.state.Store("searching")
 		case 2:
@@ -969,7 +980,7 @@ func (s *Service) connectToGPSD() error {
 		s.eps.Store(report.Eps)
 		s.ept.Store(report.Ept)
 
-		if report.Mode == 1 || report.Mode == 0 {
+		if report.Mode == 1 {
 			if s.hasValidFix.Swap(false) {
 				s.Logger.Printf("GPS fix lost: tpv mode=%d", report.Mode)
 			}
