@@ -38,8 +38,27 @@ func NewRecovery(logger func(string, ...interface{})) *Recovery {
 	}
 }
 
-// Unbind unbinds the USB device from the driver
+// ErrDeviceNotPresent is returned when USB recovery is attempted while the
+// device is not currently bound to the USB bus. This happens during a
+// ModemManager reset window where the modem is transiently off the bus and
+// will reappear on its own; unbind/bind would just fail with "no such
+// device". Callers should treat this as a hint to wait or escalate past
+// USB recovery rather than as a failure.
+var ErrDeviceNotPresent = errors.New("USB device not present on bus")
+
+// Present reports whether the USB device is currently bound to the bus.
+func (r *Recovery) Present() bool {
+	_, err := os.Stat("/sys/bus/usb/devices/" + r.device)
+	return err == nil
+}
+
+// Unbind unbinds the USB device from the driver. Returns ErrDeviceNotPresent
+// if the device isn't currently bound (transient absence during MM reset).
 func (r *Recovery) Unbind() error {
+	if !r.Present() {
+		r.log("USB device %s not present on bus, skipping unbind", r.device)
+		return ErrDeviceNotPresent
+	}
 	r.log("Unbinding USB device %s...", r.device)
 
 	f, err := os.OpenFile(USBUnbindPath, os.O_WRONLY, 0)

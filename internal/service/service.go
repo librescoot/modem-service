@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"modem-service/internal/modem"
 	"modem-service/internal/modem/connectivity"
 	redisClient "modem-service/internal/redis"
+	"modem-service/internal/usb"
 )
 
 // Vehicle states that should trigger modem enable
@@ -140,6 +142,9 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		connClassifier:      connectivity.New(),
 		monitorDone:         make(chan struct{}),
 	}
+	// Let the location service re-resolve the modem D-Bus path when MM
+	// rebinds the modem (e.g. after mmcli --reset or AT+CFUN=0/1).
+	service.Location.ResolveModemPath = modemMgr.FindModem
 	service.gpsEnabled.Store(true)           // default: GPS on
 	service.cellLocationEnabled.Store(false) // default: cell location off
 	service.modemEnabled.Store(true)         // default: modem on until pm-service says otherwise
@@ -478,7 +483,20 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 	// Strategy 2: Try USB unbind/bind recovery
 	s.Logger.Printf("Attempting USB recovery (unbind/bind)...")
 	if err := s.Modem.RecoverUSB(); err != nil {
-		s.Logger.Printf("USB recovery failed: %v", err)
+		if errors.Is(err, usb.ErrDeviceNotPresent) {
+			// Modem is transiently off the bus (typical mid-reset). Wait
+			// briefly for it to reappear; if it does, skip USB recovery.
+			s.Logger.Printf("USB device not present, waiting up to %v for modem to reappear on D-Bus", health.RecoveryWaitTime)
+			waitCtx, waitCancel := context.WithTimeout(ctx, health.RecoveryWaitTime)
+			err := s.Modem.WaitForModem(waitCtx, s.Config.Interface)
+			waitCancel()
+			if err == nil && s.probeHealth() {
+				s.recoverySucceeded(ctx, "MM rebind wait")
+				return nil
+			}
+		} else {
+			s.Logger.Printf("USB recovery failed: %v", err)
+		}
 	} else {
 		usbCtx, usbCancel := context.WithTimeout(ctx, health.RecoveryWaitTime)
 		err := s.Modem.WaitForModem(usbCtx, s.Config.Interface)

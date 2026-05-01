@@ -106,15 +106,21 @@ type Location struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// ModemPathResolver re-resolves the current ModemManager modem object path.
+// Wired by service.go to s.Modem.FindModem so location can recover when MM
+// rebinds the modem (e.g. after a soft reset, AT+CFUN=0/1, mmcli --reset).
+type ModemPathResolver func() (dbus.ObjectPath, error)
+
 type Service struct {
-	ModemPath  dbus.ObjectPath
-	MMClient   *mm.Client
-	Config     Config
-	Enabled    bool
-	Logger     *log.Logger
-	GpsdConn   *gpsd.Session
-	GpsdServer string
-	Done       chan bool
+	ModemPath        dbus.ObjectPath
+	ResolveModemPath ModemPathResolver
+	MMClient         *mm.Client
+	Config           Config
+	Enabled          bool
+	Logger           *log.Logger
+	GpsdConn         *gpsd.Session
+	GpsdServer       string
+	Done             chan bool
 
 	// GPS state fields — written by gpsd callbacks, read by monitorStatus.
 	// Simple scalars use atomics; compound types (Location, time.Time) use stateMutex.
@@ -456,6 +462,37 @@ func (s *Service) doGPSConfiguration(ctx context.Context) error {
 	return nil
 }
 
+// isStalePathError reports whether err is the ModemManager-rebind signature:
+// "Object does not exist at path". Comes through godbus as the message
+// portion of an org.freedesktop.DBus.Error.UnknownObject error.
+func isStalePathError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Object does not exist at path") ||
+		strings.Contains(msg, "UnknownObject")
+}
+
+// refreshModemPathIfStale checks whether err is a stale-path error and, if a
+// resolver is wired, asks it for the current path. Updates s.ModemPath in
+// place when the path has actually changed and returns true so the caller
+// can retry. Returns false (no retry) if err isn't a stale-path error, no
+// resolver is configured, the resolver itself fails, or the path is
+// unchanged (the failure is something else).
+func (s *Service) refreshModemPathIfStale(err error) bool {
+	if !isStalePathError(err) || s.ResolveModemPath == nil {
+		return false
+	}
+	newPath, rerr := s.ResolveModemPath()
+	if rerr != nil || newPath == s.ModemPath {
+		return false
+	}
+	s.Logger.Printf("ModemManager rebind detected: modem path %s -> %s", s.ModemPath, newPath)
+	s.ModemPath = newPath
+	return true
+}
+
 // sendATCommand is a helper to send AT commands with context and logging support.
 //
 // When ctx is cancelled while a command is in flight we return immediately,
@@ -464,32 +501,44 @@ func (s *Service) doGPSConfiguration(ctx context.Context) error {
 // no interruptible D-Bus call on godbus, so we accept that bounded drift.
 // The done channel is buffered so the goroutine never blocks on send even
 // after the caller has given up, guaranteeing it exits within the timeout.
+//
+// On a stale-path error (ModemManager rebound the modem under a new D-Bus
+// object path, e.g. after AT+CFUN=0/1 or mmcli --reset) we re-resolve via
+// the configured ModemPathResolver and retry once.
 func (s *Service) sendATCommand(ctx context.Context, command string, logResponse bool) (string, error) {
-	done := make(chan struct {
-		response string
-		err      error
-	}, 1)
-
-	go func() {
-		response, err := s.MMClient.SendCommand(s.ModemPath, command, 10*time.Second)
-		done <- struct {
+	send := func() (string, error) {
+		done := make(chan struct {
 			response string
 			err      error
-		}{response, err}
-	}()
+		}, 1)
 
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case result := <-done:
-		if result.err != nil {
-			return "", result.err
+		go func() {
+			response, err := s.MMClient.SendCommand(s.ModemPath, command, 10*time.Second)
+			done <- struct {
+				response string
+				err      error
+			}{response, err}
+		}()
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case result := <-done:
+			return result.response, result.err
 		}
-		if logResponse && result.response != "" {
-			s.Logger.Printf("%s -> %s", command, result.response)
-		}
-		return result.response, nil
 	}
+
+	response, err := send()
+	if err != nil && s.refreshModemPathIfStale(err) {
+		response, err = send()
+	}
+	if err != nil {
+		return "", err
+	}
+	if logResponse && response != "" {
+		s.Logger.Printf("%s -> %s", command, response)
+	}
+	return response, nil
 }
 
 // configureGPSViaATCommands configures GPS using AT commands for optimal performance
@@ -738,7 +787,11 @@ func (s *Service) setGPSRefreshRate(ctx context.Context) error {
 	// Set GPS refresh rate to 1 second (matches GPSUpdateInterval)
 	refreshSeconds := uint32(s.Config.RefreshRate.Seconds())
 
-	if err := s.MMClient.SetGPSRefreshRate(s.ModemPath, refreshSeconds); err != nil {
+	err := s.MMClient.SetGPSRefreshRate(s.ModemPath, refreshSeconds)
+	if err != nil && s.refreshModemPathIfStale(err) {
+		err = s.MMClient.SetGPSRefreshRate(s.ModemPath, refreshSeconds)
+	}
+	if err != nil {
 		return fmt.Errorf("failed to set GPS refresh rate to %ds: %v", refreshSeconds, err)
 	}
 	s.Logger.Printf("Set GPS refresh rate to %d second(s)", refreshSeconds)
@@ -760,6 +813,9 @@ func (s *Service) getLocationStatusWithTimeout(ctx context.Context) (*LocationSt
 
 	go func() {
 		enabled, err := s.MMClient.GetEnabledLocationSources(s.ModemPath)
+		if err != nil && s.refreshModemPathIfStale(err) {
+			enabled, err = s.MMClient.GetEnabledLocationSources(s.ModemPath)
+		}
 		if err != nil {
 			done <- result{nil, err}
 			return
@@ -787,7 +843,11 @@ func (s *Service) disableConflictingSources(ctx context.Context, enabledSources 
 		newSources := enabledSources &^ conflictingMask
 		s.Logger.Printf("Disabling conflicting GPS sources (nmea/raw), new mask: 0x%x", newSources)
 
-		if err := s.MMClient.SetupLocation(s.ModemPath, newSources, false); err != nil {
+		err := s.MMClient.SetupLocation(s.ModemPath, newSources, false)
+		if err != nil && s.refreshModemPathIfStale(err) {
+			err = s.MMClient.SetupLocation(s.ModemPath, newSources, false)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to disable conflicting sources: %v", err)
 		}
 	}
@@ -821,6 +881,9 @@ func (s *Service) enableLocationSources(ctx context.Context, currentSources uint
 		var enableErr error
 		for attempt := 0; attempt < 3; attempt++ {
 			enableErr = s.MMClient.SetupLocation(s.ModemPath, finalSources, false)
+			if enableErr != nil && s.refreshModemPathIfStale(enableErr) {
+				enableErr = s.MMClient.SetupLocation(s.ModemPath, finalSources, false)
+			}
 			if enableErr == nil {
 				s.Logger.Printf("Location sources enabled successfully")
 				break
