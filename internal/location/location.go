@@ -19,7 +19,6 @@ const (
 	GPSUpdateInterval          = 1 * time.Second
 	CellLocationUpdateInterval = 5 * time.Second
 	GPSTimeout                 = 10 * time.Minute
-	GPSTimestampStaleness      = 180 * time.Second
 	MaxGPSRetries              = 10
 	GPSRetryInterval           = 5 * time.Second
 	GPSConfigTimeout           = 30 * time.Second
@@ -134,12 +133,10 @@ type Service struct {
 	state         atomic.Value // string: "off", "searching", "fix-established", "error"
 
 	// Protected by stateMutex — compound types that can't use atomics
-	stateMutex             sync.RWMutex
-	currentLoc             Location
-	lastFix                time.Time
-	lastDataReceived       time.Time // Last time any GPS data was received (even without fix)
-	lastGPSTimestamp       time.Time // Last GPS timestamp received from GPSD
-	lastGPSTimestampUpdate time.Time // When we last saw the GPS timestamp change
+	stateMutex       sync.RWMutex
+	currentLoc       Location
+	lastFix          time.Time
+	lastDataReceived time.Time // Last time any GPS data was received (even without fix)
 
 	// Accessed only from the main goroutine or under explicit coordination
 	GPSLostTime  time.Time   // Time when GPS fix was lost
@@ -212,24 +209,16 @@ func (s *Service) CurrentLoc() Location {
 	return s.currentLoc
 }
 
-func (s *Service) LastGPSTimestampUpdate() time.Time {
+func (s *Service) LastDataReceived() time.Time {
 	s.stateMutex.RLock()
 	defer s.stateMutex.RUnlock()
-	return s.lastGPSTimestampUpdate
+	return s.lastDataReceived
 }
 
-func (s *Service) ResetTimestampTracking() {
+func (s *Service) SetLastDataReceived(t time.Time) {
 	s.stateMutex.Lock()
 	defer s.stateMutex.Unlock()
-	s.lastGPSTimestamp = time.Time{}
-	s.lastGPSTimestampUpdate = time.Time{}
-	s.lastDataReceived = time.Time{}
-}
-
-func (s *Service) SetLastGPSTimestampUpdate(t time.Time) {
-	s.stateMutex.Lock()
-	defer s.stateMutex.Unlock()
-	s.lastGPSTimestampUpdate = t
+	s.lastDataReceived = t
 }
 
 func (s *Service) SetHasValidFix(v bool) {
@@ -728,11 +717,10 @@ func (s *Service) SetGPSMode(ctx context.Context, mode GPSMode) error {
 		s.Logger.Printf("GPS start command reported %v but CGPS? confirms %s mode", startErr, mode)
 	}
 	s.currentMode = mode
-	// Reset the GPS-timestamp staleness clock. Our CGPS=0 / sleep 3s /
-	// CGPS=1,X dance briefly silences gpsd; without this reset, a pre-
-	// existing aging timestamp could trip checkGPSHealth's 180s stuck
-	// window mid-session and cause a self-inflicted recovery.
-	s.SetLastGPSTimestampUpdate(time.Now())
+	// Bump the no-data watchdog. Our CGPS=0 / sleep 3s / CGPS=1,X dance
+	// briefly silences gpsd; without this reset the next checkGPSHealth
+	// could trip on the silence and cause a self-inflicted recovery.
+	s.SetLastDataReceived(time.Now())
 	s.Logger.Printf("GPS running in %s mode", mode)
 	return nil
 }
@@ -909,6 +897,10 @@ func (s *Service) connectToGPSD() error {
 			return
 		}
 
+		s.stateMutex.Lock()
+		s.lastDataReceived = time.Now()
+		s.stateMutex.Unlock()
+
 		s.hdop.Store(report.Hdop)
 		s.vdop.Store(report.Vdop)
 		s.pdop.Store(report.Pdop)
@@ -1034,15 +1026,6 @@ func (s *Service) connectToGPSD() error {
 				})
 			}
 			rawLocation.Timestamp = gpsTime
-
-			// Track GPS timestamp changes (use corrected time so staleness
-			// detection still works after rollover compensation).
-			s.stateMutex.Lock()
-			if s.lastGPSTimestamp.IsZero() || !gpsTime.Equal(s.lastGPSTimestamp) {
-				s.lastGPSTimestamp = gpsTime
-				s.lastGPSTimestampUpdate = time.Now()
-			}
-			s.stateMutex.Unlock()
 		} else {
 			rawLocation.Timestamp = time.Now()
 		}

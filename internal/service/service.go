@@ -49,7 +49,6 @@ type Service struct {
 	MMClient              *mm.Client
 	LastState             *modem.State
 	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
-	LastGPSDataTime       time.Time  // Last time we received any GPS data
 	GPSEnabledTime        time.Time  // When GPS was first enabled
 	GPSRecoveryCount      int        // Number of GPS recovery attempts
 	LastGPSQualityLog     time.Time  // Last time GPS quality was logged
@@ -591,10 +590,9 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 		s.Location.Close()
 
 		// Reset state tracking
-		s.LastGPSDataTime = time.Time{}
 		s.GPSEnabledTime = time.Time{}
 		s.WaitingForGPSLogged = false
-		s.Location.ResetTimestampTracking()
+		s.Location.SetLastDataReceived(time.Time{})
 
 		// Gate the monitor loop rather than sleeping under the mutex.
 		s.gpsRecoveryMutex.Lock()
@@ -619,10 +617,9 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 	s.gpsRecoveryMutex.Unlock()
 
 	// Reset GPS state tracking
-	s.LastGPSDataTime = time.Time{}
 	s.GPSEnabledTime = time.Time{}
 	s.WaitingForGPSLogged = false
-	s.Location.ResetTimestampTracking()
+	s.Location.SetLastDataReceived(time.Time{})
 
 	// Try to re-enable GPS
 	modemPath, err := s.Modem.FindModem()
@@ -1094,28 +1091,43 @@ func (s *Service) queryCellLocation(ctx context.Context, state *modem.State) {
 // so a fresh EnableGPS is cleaner than trying to paper over stale clocks.
 func (s *Service) resetGPSAfterModemRecovery() {
 	s.Location.Close()
-	s.LastGPSDataTime = time.Time{}
 	s.GPSEnabledTime = time.Time{}
 	s.WaitingForGPSLogged = false
-	s.Location.ResetTimestampTracking()
+	s.Location.SetLastDataReceived(time.Time{})
 }
+
+const (
+	// gpsNoDataTimeout is how long we tolerate silence from the modem's GPS
+	// before declaring it wedged. The chip emits NMEA at 1 Hz, so anything
+	// past a handful of seconds means it's stopped talking and we should
+	// reinit. Independent of fix state.
+	gpsNoDataTimeout = 5 * time.Second
+
+	// gpsFixTimeout is how long we wait for a fix once GPS is enabled.
+	// Sized for cold-start: SIM7100E in standalone mode (UE-Based is
+	// disabled for this hardware) needs the full GPS almanac broadcast,
+	// which is 12.5 minutes minimum. Aggressive recovery during this
+	// window discards partial almanac/ephemeris pages and resets the
+	// download — counter-productive.
+	gpsFixTimeout = 15 * time.Minute
+)
 
 func (s *Service) checkGPSHealth() error {
 	now := time.Now()
 
-	// Check if GPS data is stale (no data for 30 seconds)
-	if !s.LastGPSDataTime.IsZero() && now.Sub(s.LastGPSDataTime) > 30*time.Second {
-		return fmt.Errorf("gps_data_stale: no GPS data received for %v", now.Sub(s.LastGPSDataTime))
+	// "Are we getting any NMEA from the chip?" — fed on every TPV/SKY
+	// callback in location.go regardless of fix mode. If this trips the
+	// chip is wedged; recovery should reinit.
+	lastData := s.Location.LastDataReceived()
+	if !lastData.IsZero() && now.Sub(lastData) > gpsNoDataTimeout {
+		return fmt.Errorf("gps_no_data: no GPS stanzas received for %v", now.Sub(lastData))
 	}
 
-	// Check if GPS timestamp is stuck (timestamp hasn't changed for 180 seconds)
-	lastTsUpdate := s.Location.LastGPSTimestampUpdate()
-	if !lastTsUpdate.IsZero() && now.Sub(lastTsUpdate) > location.GPSTimestampStaleness {
-		return fmt.Errorf("gps_timestamp_stuck: GPS timestamp hasn't changed for %v", now.Sub(lastTsUpdate))
-	}
-
-	// Check if GPS fix is taking too long (no fix for 300 seconds since GPS was enabled)
-	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix() && now.Sub(s.GPSEnabledTime) > 300*time.Second {
+	// "Did we ever achieve a fix this session?" — long timeout because
+	// cold-start without SUPL is bounded below by the almanac broadcast
+	// cycle. Disarmed once a fix is established (see GPSEnabledTime
+	// reset in the monitor loop).
+	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix() && now.Sub(s.GPSEnabledTime) > gpsFixTimeout {
 		return fmt.Errorf("gps_fix_timeout: no GPS fix established for %v", now.Sub(s.GPSEnabledTime))
 	}
 
@@ -1229,9 +1241,6 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					// Reset GPS lost time since we have a fix now
 					s.Location.GPSLostTime = time.Time{}
 
-					// Update GPS data timestamp when we have active GPS
-					s.LastGPSDataTime = time.Now()
-
 					// If we were waiting (flag is true), log that we got a fix
 					if s.WaitingForGPSLogged {
 						s.Logger.Printf("GPS fix established")
@@ -1280,12 +1289,6 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					// GPS fix is lost - mark the time
 					if s.Location.GPSLostTime.IsZero() {
 						s.Location.GPSLostTime = time.Now()
-					}
-
-					// Update GPS data timestamp even when no fix, if GPS is connected
-					isConnected, _ := gpsStatus["connected"].(bool)
-					if isConnected {
-						s.LastGPSDataTime = time.Now()
 					}
 
 					if !s.WaitingForGPSLogged {

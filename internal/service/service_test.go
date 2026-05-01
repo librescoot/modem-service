@@ -329,48 +329,44 @@ func TestGPSHealthCheck(t *testing.T) {
 		LastState: modem.NewState(),
 	}
 
-	// Test 1: Fresh service with no GPS data should pass (LastGPSDataTime is zero)
+	// Test 1: Fresh service with no GPS data should pass (lastDataReceived is zero)
 	err := service.checkGPSHealth()
 	if err != nil {
 		t.Logf("Fresh service GPS health check result: %v (expected)", err)
 	}
 
 	// Test 2: GPS data received recently should pass
-	service.LastGPSDataTime = time.Now().Add(-10 * time.Second)
+	service.Location.SetLastDataReceived(time.Now().Add(-2 * time.Second))
 	err = service.checkGPSHealth()
 	if err != nil {
 		t.Errorf("Expected no error for recent GPS data, got: %v", err)
 	}
 
-	// Test 3: Stale GPS data (>30s) should fail
-	service.LastGPSDataTime = time.Now().Add(-40 * time.Second)
+	// Test 3: No data past gpsNoDataTimeout should fail
+	service.Location.SetLastDataReceived(time.Now().Add(-10 * time.Second))
 	err = service.checkGPSHealth()
 	if err == nil {
-		t.Error("Expected error for stale GPS data, got nil")
+		t.Error("Expected error for no GPS data, got nil")
 	} else {
-		t.Logf("Correctly detected stale GPS data: %v", err)
+		t.Logf("Correctly detected gps_no_data: %v", err)
 	}
 
-	// Test 4: GPS timestamp stuck should fail
-	service.LastGPSDataTime = time.Now()
-	service.Location.SetLastGPSTimestampUpdate(time.Now().Add(-200 * time.Second))
-	err = service.checkGPSHealth()
-	if err == nil {
-		t.Error("Expected error for stuck GPS timestamp, got nil")
-	} else {
-		t.Logf("Correctly detected stuck GPS timestamp: %v", err)
-	}
-
-	// Test 5: GPS fix timeout should fail
-	service.LastGPSDataTime = time.Now()
-	service.Location.SetLastGPSTimestampUpdate(time.Now())
-	service.GPSEnabledTime = time.Now().Add(-400 * time.Second)
+	// Test 4: GPS fix timeout should fail past 15 minutes
+	service.Location.SetLastDataReceived(time.Now())
+	service.GPSEnabledTime = time.Now().Add(-16 * time.Minute)
 	service.Location.SetHasValidFix(false)
 	err = service.checkGPSHealth()
 	if err == nil {
 		t.Error("Expected error for GPS fix timeout, got nil")
 	} else {
 		t.Logf("Correctly detected GPS fix timeout: %v", err)
+	}
+
+	// Test 5: GPS fix timeout should NOT fire before 15 minutes elapsed
+	service.GPSEnabledTime = time.Now().Add(-10 * time.Minute)
+	err = service.checkGPSHealth()
+	if err != nil {
+		t.Errorf("Expected no error 10 minutes into cold start, got: %v", err)
 	}
 }
 
