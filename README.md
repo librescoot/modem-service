@@ -90,10 +90,33 @@ The service maintains various Redis hashes:
 - `power-state` (on/off/low-power)
 - `sim-state` (active/locked/missing/unknown)
 - `sim-lock` (enabled/disabled/unknown)
+- `pin-action` outcome of the last SIM PIN reconcile cycle:
+  - `unconfigured` - no `cellular.sim-pin` setting
+  - `ok` - SIM is in the desired state
+  - `unlocked` - service just sent the PIN to unlock
+  - `lock-enabled` - service just enabled PIN lock with the configured PIN
+  - `wrong-pin` - last attempt was rejected; service will not retry until restart
+  - `low-retries-bail` - retries < 3, refusing to attempt to avoid PUK lock
+  - `puk-required` - SIM is in PUK state, manual recovery needed
+  - `error` - D-Bus call failed (see journal)
 - `operator-name` (current network operator name)
 - `operator-code` (current network operator code)
 - `is-roaming` (true/false)
 - `registration-fail` (reason if registration failed)
+
+When `cellular.sim-pin` is set in the `settings` Redis hash (typically via
+`/data/settings.toml` or the mobile app), modem-service will:
+
+- send the PIN to unlock the SIM if it's PIN-locked, or
+- enable PIN lock with the configured PIN if the SIM has the lock disabled.
+
+A wrong PIN attempt consumes one retry. To prevent the SIM from ever entering
+PUK state through the service, modem-service refuses to attempt a PIN unless
+`unlock-retries["sim-pin"]` is at the maximum (3) and the service has not
+already failed an attempt this run. To recover after a wrong-PIN configuration,
+fix the value, then unlock the SIM once manually (e.g.
+`mmcli -i 0 --send-pin=CORRECT`) — that restores the retry counter and
+modem-service will resume normally.
 
 #### `gps` hash
 
