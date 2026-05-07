@@ -19,6 +19,7 @@ import (
 	"modem-service/internal/modem"
 	"modem-service/internal/modem/connectivity"
 	redisClient "modem-service/internal/redis"
+	"modem-service/internal/sim"
 	"modem-service/internal/usb"
 )
 
@@ -49,6 +50,8 @@ type Service struct {
 	Location              *location.Service
 	Modem                 *modem.Manager
 	MMClient              *mm.Client
+	Sim                   *sim.Manager
+	simPin                atomic.Value // string; PIN configured via cellular.sim-pin setting
 	LastState             *modem.State
 	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
 	GPSEnabledTime        time.Time  // When GPS was first enabled
@@ -136,6 +139,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		Health:              health.New(),
 		Modem:               modemMgr,
 		MMClient:            mmClient,
+		Sim:                 sim.New(mmClient, logger),
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
@@ -148,6 +152,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	service.gpsEnabled.Store(true)           // default: GPS on
 	service.cellLocationEnabled.Store(false) // default: cell location off
 	service.modemEnabled.Store(true)         // default: modem on until pm-service says otherwise
+	service.simPin.Store("")                 // default: no PIN configured
 
 	cell.SetVersion(version)
 	service.Logger.Printf("modem-service %s", version)
@@ -185,6 +190,17 @@ func (s *Service) Run(ctx context.Context) error {
 		enabled := value == "true"
 		s.cellLocationEnabled.Store(enabled)
 		s.Logger.Printf("Cell location %s", map[bool]string{true: "enabled", false: "disabled"}[enabled])
+		return nil
+	})
+	// SIM PIN setting. The value is sensitive — never logged. The next monitor
+	// tick reads simPin via Load() and feeds it to sim.Manager.Reconcile.
+	s.Redis.StartSettingsWatcher("cellular.sim-pin", func(value string) error {
+		s.simPin.Store(value)
+		if value == "" {
+			s.Logger.Printf("SIM PIN cleared")
+		} else {
+			s.Logger.Printf("SIM PIN configured")
+		}
 		return nil
 	})
 	s.Redis.StartSettingsWatching()
@@ -807,6 +823,14 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		s.LastState.SIMLockStatus = currentState.SIMLockStatus
 	}
 
+	if s.LastState.PinAction != currentState.PinAction {
+		if err := s.Redis.PublishModemState("pin-action", currentState.PinAction); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("pin-action=%s", currentState.PinAction))
+		s.LastState.PinAction = currentState.PinAction
+	}
+
 	if s.LastState.OperatorName != currentState.OperatorName {
 		if err := s.Redis.PublishModemState("operator-name", currentState.OperatorName); err != nil {
 			return err
@@ -966,6 +990,18 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		s.publishHealthState(ctx)
 		return err // Return the original error from GetModemInfo
 	}
+
+	// Reconcile SIM PIN state with the configured cellular.sim-pin setting.
+	// The manager owns retry-counter gating so the service can never push the
+	// SIM into PUK lock by itself.
+	pin, _ := s.simPin.Load().(string)
+	currentState.PinAction = string(s.Sim.Reconcile(sim.Input{
+		SIMPath:           currentState.SIMPath,
+		LockStatus:        currentState.SIMLockStatus,
+		SIMPinLockEnabled: currentState.SIMPinLockEnabled,
+		UnlockRetriesPin:  currentState.UnlockRetriesPin,
+		ConfiguredPIN:     pin,
+	}))
 
 	internetStatus := "disconnected"
 	if currentState.Status == "connected" {

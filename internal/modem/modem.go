@@ -66,11 +66,15 @@ type State struct {
 	PowerState         string
 	SIMState           string
 	SIMLockStatus      string
+	SIMPath            dbus.ObjectPath // SIM D-Bus object path; "" if no SIM
+	SIMPinLockEnabled  bool            // sim-pin facility enabled in EnabledFacilityLocks
+	UnlockRetriesPin   uint32          // remaining sim-pin attempts; 0 means unknown/exhausted
 	OperatorName       string
 	OperatorCode       string
 	IsRoaming          bool
 	RegistrationFail   string
 	ErrorState         string
+	PinAction          string // outcome of last SIM PIN reconcile (see internal/sim)
 }
 
 // Manager manages modem operations via D-Bus
@@ -182,6 +186,7 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 	if err == nil {
 		if simPath, ok := simVar.Value().(dbus.ObjectPath); ok && string(simPath) != "/" {
 			state.SIMState = SIMStatePresent
+			state.SIMPath = simPath
 
 			// Get IMSI
 			if imsiVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "Imsi"); err == nil {
@@ -224,6 +229,16 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 				state.SIMState = SIMStateLocked
 			}
 		}
+	}
+
+	// Read PIN-lock facility flag and remaining unlock retries.
+	// Both are best-effort: failures here don't fail the snapshot, but the
+	// PIN reconcile path treats missing values conservatively (won't act).
+	if locks, err := m.client.GetEnabledFacilityLocks(modemPath); err == nil {
+		state.SIMPinLockEnabled = (locks & mm.MMModem3gppFacilitySim) != 0
+	}
+	if retries, err := m.client.GetUnlockRetries(modemPath); err == nil {
+		state.UnlockRetriesPin = retries[mm.MMLockSimPin]
 	}
 
 	// Get signal quality - returns (ub) struct: quality percentage and "recent" flag

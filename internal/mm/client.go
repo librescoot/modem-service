@@ -19,6 +19,13 @@ const (
 	Modem3gppInterface     = "org.freedesktop.ModemManager1.Modem.Modem3gpp"
 	ModemLocationInterface = "org.freedesktop.ModemManager1.Modem.Location"
 	ModemSimpleInterface   = "org.freedesktop.ModemManager1.Modem.Simple"
+	SimInterface           = "org.freedesktop.ModemManager1.Sim"
+
+	// MobileEquipment error names returned by ModemManager when SIM PIN
+	// operations fail. Used by IsWrongPinError and IsPukRequiredError.
+	ErrIncorrectPassword = "org.freedesktop.ModemManager1.Error.MobileEquipment.IncorrectPassword"
+	ErrSimPuk            = "org.freedesktop.ModemManager1.Error.MobileEquipment.SimPuk"
+	ErrSimPuk2           = "org.freedesktop.ModemManager1.Error.MobileEquipment.SimPuk2"
 
 	DBusPropertiesInterface = "org.freedesktop.DBus.Properties"
 	DBusObjectManager       = "org.freedesktop.DBus.ObjectManager"
@@ -139,6 +146,71 @@ func (c *Client) Enable(modemPath dbus.ObjectPath, enable bool) error {
 func (c *Client) Reset(modemPath dbus.ObjectPath) error {
 	call := c.CallMethod(modemPath, ModemInterface, "Reset")
 	return call.Err
+}
+
+// SendPin sends a PIN to unlock the SIM. The pin string is never logged.
+func (c *Client) SendPin(simPath dbus.ObjectPath, pin string) error {
+	obj := c.conn.Object(ModemManagerService, simPath)
+	c.log("Call %s.SendPin([REDACTED])", SimInterface)
+	return obj.Call(SimInterface+".SendPin", 0, pin).Err
+}
+
+// EnablePin enables or disables the PIN lock on the SIM. The pin string is
+// never logged.
+func (c *Client) EnablePin(simPath dbus.ObjectPath, pin string, enabled bool) error {
+	obj := c.conn.Object(ModemManagerService, simPath)
+	c.log("Call %s.EnablePin([REDACTED], %v)", SimInterface, enabled)
+	return obj.Call(SimInterface+".EnablePin", 0, pin, enabled).Err
+}
+
+// GetUnlockRetries reads modem.UnlockRetries (a{uu}), keyed by MMLock*.
+// Missing entries mean "unknown"; callers should treat absent keys
+// conservatively (e.g. as zero remaining attempts).
+func (c *Client) GetUnlockRetries(modemPath dbus.ObjectPath) (map[uint32]uint32, error) {
+	variant, err := c.GetProperty(modemPath, ModemInterface, "UnlockRetries")
+	if err != nil {
+		return nil, err
+	}
+	if retries, ok := variant.Value().(map[uint32]uint32); ok {
+		return retries, nil
+	}
+	return nil, errors.New("invalid UnlockRetries type")
+}
+
+// GetEnabledFacilityLocks reads modem3gpp.EnabledFacilityLocks (u, bitmask of
+// MMModem3gppFacility flags). Returns 0 with no error when the modem doesn't
+// expose the property (rare but possible during early init).
+func (c *Client) GetEnabledFacilityLocks(modemPath dbus.ObjectPath) (uint32, error) {
+	variant, err := c.GetProperty(modemPath, Modem3gppInterface, "EnabledFacilityLocks")
+	if err != nil {
+		return 0, err
+	}
+	if locks, ok := variant.Value().(uint32); ok {
+		return locks, nil
+	}
+	return 0, errors.New("invalid EnabledFacilityLocks type")
+}
+
+// IsWrongPinError reports whether err is a ModemManager IncorrectPassword.
+func IsWrongPinError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if dbusErr, ok := err.(dbus.Error); ok {
+		return dbusErr.Name == ErrIncorrectPassword
+	}
+	return false
+}
+
+// IsPukRequiredError reports whether err indicates the SIM is PUK-locked.
+func IsPukRequiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if dbusErr, ok := err.(dbus.Error); ok {
+		return dbusErr.Name == ErrSimPuk || dbusErr.Name == ErrSimPuk2
+	}
+	return false
 }
 
 // SetupLocation configures location services
