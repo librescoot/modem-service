@@ -178,7 +178,9 @@ func (c *Client) StartSettingsWatcher(field string, handler SettingHandler) {
 		c.settingsWatch = c.client.NewHashWatcher("settings")
 	}
 	c.settingsWatch.OnField(field, func(value string) error {
-		c.logger.Printf("Setting %s changed: %s", field, value)
+		// Don't log the value here: some settings (e.g. cellular.sim-pin) are
+		// sensitive. Per-field handlers can log a redacted summary themselves.
+		c.logger.Printf("Setting %s changed", field)
 		return handler(value)
 	})
 }
