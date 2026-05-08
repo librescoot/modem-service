@@ -24,8 +24,7 @@ const (
 type Client struct {
 	client        *ipc.Client
 	logger        *log.Logger
-	faultStream   *ipc.StreamPublisher
-	faultSet      *ipc.FaultSet
+	faults        *ipc.FaultReporter
 	modemHandler  *ipc.QueueHandler[string]
 	vehicleWatch  *ipc.HashWatcher
 	settingsWatch *ipc.HashWatcher
@@ -50,17 +49,10 @@ func New(redisURL string, logger *log.Logger) (*Client, error) {
 		return nil, fmt.Errorf("failed to create redis-ipc client: %v", err)
 	}
 
-	// Create fault stream publisher for events:faults
-	faultStream := client.NewStreamPublisher("events:faults")
-
-	// Create fault set for internet:fault
-	faultSet := client.NewFaultSet("internet:fault", "internet", "fault")
-
 	return &Client{
-		client:      client,
-		logger:      logger,
-		faultStream: faultStream,
-		faultSet:    faultSet,
+		client: client,
+		logger: logger,
+		faults: client.NewFaultReporter("internet"),
 	}, nil
 }
 
@@ -192,32 +184,24 @@ func (c *Client) StartSettingsWatching() {
 	}
 }
 
-// LogFault logs a fault event to the events:faults stream
-func (c *Client) LogFault(group string, code int, description string) error {
-	_, err := c.faultStream.Add(map[string]any{
-		"group":       group,
-		"code":        code,
-		"description": description,
-	})
-	if err != nil {
-		c.logger.Printf("Failed to log fault: %v", err)
+// RaiseFault marks a fault as present. Idempotent: emits no stream entry
+// if the code is already raised.
+func (c *Client) RaiseFault(code int, description string) error {
+	if err := c.faults.Raise(code, description); err != nil {
+		c.logger.Printf("Failed to raise fault %d: %v", code, err)
+		return err
 	}
-	return err
+	return nil
 }
 
-// AddFault adds a fault code to the internet:fault set
-func (c *Client) AddFault(code int) error {
-	return c.faultSet.Add(code)
-}
-
-// RemoveFault removes a fault code from the internet:fault set
-func (c *Client) RemoveFault(code int) error {
-	return c.faultSet.Remove(code)
-}
-
-// ClearFaults clears all faults from the internet:fault set
-func (c *Client) ClearFaults() error {
-	return c.faultSet.Clear()
+// ClearFault marks a fault as absent. Idempotent: emits no stream entry
+// if the code wasn't raised.
+func (c *Client) ClearFault(code int) error {
+	if err := c.faults.Clear(code); err != nil {
+		c.logger.Printf("Failed to clear fault %d: %v", code, err)
+		return err
+	}
+	return nil
 }
 
 // Close closes the Redis client and stops all handlers with a tight timeout.

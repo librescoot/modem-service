@@ -380,9 +380,7 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	s.Health.State = health.StatePermanentFailure
 	s.publishHealthState(ctx)
 
-	// Log fault to events stream and add to fault set
-	s.Redis.LogFault("internet", redisClient.FaultCodeModemRecoveryFailed, "Modem recovery failed")
-	s.Redis.AddFault(redisClient.FaultCodeModemRecoveryFailed)
+	s.Redis.RaiseFault(redisClient.FaultCodeModemRecoveryFailed, "Modem recovery failed")
 
 	return fmt.Errorf("modem failed to come up after multiple attempts, marked as potentially defective")
 }
@@ -413,7 +411,7 @@ func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
 	s.GPSRecoveryCount = 0
 	s.resetGPSAfterModemRecovery()
 	s.publishHealthState(ctx)
-	s.Redis.RemoveFault(redisClient.FaultCodeModemRecoveryFailed)
+	s.Redis.ClearFault(redisClient.FaultCodeModemRecoveryFailed)
 }
 
 func (s *Service) checkHealth(ctx context.Context) error {
@@ -427,8 +425,7 @@ func (s *Service) checkHealth(ctx context.Context) error {
 	}
 
 	s.Health.MarkNormal()
-	// Clear any active faults when modem is healthy
-	s.Redis.RemoveFault(redisClient.FaultCodeModemRecoveryFailed)
+	s.Redis.ClearFault(redisClient.FaultCodeModemRecoveryFailed)
 	return nil
 }
 
@@ -446,9 +443,8 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 	if !s.Health.CanRecover() {
 		s.Health.MarkRecoveryFailed()
 		s.publishHealthState(ctx)
-		s.Redis.LogFault("internet", redisClient.FaultCodeModemRecoveryFailed,
+		s.Redis.RaiseFault(redisClient.FaultCodeModemRecoveryFailed,
 			fmt.Sprintf("Max recovery attempts (%d) exhausted, entering recovery-failed-wait", health.MaxRecoveryAttempts))
-		s.Redis.AddFault(redisClient.FaultCodeModemRecoveryFailed)
 		s.Logger.Printf("Max recovery attempts reached, entering %s state", s.Health.State)
 		select {
 		case <-ctx.Done():
