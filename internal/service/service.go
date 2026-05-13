@@ -721,6 +721,22 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 // Until we can verify UE-Based is reliable across carriers and firmware (and
 // given XTRA is broken on SIM7100E), stay in standalone always. The
 // classifier + plumbing are kept so flipping this back on is one constant.
+//
+// Re-tested 2026-05-13 on deep-blue (O2 DE, MCC-MNC 26203):
+//   - Tried supl.storo.cloud:7276 and (per past testing) supl.google.com:7276.
+//     Both: TCP reachable, modem accepts CGPSURL, enters CGPS=1,2 cleanly,
+//     then produces no NMEA / no fix until the CGPSMSB=1 fallback finally
+//     drops to standalone after ~10 minutes. SUPL is dead on this firmware
+//     regardless of server.
+//   - Tried re-enabling XTRA (AT+CGPSXE=1, AT+CGPSXDAUTO=1). Chip emits
+//     "+CGPSXD: 2" ("Assistant file check error" per SIMCom AT manual
+//     V1.01 §19.20) on every attempt. Verified the host can fetch the
+//     same xtra2.bin from xtrapath1.izatcloud.net via wwu1i5 (HTTP 200,
+//     34 KB), and chip clock is correct (CTZU=1 → NITZ-synced). HTP time
+//     sync (AT+CHTPSERV/CHTPUPDATE) makes no difference; the chip rejects
+//     the file. Most plausible cause: Qualcomm rotated XTRA signing keys
+//     post-2018, SIM7100E firmware has the old root in ROM. Not fixable
+//     from outside the modem firmware.
 const enableUEBasedMode = false
 
 func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connectivity.State) {
