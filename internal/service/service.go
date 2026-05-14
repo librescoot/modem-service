@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"modem-service/internal/apn"
 	"modem-service/internal/cell"
 	"modem-service/internal/config"
 	"modem-service/internal/health"
@@ -22,6 +23,10 @@ import (
 	"modem-service/internal/sim"
 	"modem-service/internal/usb"
 )
+
+// nmWWANConnection is the NetworkManager connection name for the cellular
+// data bearer. Matches what mdb-netconfig provisions.
+const nmWWANConnection = "wwan"
 
 // Vehicle states that should trigger modem enable
 var modemOnlineStates = map[string]bool{
@@ -52,6 +57,11 @@ type Service struct {
 	MMClient              *mm.Client
 	Sim                   *sim.Manager
 	simPin                atomic.Value // string; PIN configured via cellular.sim-pin setting
+	Apn                   *apn.Manager
+	apnAPN                atomic.Value // string; cellular.apn
+	apnUsername           atomic.Value // string; cellular.username
+	apnPassword           atomic.Value // string; cellular.password
+	apnAuth               atomic.Value // string; cellular.auth ("none"|"pap"|"chap")
 	LastState             *modem.State
 	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
 	GPSEnabledTime        time.Time  // When GPS was first enabled
@@ -140,6 +150,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		Modem:               modemMgr,
 		MMClient:            mmClient,
 		Sim:                 sim.New(mmClient, logger),
+		Apn:                 apn.New(mmClient, apn.NewNMCli(), nmWWANConnection, logger),
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
@@ -153,6 +164,10 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	service.cellLocationEnabled.Store(false) // default: cell location off
 	service.modemEnabled.Store(true)         // default: modem on until pm-service says otherwise
 	service.simPin.Store("")                 // default: no PIN configured
+	service.apnAPN.Store("")
+	service.apnUsername.Store("")
+	service.apnPassword.Store("")
+	service.apnAuth.Store("")
 
 	cell.SetVersion(version)
 	service.Logger.Printf("modem-service %s", version)
@@ -201,6 +216,32 @@ func (s *Service) Run(ctx context.Context) error {
 		} else {
 			s.Logger.Printf("SIM PIN configured")
 		}
+		return nil
+	})
+	// APN settings. Values are stored and consumed by apn.Manager on the
+	// next reconcile cycle. cellular.password is never logged.
+	s.Redis.StartSettingsWatcher("cellular.apn", func(value string) error {
+		s.apnAPN.Store(value)
+		s.Logger.Printf("APN set: %q", value)
+		return nil
+	})
+	s.Redis.StartSettingsWatcher("cellular.username", func(value string) error {
+		s.apnUsername.Store(value)
+		s.Logger.Printf("APN username set: %q", value)
+		return nil
+	})
+	s.Redis.StartSettingsWatcher("cellular.password", func(value string) error {
+		s.apnPassword.Store(value)
+		if value == "" {
+			s.Logger.Printf("APN password cleared")
+		} else {
+			s.Logger.Printf("APN password configured")
+		}
+		return nil
+	})
+	s.Redis.StartSettingsWatcher("cellular.auth", func(value string) error {
+		s.apnAuth.Store(value)
+		s.Logger.Printf("APN auth set: %q", value)
 		return nil
 	})
 	s.Redis.StartSettingsWatching()
@@ -827,6 +868,14 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		s.LastState.PinAction = currentState.PinAction
 	}
 
+	if s.LastState.ApnAction != currentState.ApnAction {
+		if err := s.Redis.PublishModemState("apn-action", currentState.ApnAction); err != nil {
+			return err
+		}
+		modemChanges = append(modemChanges, fmt.Sprintf("apn-action=%s", currentState.ApnAction))
+		s.LastState.ApnAction = currentState.ApnAction
+	}
+
 	if s.LastState.OperatorName != currentState.OperatorName {
 		if err := s.Redis.PublishModemState("operator-name", currentState.OperatorName); err != nil {
 			return err
@@ -998,6 +1047,24 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		UnlockRetriesPin:  currentState.UnlockRetriesPin,
 		ConfiguredPIN:     pin,
 	}))
+
+	// Reconcile APN settings against the modem and NetworkManager. Only
+	// runs once we have an ICCID — apn.Manager handles the no-SIM case
+	// itself but skipping here avoids a redundant log line on every tick
+	// before the SIM comes up.
+	if currentState.ICCID != "" && currentState.SIMLockStatus == "" {
+		modemPath, _ := s.Modem.FindModem()
+		currentState.ApnAction = string(s.Apn.Reconcile(apn.Input{
+			ICCID:     currentState.ICCID,
+			ModemPath: modemPath,
+			Desired: apn.Config{
+				APN:      s.apnAPN.Load().(string),
+				Username: s.apnUsername.Load().(string),
+				Password: s.apnPassword.Load().(string),
+				Auth:     s.apnAuth.Load().(string),
+			},
+		}))
+	}
 
 	internetStatus := "disconnected"
 	if currentState.Status == "connected" {

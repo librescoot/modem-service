@@ -27,6 +27,18 @@ const (
 	ErrSimPuk            = "org.freedesktop.ModemManager1.Error.MobileEquipment.SimPuk"
 	ErrSimPuk2           = "org.freedesktop.ModemManager1.Error.MobileEquipment.SimPuk2"
 
+	// MMBearerAllowedAuth flags (from MM-enums.h). Used in the "allowed-auth"
+	// field of InitialEpsBearerSettings.
+	BearerAuthNone uint32 = 1 << 0
+	BearerAuthPAP  uint32 = 1 << 1
+	BearerAuthCHAP uint32 = 1 << 2
+
+	// MMBearerIpFamily values. Used in the "ip-type" field of
+	// InitialEpsBearerSettings.
+	BearerIPv4   uint32 = 1 << 0
+	BearerIPv6   uint32 = 1 << 1
+	BearerIPv4v6 uint32 = 1 << 2
+
 	DBusPropertiesInterface = "org.freedesktop.DBus.Properties"
 	DBusObjectManager       = "org.freedesktop.DBus.ObjectManager"
 )
@@ -211,6 +223,31 @@ func IsPukRequiredError(err error) bool {
 		return dbusErr.Name == ErrSimPuk || dbusErr.Name == ErrSimPuk2
 	}
 	return false
+}
+
+// GetInitialEpsBearerSettings reads modem3gpp.InitialEpsBearerSettings (a{sv}).
+// Returned dict keys include "apn" (s), "user" (s), "password" (s),
+// "ip-type" (u), "allowed-auth" (u). Missing keys mean the modem has no
+// value set for that field — callers should treat them as empty/zero.
+func (c *Client) GetInitialEpsBearerSettings(modemPath dbus.ObjectPath) (map[string]dbus.Variant, error) {
+	variant, err := c.GetProperty(modemPath, Modem3gppInterface, "InitialEpsBearerSettings")
+	if err != nil {
+		return nil, err
+	}
+	if settings, ok := variant.Value().(map[string]dbus.Variant); ok {
+		return settings, nil
+	}
+	return nil, errors.New("invalid InitialEpsBearerSettings type")
+}
+
+// SetInitialEpsBearerSettings calls
+// org.freedesktop.ModemManager1.Modem.Modem3gpp.SetInitialEpsBearerSettings.
+// Persists the LTE attach APN/credentials in the modem (survives reboot).
+// The password value is never logged.
+func (c *Client) SetInitialEpsBearerSettings(modemPath dbus.ObjectPath, settings map[string]dbus.Variant) error {
+	obj := c.conn.Object(ModemManagerService, modemPath)
+	c.log("Call %s.SetInitialEpsBearerSettings([apn/user/password redacted])", Modem3gppInterface)
+	return obj.Call(Modem3gppInterface+".SetInitialEpsBearerSettings", 0, settings).Err
 }
 
 // SetupLocation configures location services

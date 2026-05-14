@@ -75,6 +75,7 @@ type State struct {
 	RegistrationFail   string
 	ErrorState         string
 	PinAction          string // outcome of last SIM PIN reconcile (see internal/sim)
+	ApnAction          string // outcome of last APN reconcile (see internal/apn)
 }
 
 // Manager manages modem operations via D-Bus
