@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/godbus/dbus/v5"
+
 	"modem-service/internal/apn"
 	"modem-service/internal/cell"
 	"modem-service/internal/config"
@@ -1054,7 +1056,7 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	// before the SIM comes up.
 	if currentState.ICCID != "" && currentState.SIMLockStatus == "" {
 		modemPath, _ := s.Modem.FindModem()
-		currentState.ApnAction = string(s.Apn.Reconcile(apn.Input{
+		outcome := s.Apn.Reconcile(apn.Input{
 			ICCID:     currentState.ICCID,
 			ModemPath: modemPath,
 			Desired: apn.Config{
@@ -1063,7 +1065,22 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 				Password: s.apnPassword.Load().(string),
 				Auth:     s.apnAuth.Load().(string),
 			},
-		}))
+		})
+		currentState.ApnAction = string(outcome)
+		// Force LTE reattach when we actually wrote something — a new
+		// CGDCONT=1 only takes effect on the next attach. Done in a
+		// goroutine because COPS=2/0 can block for tens of seconds; we
+		// don't want to stall the monitor loop. modemPath is captured
+		// by value so a concurrent modem rebind doesn't race us.
+		if outcome == apn.OutcomeApplied || outcome == apn.OutcomeICCIDChangedClear {
+			if modemPath != "" {
+				go func(p dbus.ObjectPath) {
+					if err := s.Apn.Reattach(p); err != nil {
+						s.Logger.Printf("apn: reattach failed: %v", err)
+					}
+				}(modemPath)
+			}
+		}
 	}
 
 	internetStatus := "disconnected"

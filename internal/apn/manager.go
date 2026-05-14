@@ -21,11 +21,23 @@ package apn
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 
 	"modem-service/internal/mm"
+)
+
+// AT command timeouts. CGDCONT/CGAUTH are near-instant on SIM7100E.
+// COPS=2 (deregister) can take a few seconds; COPS=0 (auto-register) waits
+// for the modem to find and lock onto a cell, which is bounded by network
+// search time.
+const (
+	atQuickTimeout    = 5 * time.Second
+	atDeregisterTime  = 10 * time.Second
+	atAutoRegisterMax = 60 * time.Second
 )
 
 // Outcome describes the result of one Reconcile call. Published verbatim to
@@ -79,6 +91,11 @@ type Input struct {
 type MMDBus interface {
 	GetInitialEpsBearerSettings(modemPath dbus.ObjectPath) (map[string]dbus.Variant, error)
 	SetInitialEpsBearerSettings(modemPath dbus.ObjectPath, settings map[string]dbus.Variant) error
+	// SendCommand is used for SIM7100E-specific belt-and-braces AT
+	// commands. MM's SetInitialEpsBearerSettings writes to CGDCONT=0,
+	// which simtech firmware ignores; the modem actually attaches with
+	// CGDCONT=1. We send both for portability.
+	SendCommand(modemPath dbus.ObjectPath, command string, timeout time.Duration) (string, error)
 }
 
 // NM is the narrow NetworkManager surface the manager needs. Concrete impl
@@ -215,7 +232,93 @@ func (m *Manager) applyBoth(modemPath dbus.ObjectPath, cfg Config) error {
 		return nil
 	}
 	if err := m.mm.SetInitialEpsBearerSettings(modemPath, encodeMMSettings(cfg)); err != nil {
-		return fmt.Errorf("mm set: %w", err)
+		// Don't bail — the AT fallback is what actually works on
+		// SIM7100E; SetInitialEpsBearerSettings can fail on simtech
+		// when the modem isn't in a state MM likes, but the raw AT
+		// commands still go through.
+		m.logger.Printf("apn: SetInitialEpsBearerSettings failed (will rely on AT fallback): %v", err)
+	}
+	if err := m.applyAT(modemPath, cfg); err != nil {
+		return fmt.Errorf("at fallback: %w", err)
+	}
+	return nil
+}
+
+// applyAT writes the LTE attach context (cid=1) and authentication via raw
+// AT commands. MM's generic 3GPP code writes CGDCONT=0 which simtech
+// firmware ignores at attach time — cid=1 is the slot the SIM7100E actually
+// reads. SIMCom firmware persists cid=1 in NVRAM automatically.
+func (m *Manager) applyAT(modemPath dbus.ObjectPath, cfg Config) error {
+	if err := validateATValue(cfg.APN); err != nil {
+		return fmt.Errorf("invalid APN: %w", err)
+	}
+	if err := validateATValue(cfg.Username); err != nil {
+		return fmt.Errorf("invalid username: %w", err)
+	}
+	if err := validateATValue(cfg.Password); err != nil {
+		return fmt.Errorf("invalid password: %w", err)
+	}
+
+	pdpType := "IP"
+	if cfg.APN == "" {
+		// Clearing — IPV4V6 with empty APN tells the modem to use the
+		// SIM-derived default at attach.
+		pdpType = "IPV4V6"
+	}
+	cgdcont := fmt.Sprintf(`AT+CGDCONT=1,"%s","%s"`, pdpType, cfg.APN)
+	if _, err := m.mm.SendCommand(modemPath, cgdcont, atQuickTimeout); err != nil {
+		return fmt.Errorf("CGDCONT: %w", err)
+	}
+
+	authType := 0 // none
+	switch cfg.Auth {
+	case "pap":
+		authType = 1
+	case "chap":
+		authType = 2
+	}
+	var cgauth string
+	if authType == 0 || (cfg.Username == "" && cfg.Password == "") {
+		cgauth = `AT+CGAUTH=1,0`
+	} else {
+		cgauth = fmt.Sprintf(`AT+CGAUTH=1,%d,"%s","%s"`, authType, cfg.Username, cfg.Password)
+	}
+	if _, err := m.mm.SendCommand(modemPath, cgauth, atQuickTimeout); err != nil {
+		// Some firmware rejects CGAUTH when context isn't activated.
+		// Log and continue — CGDCONT alone is the critical piece for
+		// the Vodafone/Telekom "stuck on EDGE" symptom.
+		m.logger.Printf("apn: CGAUTH failed (continuing): %v", err)
+	}
+	return nil
+}
+
+// Reattach forces the modem to deregister from the carrier and reattach,
+// which makes a freshly-written CGDCONT=1 actually take effect. Blocks for
+// up to ~atDeregisterTime + atAutoRegisterMax. Intended to be called from a
+// goroutine by the caller — Reconcile does not invoke it directly.
+func (m *Manager) Reattach(modemPath dbus.ObjectPath) error {
+	if modemPath == "" {
+		return fmt.Errorf("empty modem path")
+	}
+	m.logger.Printf("apn: triggering LTE reattach (AT+COPS=2 then AT+COPS=0)")
+	if _, err := m.mm.SendCommand(modemPath, "AT+COPS=2", atDeregisterTime); err != nil {
+		return fmt.Errorf("COPS=2: %w", err)
+	}
+	if _, err := m.mm.SendCommand(modemPath, "AT+COPS=0", atAutoRegisterMax); err != nil {
+		return fmt.Errorf("COPS=0: %w", err)
+	}
+	m.logger.Printf("apn: reattach complete")
+	return nil
+}
+
+// validateATValue rejects values that would break the AT quoting. SIMCom AT
+// has no escape mechanism inside string literals; a literal double-quote
+// would terminate the argument and let the rest of the value be parsed as
+// command syntax. APNs and usernames don't contain quotes in practice;
+// passwords can but won't from settings-service. Defense-in-depth.
+func validateATValue(s string) error {
+	if strings.ContainsAny(s, "\"\r\n") {
+		return fmt.Errorf("contains quote or newline")
 	}
 	return nil
 }

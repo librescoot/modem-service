@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"testing"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 
@@ -11,10 +12,13 @@ import (
 )
 
 type fakeMM struct {
-	current map[string]dbus.Variant
-	setErr  error
-	getErr  error
-	lastSet map[string]dbus.Variant
+	current  map[string]dbus.Variant
+	setErr   error
+	getErr   error
+	lastSet  map[string]dbus.Variant
+	atCmds   []string
+	atErr    error
+	atOnSend func(cmd string) error
 }
 
 func (f *fakeMM) GetInitialEpsBearerSettings(dbus.ObjectPath) (map[string]dbus.Variant, error) {
@@ -31,6 +35,19 @@ func (f *fakeMM) SetInitialEpsBearerSettings(_ dbus.ObjectPath, s map[string]dbu
 	f.current = s
 	f.lastSet = s
 	return nil
+}
+
+func (f *fakeMM) SendCommand(_ dbus.ObjectPath, cmd string, _ time.Duration) (string, error) {
+	f.atCmds = append(f.atCmds, cmd)
+	if f.atOnSend != nil {
+		if err := f.atOnSend(cmd); err != nil {
+			return "", err
+		}
+	}
+	if f.atErr != nil {
+		return "", f.atErr
+	}
+	return "", nil
 }
 
 type fakeNM struct {
@@ -181,6 +198,75 @@ func TestReconcileAfterICCIDClearAwaitsUserAction(t *testing.T) {
 	got := m.Reconcile(Input{ICCID: "ICCID-B", ModemPath: testPath, Desired: Config{APN: "a"}})
 	if got != OutcomeApplied {
 		t.Fatalf("after-clear apply: got %s want %s", got, OutcomeApplied)
+	}
+}
+
+func TestApplySendsATCommands(t *testing.T) {
+	m, mmFake, _ := newTestManager()
+	desired := Config{APN: "internet.telekom", Username: "congstar", Password: "cs", Auth: "pap"}
+	if got := m.Reconcile(Input{ICCID: "ICCID-A", ModemPath: testPath, Desired: desired}); got != OutcomeApplied {
+		t.Fatalf("got %s", got)
+	}
+	if len(mmFake.atCmds) != 2 {
+		t.Fatalf("want 2 AT commands, got %d: %v", len(mmFake.atCmds), mmFake.atCmds)
+	}
+	want := `AT+CGDCONT=1,"IP","internet.telekom"`
+	if mmFake.atCmds[0] != want {
+		t.Errorf("CGDCONT: got %q want %q", mmFake.atCmds[0], want)
+	}
+	wantAuth := `AT+CGAUTH=1,1,"congstar","cs"`
+	if mmFake.atCmds[1] != wantAuth {
+		t.Errorf("CGAUTH: got %q want %q", mmFake.atCmds[1], wantAuth)
+	}
+}
+
+func TestClearSendsEmptyCGDCONT(t *testing.T) {
+	m, mmFake, nmFake := newTestManager()
+	nmFake.current = Config{APN: "stale"}
+	mmFake.current = map[string]dbus.Variant{"apn": dbus.MakeVariant("stale")}
+	if got := m.Reconcile(Input{ICCID: "ICCID-A", ModemPath: testPath}); got != OutcomeApplied {
+		t.Fatalf("got %s", got)
+	}
+	if len(mmFake.atCmds) < 2 {
+		t.Fatalf("want CGDCONT+CGAUTH, got %v", mmFake.atCmds)
+	}
+	want := `AT+CGDCONT=1,"IPV4V6",""`
+	if mmFake.atCmds[0] != want {
+		t.Errorf("clear CGDCONT: got %q want %q", mmFake.atCmds[0], want)
+	}
+	if mmFake.atCmds[1] != "AT+CGAUTH=1,0" {
+		t.Errorf("clear CGAUTH: got %q", mmFake.atCmds[1])
+	}
+}
+
+func TestApplyChapAuth(t *testing.T) {
+	m, mmFake, _ := newTestManager()
+	desired := Config{APN: "x", Username: "u", Password: "p", Auth: "chap"}
+	if got := m.Reconcile(Input{ICCID: "ICCID-A", ModemPath: testPath, Desired: desired}); got != OutcomeApplied {
+		t.Fatalf("got %s", got)
+	}
+	want := `AT+CGAUTH=1,2,"u","p"`
+	if mmFake.atCmds[1] != want {
+		t.Errorf("CHAP CGAUTH: got %q want %q", mmFake.atCmds[1], want)
+	}
+}
+
+func TestApplyRejectsQuotedValues(t *testing.T) {
+	m, _, _ := newTestManager()
+	desired := Config{APN: `bad"apn`}
+	got := m.Reconcile(Input{ICCID: "ICCID-A", ModemPath: testPath, Desired: desired})
+	if got != OutcomeError {
+		t.Fatalf("got %s want %s", got, OutcomeError)
+	}
+}
+
+func TestReattachSendsCOPS(t *testing.T) {
+	m, mmFake, _ := newTestManager()
+	if err := m.Reattach(testPath); err != nil {
+		t.Fatalf("reattach: %v", err)
+	}
+	if len(mmFake.atCmds) != 2 || mmFake.atCmds[0] != "AT+COPS=2" || mmFake.atCmds[1] != "AT+COPS=0" {
+		t.Errorf("got %v want [AT+COPS=2 AT+COPS=0]", mmFake.atCmds)
 	}
 }
 
