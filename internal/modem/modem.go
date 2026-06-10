@@ -30,6 +30,11 @@ const (
 
 // SIM states
 const (
+	// SIMStateUnknown is the default before/when the modem can't be read.
+	// "missing" must mean the modem actually reported no SIM, not that the
+	// modem is off or unreachable (the connectivity classifier treats
+	// "missing" as no-sim, bypassing hysteresis).
+	SIMStateUnknown  = "unknown"
 	SIMStatePresent  = "present"
 	SIMStateMissing  = "missing"
 	SIMStateLocked   = "locked"
@@ -128,7 +133,7 @@ func NewState() *State {
 		IfIPAddr:           "UNKNOWN",
 		Registration:       "",
 		PowerState:         PowerStateOff,
-		SIMState:           SIMStateMissing,
+		SIMState:           SIMStateUnknown,
 		SIMLockStatus:      "",
 		OperatorName:       "",
 		OperatorCode:       "",
