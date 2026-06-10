@@ -78,12 +78,11 @@ func New(d SimDBus, logger *log.Logger) *Manager {
 // the outcome for publication. It may make at most one D-Bus call per
 // invocation.
 func (m *Manager) Reconcile(in Input) Outcome {
-	// Diagnostic — logs what the service sees on every tick so we can
-	// confirm settings-service delivered the configured PIN. %q quotes
-	// the value, so empty PINs print as `""` and any actual PIN is visible
-	// in journalctl; redact if you don't want that on this box.
-	m.logger.Printf("sim-reconcile: lock=%q pin=%q enabled=%v retries=%d",
-		in.LockStatus, in.ConfiguredPIN, in.SIMPinLockEnabled, in.UnlockRetriesPin)
+	// Diagnostic — log what the service sees each tick so we can confirm
+	// settings-service delivered a PIN. The value is sensitive and never
+	// logged; only whether one is configured.
+	m.logger.Printf("sim-reconcile: lock=%q pin-configured=%v enabled=%v retries=%d",
+		in.LockStatus, in.ConfiguredPIN != "", in.SIMPinLockEnabled, in.UnlockRetriesPin)
 
 	if in.ConfiguredPIN == "" {
 		return OutcomeUnconfigured
