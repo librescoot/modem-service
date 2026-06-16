@@ -150,6 +150,65 @@ func (c *Client) StartModemCommandHandler(handler ModemCommandHandler) error {
 	return nil
 }
 
+// Power inhibitor wiring. modem-service registers a block inhibitor in the
+// power:inhibits hash while the modem is powered, so pm-service holds off
+// suspend until the modem has been told to shut down and confirmed off. The
+// "who" string MUST match pm-service's modem check (hasOnlyModemBlockingInhibitors).
+const (
+	powerInhibitHash    = "power:inhibits"
+	powerInhibitChannel = "power:inhibits"
+	modemInhibitID      = "modem-active"
+	modemInhibitWho     = "librescoot-modem"
+)
+
+// inhibitData mirrors the JSON shape pm-service reads from the power:inhibits hash.
+type inhibitData struct {
+	ID       string `json:"id"`
+	Who      string `json:"who"`
+	What     string `json:"what"`
+	Why      string `json:"why"`
+	Type     string `json:"type"`
+	Duration int64  `json:"duration"`
+	Created  int64  `json:"created"`
+}
+
+// AddModemInhibitor registers a block inhibitor so pm-service does not suspend
+// while the modem is powered. Idempotent: HSET overwrites and pm-service
+// reconciles from HGETALL, so calling it on every enable is safe.
+func (c *Client) AddModemInhibitor() error {
+	payload, err := json.Marshal(inhibitData{
+		ID:      modemInhibitID,
+		Who:     modemInhibitWho,
+		What:    "power-state-change",
+		Why:     "modem is powered",
+		Type:    "block",
+		Created: time.Now().Unix(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal modem inhibitor: %w", err)
+	}
+	if err := c.client.HSet(powerInhibitHash, modemInhibitID, string(payload)); err != nil {
+		return fmt.Errorf("set modem inhibitor: %w", err)
+	}
+	if _, err := c.client.Publish(powerInhibitChannel, "add:"+modemInhibitID); err != nil {
+		return fmt.Errorf("publish modem inhibitor add: %w", err)
+	}
+	return nil
+}
+
+// RemoveModemInhibitor clears the block inhibitor. HDEL is required: pm-service
+// reconciles from the hash, so publishing "remove:" without deleting the field
+// would leave the inhibitor asserted. redis-ipc has no HDel wrapper, so use Do.
+func (c *Client) RemoveModemInhibitor() error {
+	if _, err := c.client.Do("HDEL", powerInhibitHash, modemInhibitID); err != nil {
+		return fmt.Errorf("del modem inhibitor: %w", err)
+	}
+	if _, err := c.client.Publish(powerInhibitChannel, "remove:"+modemInhibitID); err != nil {
+		return fmt.Errorf("publish modem inhibitor remove: %w", err)
+	}
+	return nil
+}
+
 // StartVehicleStateWatcher starts watching vehicle state changes
 func (c *Client) StartVehicleStateWatcher(handler VehicleStateHandler) error {
 	c.vehicleWatch = c.client.NewHashWatcher("vehicle")

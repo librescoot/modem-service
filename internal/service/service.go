@@ -259,6 +259,12 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
+	// Hold a power inhibitor while the modem is up so pm-service won't suspend
+	// the MDB until the modem has been told to shut down and confirmed off.
+	if err := s.Redis.AddModemInhibitor(); err != nil {
+		s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
+	}
+
 	s.Logger.Printf("Starting modem service on interface %s", s.Config.Interface)
 	go s.monitorStatus(ctx)
 
@@ -300,6 +306,11 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.MMClient.Close(); err != nil {
 		s.Logger.Printf("Error closing ModemManager D-Bus client: %v", err)
 	}
+	// Drop the power inhibitor so a restart doesn't leave a stale entry in
+	// power:inhibits blocking suspend.
+	if err := s.Redis.RemoveModemInhibitor(); err != nil {
+		s.Logger.Printf("Error clearing modem power inhibitor: %v", err)
+	}
 	if err := s.Redis.Close(); err != nil {
 		s.Logger.Printf("Error closing Redis client: %v", err)
 	}
@@ -313,6 +324,10 @@ func (s *Service) handleModemCommand(command string) error {
 	case "enable":
 		s.Logger.Printf("Received modem enable command")
 		s.modemEnabled.Store(true)
+		// Re-arm the power inhibitor for the next suspend cycle. Idempotent.
+		if err := s.Redis.AddModemInhibitor(); err != nil {
+			s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
+		}
 		// Modem will be enabled by ensureModemEnabled or monitor loop
 	case "disable":
 		s.Logger.Printf("Received modem disable command")
@@ -330,6 +345,10 @@ func (s *Service) handleVehicleState(state string) error {
 	if modemOnlineStates[state] {
 		if s.modemEnabled.CompareAndSwap(false, true) {
 			s.Logger.Printf("Vehicle state '%s' - enabling modem", state)
+			// Re-arm the power inhibitor for the next suspend cycle. Idempotent.
+			if err := s.Redis.AddModemInhibitor(); err != nil {
+				s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
+			}
 		}
 	}
 	return nil
@@ -363,6 +382,13 @@ func (s *Service) disableModem(ctx context.Context) {
 
 	if err := s.Modem.PowerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
+	}
+
+	// Modem is off: drop the power inhibitor so pm-service can proceed to
+	// suspend. Released here (after PowerOffModem) so suspend can't race the
+	// modem still being powered.
+	if err := s.Redis.RemoveModemInhibitor(); err != nil {
+		s.Logger.Printf("Failed to clear modem power inhibitor: %v", err)
 	}
 
 	s.Logger.Printf("Modem disabled")

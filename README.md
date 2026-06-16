@@ -66,6 +66,7 @@ The service uses Redis to:
 - Store current modem state
 - Publish state change notifications on the `internet` channel
 - Publish GPS information
+- Register a power inhibitor in `power:inhibits` while the modem is powered
 
 ### Redis Hash Structure
 
@@ -138,6 +139,15 @@ GPS state transitions occur when:
 3. Losing fix: `fix-established` → `searching`
 4. Configuration failure: `searching` → `error`
 5. Disabling GPS: any state → `off`
+
+### Power inhibitor
+
+While the modem is powered, modem-service registers a `block` inhibitor in the
+`power:inhibits` hash (`who=librescoot-modem`). This holds pm-service off from
+suspending the MDB until the modem has been told to shut down and confirmed off:
+on a `disable` command modem-service powers the modem down and only then removes
+the inhibitor. The inhibitor is also dropped on clean shutdown, so a restart
+cannot leave a stale entry blocking suspend.
 
 ## Usage
 
