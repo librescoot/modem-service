@@ -228,3 +228,61 @@ func LockReasonToString(lock uint32) string {
 		return "unknown"
 	}
 }
+
+// SMS State (MMSmsState) — value of the Sms object's State property.
+const (
+	MMSmsStateUnknown   uint32 = 0
+	MMSmsStateStored    uint32 = 1
+	MMSmsStateReceiving uint32 = 2
+	MMSmsStateReceived  uint32 = 3
+	MMSmsStateSending   uint32 = 4
+	MMSmsStateSent      uint32 = 5
+)
+
+// SMS PDU Type (MMSmsPduType) — value of the Sms object's PduType property.
+// ModemManager exposes no "direction" property; the PDU type is what tells an
+// inbound (network-delivered) message apart from an outbound one. Only the
+// 3GPP types are listed — these are GSM/LTE modems, so the CDMA variants never
+// occur.
+const (
+	MMSmsPduTypeUnknown      uint32 = 0
+	MMSmsPduTypeDeliver      uint32 = 1 // received from the network (inbound)
+	MMSmsPduTypeSubmit       uint32 = 2 // created locally to send (outbound)
+	MMSmsPduTypeStatusReport uint32 = 3
+)
+
+func SmsStateToString(state uint32) string {
+	switch state {
+	case MMSmsStateStored:
+		return "stored"
+	case MMSmsStateReceiving:
+		return "receiving"
+	case MMSmsStateReceived:
+		return "received"
+	case MMSmsStateSending:
+		return "sending"
+	case MMSmsStateSent:
+		return "sent"
+	default:
+		return "unknown"
+	}
+}
+
+// SmsPduTypeIsIncoming reports whether a PDU type denotes a message delivered
+// to us by the network, as opposed to one we created to send.
+func SmsPduTypeIsIncoming(pduType uint32) bool {
+	return pduType == MMSmsPduTypeDeliver
+}
+
+func SmsPduTypeToString(pduType uint32) string {
+	switch pduType {
+	case MMSmsPduTypeDeliver:
+		return "deliver"
+	case MMSmsPduTypeSubmit:
+		return "submit"
+	case MMSmsPduTypeStatusReport:
+		return "status-report"
+	default:
+		return "unknown"
+	}
+}
