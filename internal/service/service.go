@@ -284,6 +284,10 @@ func (s *Service) Run(ctx context.Context) error {
 	// also drains any messages that arrived while we were offline.
 	s.startSMSWatch(ctx)
 
+	// Periodically check that the SGs CS registration at the MSC/VLR is still
+	// alive and force a fresh combined attach if it has expired (LAC=0xFFFE).
+	s.startSMSRegistrationWatchdog(ctx)
+
 	s.Logger.Printf("Starting modem service on interface %s", s.Config.Interface)
 	go s.monitorStatus(ctx)
 
@@ -551,6 +555,13 @@ func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
 		s.Logger.Printf("sms: MM supported-storages=%v", v.Value())
 	}
 
+	// Enable CS registration location info so AT+CREG? includes the LAC.
+	// The SGs watchdog uses this to detect when the SGs association at the
+	// MSC/VLR has expired (LAC=0xFFFE) and needs a fresh combined attach.
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+CREG=2", 5*time.Second); err != nil {
+		s.Logger.Printf("sms: enabling CREG location info failed: %v", err)
+	}
+
 	// Enable new-message indications so the modem notifies MM of inbound SMS.
 	if _, err := s.MMClient.SendCommand(modemPath, "AT+CNMI=2,1,0,0,0", 5*time.Second); err != nil {
 		s.Logger.Printf("sms: enabling new-message indications (CNMI) failed: %v", err)
@@ -601,6 +612,100 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 	}, "last-received-at"); err != nil {
 		s.Logger.Printf("sms: failed to publish incoming message: %v", err)
 	}
+}
+
+// startSMSRegistrationWatchdog monitors CS registration health and forces a
+// combined EPS+IMSI re-attach when the SGs association at the MSC/VLR expires.
+//
+// On LTE with CEMODE=2 (CS/PS mode 1) the modem does a combined EPS+IMSI attach
+// at boot, registering with both the LTE core (PS) and the MSC/VLR via SGs (CS).
+// Lebara/O2 Germany's MSC has an SGs implicit detach timer of roughly 15 minutes.
+// The LTE periodic TAU timer (T3412) is set to hours by the network, so the UE
+// never sends a combined TAU before the MSC expires the SGs association. After
+// expiry the MSC silently discards the SGs record; the modem's NAS layer still
+// reports CS:attached but the LAC becomes 0xFFFE — the network can no longer
+// route SMS to the UE.
+//
+// Every 10 minutes we query AT+CREG? for the current LAC. If it is the reserved
+// value 0xFFFE we deregister and re-register (AT+COPS=2 → AT+COPS=0), which with
+// CEMODE=2 triggers a fresh combined attach and a new valid SGs association.
+func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.checkAndRefreshCSRegistration(ctx)
+			}
+		}
+	}()
+}
+
+func (s *Service) checkAndRefreshCSRegistration(ctx context.Context) {
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		return
+	}
+
+	resp, err := s.MMClient.SendCommand(modemPath, "AT+CREG?", 5*time.Second)
+	if err != nil {
+		s.Logger.Printf("sms: CREG query failed: %v", err)
+		return
+	}
+
+	lac := parseCSRegistrationLAC(resp)
+	if lac == "" {
+		return // no location info in response; CREG=2 not yet applied or modem not registered
+	}
+	if !strings.EqualFold(lac, "FFFE") {
+		return // valid LAC — SGs association is alive
+	}
+
+	s.Logger.Printf("sms: SGs expired at MSC/VLR (LAC=FFFE) — forcing combined re-attach")
+
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+COPS=2", 15*time.Second); err != nil {
+		s.Logger.Printf("sms: COPS=2 (deregister) failed: %v", err)
+		return
+	}
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(3 * time.Second):
+	}
+
+	// CEMODE=2 ensures this triggers a combined EPS+IMSI attach, creating a
+	// fresh SGs association with a valid LAC at the MSC/VLR.
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+COPS=0", 60*time.Second); err != nil {
+		s.Logger.Printf("sms: COPS=0 (re-register) failed: %v", err)
+		return
+	}
+
+	s.Logger.Printf("sms: combined re-attach complete, re-arming SMS watch")
+	s.startSMSWatch(ctx)
+}
+
+// parseCSRegistrationLAC extracts the Location Area Code hex string from an
+// AT+CREG? response. Returns "" if no location info is present (CREG mode < 2
+// or the modem is not registered).
+//
+// Response format: +CREG: <n>,<stat>[,"<lac>","<ci>"[,<AcT>]]
+func parseCSRegistrationLAC(resp string) string {
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+CREG:") {
+			continue
+		}
+		parts := strings.SplitN(strings.TrimPrefix(line, "+CREG:"), ",", 5)
+		if len(parts) < 3 {
+			return ""
+		}
+		return strings.Trim(strings.TrimSpace(parts[2]), `"`)
+	}
+	return ""
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
