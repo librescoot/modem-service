@@ -380,6 +380,17 @@ func (s *Service) disableModem(ctx context.Context) {
 	s.Redis.PublishInternetState("modem-state", "off")
 	s.Redis.PublishModemState("power-state", "off")
 
+	// Keep the in-memory cache in sync with what we just wrote to Redis.
+	// publishModemState() only writes a field when it differs from LastState,
+	// so if we leave LastState holding the pre-disable values (e.g. "connected")
+	// the monitor loop will treat the post-resume reconnection as "no change"
+	// and never re-publish "connected"/the real modem-state — leaving the UI
+	// stuck on the disconnected icon after the modem comes back. Syncing here
+	// ensures the recovery transition is detected and re-published.
+	s.LastState.Status = "disconnected"
+	s.LastState.LastRawModemStatus = "off"
+	s.LastState.PowerState = "off"
+
 	if err := s.Modem.PowerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
 	}
