@@ -391,6 +391,14 @@ func (s *Service) disableModem(ctx context.Context) {
 	s.LastState.LastRawModemStatus = "off"
 	s.LastState.PowerState = "off"
 
+	// Clear the clock-sync bookkeeping so the first GPS fix after resume
+	// bootstraps the system clock again. While suspended the system clock can
+	// drift (no NTP, RTC may be imprecise), and without this reset the
+	// IsZero() bootstrap branch in the monitor loop wouldn't re-fire — leaving
+	// an online device to wait for chrony/NTP and an offline device to wait up
+	// to a full clockSyncInterval before correcting.
+	s.lastClockSync = time.Time{}
+
 	if err := s.Modem.PowerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
 	}
