@@ -607,64 +607,65 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 	}
 }
 
-// startSMSRegistrationWatchdog monitors CS registration health and forces a
-// fresh combined EPS+IMSI attach when the SGs association at the MSC/VLR expires.
+// startSMSRegistrationWatchdog keeps the SGs association at the MSC/VLR alive
+// so that SMS delivery works indefinitely on LTE.
 //
-// On LTE with CEMODE=2 (CS/PS mode 1) the modem does a combined EPS+IMSI attach
-// at boot, registering with both the LTE core (PS) and the MSC/VLR via SGs (CS).
-// Lebara/O2 Germany's MSC has an SGs implicit detach timer of roughly 15 minutes.
-// The LTE periodic TAU timer (T3412) is set to hours by the network, so the UE
-// never sends a combined TAU before the MSC expires the SGs association. After
-// expiry the MSC silently discards the SGs record; the modem's NAS layer still
-// reports CS:attached but the LAC becomes 0xFFFE — the network can no longer
-// route SMS to the UE.
+// Background: on LTE with CEMODE=2 the modem does a combined EPS+IMSI attach at
+// boot, establishing an SGs association with the MSC/VLR. That SGs association is
+// the CS-domain path through which the MSC pages the UE for incoming SMS. The
+// MSC has an SGs implicit detach timer (~15 min on Lebara/O2 DE): if the UE
+// hasn't sent any CS-domain signalling via SGs within that window, the MSC
+// silently drops the SGs record and can no longer route SMS to the UE.
 //
-// Every 10 minutes we check the LAC via qmicli. If it is the reserved value 65534
-// (0xFFFE) we trigger a modem reset via the recovery machinery. A full modem
-// firmware reset (AT+CFUN=1,1) is required because AT+COPS=2/0 network
-// re-registration alone does not produce a valid combined EPS+IMSI attach on the
-// SIM7100E — only a full firmware restart resets the NAS state and triggers the
-// combined attach that re-creates the SGs association with a valid LAC.
+// Normally the modem's periodic TAU (T3412) would refresh the SGs, but O2 sets
+// T3412 to hours — far too long to keep a 15-minute timer alive. The modem has
+// no way to know the SGs has expired (the network never notifies it), so we
+// can't detect expiry; we can only prevent it.
+//
+// We send a USSD request (*100# — Lebara balance query) via AT+CUSD every 13
+// minutes. The request goes through the SGs interface (CS signalling, not PS
+// data), which causes the MSC to reset its SGs implicit detach timer. Crucially,
+// this leaves the LTE data bearer completely unaffected — only CS signalling
+// travels through SGs, not user data. Internet stays up.
+//
+// If the USSD fails (SGs already expired, or USSD not supported via SGs on this
+// network), we fall back to a full modem reset to re-establish the SGs.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
+		ticker := time.NewTicker(13 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.checkAndRefreshCSRegistration(ctx)
+				s.refreshSGsAssociation(ctx)
 			}
 		}
 	}()
 }
 
-func (s *Service) checkAndRefreshCSRegistration(ctx context.Context) {
-	// Read the CS registration LAC via QMI NAS. Using AT+CREG via MM's command
-	// interface is unreliable: MM manages the CREG mode internally and overrides
-	// external AT+CREG=2, causing queries to return only <n>,<stat> without LAC.
-	out, err := exec.CommandContext(ctx, "qmicli", "-d", "/dev/cdc-wdm0", "-p",
-		"--nas-get-serving-system").Output()
+func (s *Service) refreshSGsAssociation(ctx context.Context) {
+	modemPath, err := s.Modem.FindModem()
 	if err != nil {
-		s.Logger.Printf("sms: qmicli NAS check failed: %v", err)
+		s.Logger.Printf("sms: SGs keepalive skipped, no modem: %v", err)
 		return
 	}
 
-	if !strings.Contains(string(out), "location area code: '65534'") {
-		return // valid LAC — SGs association is alive
-	}
+	// Clear any stale USSD session so Initiate doesn't get "already in use".
+	s.MMClient.UssdCancel(modemPath)
 
-	s.Logger.Printf("sms: SGs expired at MSC/VLR (LAC=65534) — resetting modem for fresh combined attach")
-
-	// AT+COPS=2/0 alone does not produce a valid combined EPS+IMSI attach on
-	// the SIM7100E; only a full modem firmware reset resets the NAS state and
-	// triggers the combined registration that re-creates the SGs association.
-	// Route through handleModemFailure so the existing recovery state machine
-	// handles concurrent recovery attempts safely and re-arms the SMS watch.
-	if err := s.handleModemFailure(ctx, "sgs_expired"); err != nil {
-		s.Logger.Printf("sms: SGs-triggered modem reset failed: %v", err)
+	ussdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	reply, err := s.MMClient.UssdInitiate(ussdCtx, modemPath, "*100#")
+	if err != nil {
+		s.Logger.Printf("sms: SGs USSD keepalive failed (%v) — falling back to modem reset", err)
+		if resetErr := s.handleModemFailure(ctx, "sgs_refresh"); resetErr != nil {
+			s.Logger.Printf("sms: SGs refresh reset failed: %v", resetErr)
+		}
+		return
 	}
+	s.Logger.Printf("sms: SGs keepalive OK (USSD reply: %s)", strings.TrimSpace(reply))
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
