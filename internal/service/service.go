@@ -608,7 +608,7 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 }
 
 // startSMSRegistrationWatchdog monitors CS registration health and forces a
-// combined EPS+IMSI re-attach when the SGs association at the MSC/VLR expires.
+// fresh combined EPS+IMSI attach when the SGs association at the MSC/VLR expires.
 //
 // On LTE with CEMODE=2 (CS/PS mode 1) the modem does a combined EPS+IMSI attach
 // at boot, registering with both the LTE core (PS) and the MSC/VLR via SGs (CS).
@@ -619,9 +619,12 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 // reports CS:attached but the LAC becomes 0xFFFE — the network can no longer
 // route SMS to the UE.
 //
-// Every 10 minutes we query AT+CREG? for the current LAC. If it is the reserved
-// value 0xFFFE we deregister and re-register (AT+COPS=2 → AT+COPS=0), which with
-// CEMODE=2 triggers a fresh combined attach and a new valid SGs association.
+// Every 10 minutes we check the LAC via qmicli. If it is the reserved value 65534
+// (0xFFFE) we trigger a modem reset via the recovery machinery. A full modem
+// firmware reset (AT+CFUN=1,1) is required because AT+COPS=2/0 network
+// re-registration alone does not produce a valid combined EPS+IMSI attach on the
+// SIM7100E — only a full firmware restart resets the NAS state and triggers the
+// combined attach that re-creates the SGs association with a valid LAC.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
@@ -638,15 +641,9 @@ func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 }
 
 func (s *Service) checkAndRefreshCSRegistration(ctx context.Context) {
-	modemPath, err := s.Modem.FindModem()
-	if err != nil {
-		return
-	}
-
 	// Read the CS registration LAC via QMI NAS. Using AT+CREG via MM's command
-	// interface is unreliable here: MM manages the CREG mode internally (for its
-	// own URC handling) and overrides external AT+CREG=2 mode changes, causing
-	// subsequent AT+CREG? queries to return only <n>,<stat> without location info.
+	// interface is unreliable: MM manages the CREG mode internally and overrides
+	// external AT+CREG=2, causing queries to return only <n>,<stat> without LAC.
 	out, err := exec.CommandContext(ctx, "qmicli", "-d", "/dev/cdc-wdm0", "-p",
 		"--nas-get-serving-system").Output()
 	if err != nil {
@@ -658,28 +655,16 @@ func (s *Service) checkAndRefreshCSRegistration(ctx context.Context) {
 		return // valid LAC — SGs association is alive
 	}
 
-	s.Logger.Printf("sms: SGs expired at MSC/VLR (LAC=65534) — forcing combined re-attach")
+	s.Logger.Printf("sms: SGs expired at MSC/VLR (LAC=65534) — resetting modem for fresh combined attach")
 
-	if _, err := s.MMClient.SendCommand(modemPath, "AT+COPS=2", 15*time.Second); err != nil {
-		s.Logger.Printf("sms: COPS=2 (deregister) failed: %v", err)
-		return
+	// AT+COPS=2/0 alone does not produce a valid combined EPS+IMSI attach on
+	// the SIM7100E; only a full modem firmware reset resets the NAS state and
+	// triggers the combined registration that re-creates the SGs association.
+	// Route through handleModemFailure so the existing recovery state machine
+	// handles concurrent recovery attempts safely and re-arms the SMS watch.
+	if err := s.handleModemFailure(ctx, "sgs_expired"); err != nil {
+		s.Logger.Printf("sms: SGs-triggered modem reset failed: %v", err)
 	}
-
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(3 * time.Second):
-	}
-
-	// CEMODE=2 ensures this triggers a combined EPS+IMSI attach, creating a
-	// fresh SGs association with a valid LAC at the MSC/VLR.
-	if _, err := s.MMClient.SendCommand(modemPath, "AT+COPS=0", 60*time.Second); err != nil {
-		s.Logger.Printf("sms: COPS=0 (re-register) failed: %v", err)
-		return
-	}
-
-	s.Logger.Printf("sms: combined re-attach complete, re-arming SMS watch")
-	s.startSMSWatch(ctx)
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
