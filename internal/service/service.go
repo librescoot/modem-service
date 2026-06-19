@@ -610,26 +610,26 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 // startSMSRegistrationWatchdog keeps the SGs association at the MSC/VLR alive
 // so that SMS delivery works indefinitely on LTE.
 //
-// Background: on LTE with CEMODE=2 the modem does a combined EPS+IMSI attach at
-// boot, establishing an SGs association with the MSC/VLR. That SGs association is
-// the CS-domain path through which the MSC pages the UE for incoming SMS. The
-// MSC has an SGs implicit detach timer (~15 min on Lebara/O2 DE): if the UE
-// hasn't sent any CS-domain signalling via SGs within that window, the MSC
-// silently drops the SGs record and can no longer route SMS to the UE.
+// On LTE with CEMODE=2 the modem does a combined EPS+IMSI Attach at boot,
+// registering with both the LTE core (PS) and the MSC/VLR via SGs (CS). That
+// SGs association is the path through which the MSC pages the UE for incoming
+// SMS. Normally the modem's periodic TAU (T3412) would refresh SGs, but per
+// 3GPP TS 23.272 §8, periodic TAU does NOT trigger an SGsAP-LOCATION-UPDATE at
+// the VLR — and O2 sets T3412 to hours anyway.
 //
-// Normally the modem's periodic TAU (T3412) would refresh the SGs, but O2 sets
-// T3412 to hours — far too long to keep a 15-minute timer alive. The modem has
-// no way to know the SGs has expired (the network never notifies it), so we
-// can't detect expiry; we can only prevent it.
+// Per 3GPP TS 23.272, the MSC/VLR MUST disable its implicit detach timer for
+// EPS-attached UEs. O2/Lebara DE's MSC does not comply — it runs a ~15-minute
+// timer and silently drops the SGs record. The modem is never notified.
 //
-// We send a USSD request (*100# — Lebara balance query) via AT+CUSD every 13
-// minutes. The request goes through the SGs interface (CS signalling, not PS
-// data), which causes the MSC to reset its SGs implicit detach timer. Crucially,
-// this leaves the LTE data bearer completely unaffected — only CS signalling
-// travels through SGs, not user data. Internet stays up.
+// The only confirmed UE-side fix: a full modem firmware reset (AT+CFUN=1,1 via
+// MM's D-Bus Reset) clears all NAS state so the modem performs a fresh Combined
+// EPS/IMSI Attach, creating a new SGs association. We reset every 13 minutes —
+// safely within the ~15-minute timer — at the cost of ~60s of internet downtime
+// per cycle. AT+COPS=2/0 does not work because the modem retains NAS context
+// and sends a Combined TAU (not a fresh Attach); TAU does not refresh SGs.
 //
-// If the USSD fails (SGs already expired, or USSD not supported via SGs on this
-// network), we fall back to a full modem reset to re-establish the SGs.
+// The proper fix is operator-side: ask Lebara/O2 to disable the VLR implicit
+// detach timer for EPS-attached UEs, per the 3GPP spec.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(13 * time.Minute)
@@ -639,33 +639,13 @@ func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.refreshSGsAssociation(ctx)
+				s.Logger.Printf("sms: SGs refresh — resetting modem for fresh combined EPS+IMSI attach")
+				if err := s.handleModemFailure(ctx, "sgs_refresh"); err != nil {
+					s.Logger.Printf("sms: SGs refresh reset failed: %v", err)
+				}
 			}
 		}
 	}()
-}
-
-func (s *Service) refreshSGsAssociation(ctx context.Context) {
-	modemPath, err := s.Modem.FindModem()
-	if err != nil {
-		s.Logger.Printf("sms: SGs keepalive skipped, no modem: %v", err)
-		return
-	}
-
-	// Clear any stale USSD session so Initiate doesn't get "already in use".
-	s.MMClient.UssdCancel(modemPath)
-
-	ussdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	reply, err := s.MMClient.UssdInitiate(ussdCtx, modemPath, "*100#")
-	if err != nil {
-		s.Logger.Printf("sms: SGs USSD keepalive failed (%v) — falling back to modem reset", err)
-		if resetErr := s.handleModemFailure(ctx, "sgs_refresh"); resetErr != nil {
-			s.Logger.Printf("sms: SGs refresh reset failed: %v", resetErr)
-		}
-		return
-	}
-	s.Logger.Printf("sms: SGs keepalive OK (USSD reply: %s)", strings.TrimSpace(reply))
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {

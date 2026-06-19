@@ -23,7 +23,6 @@ const (
 
 	ModemMessagingInterface = "org.freedesktop.ModemManager1.Modem.Messaging"
 	SmsInterface            = "org.freedesktop.ModemManager1.Sms"
-	Modem3gppUssdInterface  = "org.freedesktop.ModemManager1.Modem.Modem3gpp.Ussd"
 
 	// MobileEquipment error names returned by ModemManager when SIM PIN
 	// operations fail. Used by IsWrongPinError and IsPukRequiredError.
@@ -164,25 +163,6 @@ func (c *Client) Reset(modemPath dbus.ObjectPath) error {
 	return call.Err
 }
 
-// UssdInitiate sends a USSD request and returns the network's response.
-// Blocks until the response arrives or ctx is cancelled.
-func (c *Client) UssdInitiate(ctx context.Context, modemPath dbus.ObjectPath, command string) (string, error) {
-	obj := c.conn.Object(ModemManagerService, modemPath)
-	c.log("USSD Initiate: %s", command)
-	var reply string
-	err := obj.CallWithContext(ctx, Modem3gppUssdInterface+".Initiate", 0, command).Store(&reply)
-	if err != nil {
-		return "", errors.Wrapf(err, "USSD initiate failed")
-	}
-	c.log("USSD reply: %s", reply)
-	return reply, nil
-}
-
-// UssdCancel cancels any in-progress USSD session (best-effort, errors ignored).
-func (c *Client) UssdCancel(modemPath dbus.ObjectPath) {
-	obj := c.conn.Object(ModemManagerService, modemPath)
-	obj.Call(Modem3gppUssdInterface+".Cancel", 0)
-}
 
 // SendPin sends a PIN to unlock the SIM. The pin string is never logged.
 func (c *Client) SendPin(simPath dbus.ObjectPath, pin string) error {
