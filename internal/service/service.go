@@ -555,13 +555,6 @@ func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
 		s.Logger.Printf("sms: MM supported-storages=%v", v.Value())
 	}
 
-	// Enable CS registration location info so AT+CREG? includes the LAC.
-	// The SGs watchdog uses this to detect when the SGs association at the
-	// MSC/VLR has expired (LAC=0xFFFE) and needs a fresh combined attach.
-	if _, err := s.MMClient.SendCommand(modemPath, "AT+CREG=2", 5*time.Second); err != nil {
-		s.Logger.Printf("sms: enabling CREG location info failed: %v", err)
-	}
-
 	// Enable new-message indications so the modem notifies MM of inbound SMS.
 	if _, err := s.MMClient.SendCommand(modemPath, "AT+CNMI=2,1,0,0,0", 5*time.Second); err != nil {
 		s.Logger.Printf("sms: enabling new-message indications (CNMI) failed: %v", err)
@@ -650,21 +643,22 @@ func (s *Service) checkAndRefreshCSRegistration(ctx context.Context) {
 		return
 	}
 
-	resp, err := s.MMClient.SendCommand(modemPath, "AT+CREG?", 5*time.Second)
+	// Read the CS registration LAC via QMI NAS. Using AT+CREG via MM's command
+	// interface is unreliable here: MM manages the CREG mode internally (for its
+	// own URC handling) and overrides external AT+CREG=2 mode changes, causing
+	// subsequent AT+CREG? queries to return only <n>,<stat> without location info.
+	out, err := exec.CommandContext(ctx, "qmicli", "-d", "/dev/cdc-wdm0", "-p",
+		"--nas-get-serving-system").Output()
 	if err != nil {
-		s.Logger.Printf("sms: CREG query failed: %v", err)
+		s.Logger.Printf("sms: qmicli NAS check failed: %v", err)
 		return
 	}
 
-	lac := parseCSRegistrationLAC(resp)
-	if lac == "" {
-		return // no location info in response; CREG=2 not yet applied or modem not registered
-	}
-	if !strings.EqualFold(lac, "FFFE") {
+	if !strings.Contains(string(out), "location area code: '65534'") {
 		return // valid LAC — SGs association is alive
 	}
 
-	s.Logger.Printf("sms: SGs expired at MSC/VLR (LAC=FFFE) — forcing combined re-attach")
+	s.Logger.Printf("sms: SGs expired at MSC/VLR (LAC=65534) — forcing combined re-attach")
 
 	if _, err := s.MMClient.SendCommand(modemPath, "AT+COPS=2", 15*time.Second); err != nil {
 		s.Logger.Printf("sms: COPS=2 (deregister) failed: %v", err)
@@ -686,26 +680,6 @@ func (s *Service) checkAndRefreshCSRegistration(ctx context.Context) {
 
 	s.Logger.Printf("sms: combined re-attach complete, re-arming SMS watch")
 	s.startSMSWatch(ctx)
-}
-
-// parseCSRegistrationLAC extracts the Location Area Code hex string from an
-// AT+CREG? response. Returns "" if no location info is present (CREG mode < 2
-// or the modem is not registered).
-//
-// Response format: +CREG: <n>,<stat>[,"<lac>","<ci>"[,<AcT>]]
-func parseCSRegistrationLAC(resp string) string {
-	for _, line := range strings.Split(resp, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "+CREG:") {
-			continue
-		}
-		parts := strings.SplitN(strings.TrimPrefix(line, "+CREG:"), ",", 5)
-		if len(parts) < 3 {
-			return ""
-		}
-		return strings.Trim(strings.TrimSpace(parts[2]), `"`)
-	}
-	return ""
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
