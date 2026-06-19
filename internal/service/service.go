@@ -613,23 +613,20 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 // On LTE with CEMODE=2 the modem does a combined EPS+IMSI Attach at boot,
 // registering with both the LTE core (PS) and the MSC/VLR via SGs (CS). That
 // SGs association is the path through which the MSC pages the UE for incoming
-// SMS. Normally the modem's periodic TAU (T3412) would refresh SGs, but per
-// 3GPP TS 23.272 §8, periodic TAU does NOT trigger an SGsAP-LOCATION-UPDATE at
-// the VLR — and O2 sets T3412 to hours anyway.
+// SMS. O2/Lebara DE's MSC runs a ~15-minute implicit detach timer and silently
+// drops the SGs record; the modem is never notified.
 //
-// Per 3GPP TS 23.272, the MSC/VLR MUST disable its implicit detach timer for
-// EPS-attached UEs. O2/Lebara DE's MSC does not comply — it runs a ~15-minute
-// timer and silently drops the SGs record. The modem is never notified.
+// We refresh SGs every 13 minutes by cycling the modem radio via MM's Enable
+// D-Bus call (equivalent to AT+CFUN=0 then AT+CFUN=1). This clears NAS state
+// and triggers a fresh Combined EPS/IMSI Attach without a full firmware restart,
+// reducing downtime to roughly 25 seconds vs the ~60s of a firmware reset.
 //
-// The only confirmed UE-side fix: a full modem firmware reset (AT+CFUN=1,1 via
-// MM's D-Bus Reset) clears all NAS state so the modem performs a fresh Combined
-// EPS/IMSI Attach, creating a new SGs association. We reset every 13 minutes —
-// safely within the ~15-minute timer — at the cost of ~60s of internet downtime
-// per cycle. AT+COPS=2/0 does not work because the modem retains NAS context
-// and sends a Combined TAU (not a fresh Attach); TAU does not refresh SGs.
+// If the radio cycle fails to restore SMS (Enable/Disable uses QMI low_power
+// which may not clear NAS context fully), the fallback is handleModemFailure
+// which does the proven full firmware reset.
 //
 // The proper fix is operator-side: ask Lebara/O2 to disable the VLR implicit
-// detach timer for EPS-attached UEs, per the 3GPP spec.
+// detach timer for EPS-attached UEs, per 3GPP TS 23.272.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(13 * time.Minute)
@@ -639,13 +636,56 @@ func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.Logger.Printf("sms: SGs refresh — resetting modem for fresh combined EPS+IMSI attach")
-				if err := s.handleModemFailure(ctx, "sgs_refresh"); err != nil {
-					s.Logger.Printf("sms: SGs refresh reset failed: %v", err)
-				}
+				s.refreshSGsViaRadioCycle(ctx)
 			}
 		}
 	}()
+}
+
+func (s *Service) refreshSGsViaRadioCycle(ctx context.Context) {
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs refresh skipped, no modem: %v", err)
+		return
+	}
+
+	s.Logger.Printf("sms: SGs refresh — cycling modem radio (Enable false→true) for fresh combined attach")
+
+	if err := s.MMClient.Enable(modemPath, false); err != nil {
+		s.Logger.Printf("sms: SGs refresh: disable failed (%v), falling back to firmware reset", err)
+		if err := s.handleModemFailure(ctx, "sgs_refresh"); err != nil {
+			s.Logger.Printf("sms: SGs refresh firmware reset failed: %v", err)
+		}
+		return
+	}
+
+	// Brief pause to let the network clear the UE's registration state before
+	// re-enabling so the modem performs a fresh Combined Attach (not a TAU).
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(3 * time.Second):
+	}
+
+	if err := s.MMClient.Enable(modemPath, true); err != nil {
+		s.Logger.Printf("sms: SGs refresh: enable failed (%v), falling back to firmware reset", err)
+		if err := s.handleModemFailure(ctx, "sgs_refresh"); err != nil {
+			s.Logger.Printf("sms: SGs refresh firmware reset failed: %v", err)
+		}
+		return
+	}
+
+	// Wait for the modem to complete network registration and APN reconnection
+	// before re-applying CNMI settings and draining any queued messages.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+
+	s.configureAndDiagnoseSMS(modemPath)
+	s.drainSMS(modemPath)
+	s.Logger.Printf("sms: SGs refresh complete (radio cycle)")
 }
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
