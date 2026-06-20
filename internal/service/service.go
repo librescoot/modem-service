@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +25,7 @@ import (
 	"modem-service/internal/modem/connectivity"
 	redisClient "modem-service/internal/redis"
 	"modem-service/internal/sim"
+	"modem-service/internal/sms"
 	"modem-service/internal/usb"
 )
 
@@ -64,6 +67,11 @@ type Service struct {
 	apnUsername           atomic.Value // string; cellular.username
 	apnPassword           atomic.Value // string; cellular.password
 	apnAuth               atomic.Value // string; cellular.auth ("none"|"pap"|"chap")
+	SMS                   *sms.Manager
+	smsWatchCancel        context.CancelFunc // cancels the active inbound-SMS watch; re-armed on modem recovery
+	unreadSMS             atomic.Int64       // inbound messages since start; published as sms.unread-count
+	ownMSISDN      string       // scooter's own phone number, resolved once at startup for voice-call keepalive
+	lastCSActivity        atomic.Int64       // UnixNano of last confirmed CS event (any SMS sent/received)
 	LastState             *modem.State
 	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
 	GPSEnabledTime        time.Time  // When GPS was first enabled
@@ -153,6 +161,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		MMClient:            mmClient,
 		Sim:                 sim.New(mmClient, logger),
 		Apn:                 apn.New(mmClient, apn.NewNMCli(), nmWWANConnection, logger),
+		SMS:                 sms.New(mmClient, logger),
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
@@ -190,6 +199,14 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.Redis.StartModemCommandHandler(s.handleModemCommand); err != nil {
 		s.Logger.Printf("Failed to start modem command handler: %v", err)
 	}
+
+	// Start listening for outbound SMS requests
+	if err := s.Redis.StartSMSCommandHandler(s.handleSMSCommand); err != nil {
+		s.Logger.Printf("Failed to start SMS command handler: %v", err)
+	}
+	// Reset SMS operational state so a stale "sending" or "error" from a previous
+	// crash doesn't persist in Redis indefinitely.
+	s.Redis.PublishSMSState("state", "idle")
 
 	// Start watching vehicle state to auto-enable modem
 	if err := s.Redis.StartVehicleStateWatcher(s.handleVehicleState); err != nil {
@@ -265,6 +282,14 @@ func (s *Service) Run(ctx context.Context) error {
 		s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
 	}
 
+	// Arm the inbound-SMS watch now that the modem should be present; this
+	// also drains any messages that arrived while we were offline.
+	s.startSMSWatch(ctx)
+
+	// Periodically check that the SGs CS registration at the MSC/VLR is still
+	// alive and force a fresh combined attach if it has expired (LAC=0xFFFE).
+	s.startSMSRegistrationWatchdog(ctx)
+
 	s.Logger.Printf("Starting modem service on interface %s", s.Config.Interface)
 	go s.monitorStatus(ctx)
 
@@ -278,6 +303,13 @@ func (s *Service) Run(ctx context.Context) error {
 	case <-s.monitorDone:
 	case <-time.After(10 * time.Second):
 		s.Logger.Printf("Monitor goroutine did not exit within 10s; proceeding with shutdown")
+	}
+
+	// Stop the inbound-SMS watch. It also stops when ctx is cancelled (its
+	// context is derived from ctx), but cancel explicitly now that the monitor
+	// goroutine — the only other place that re-arms it — has exited.
+	if s.smsWatchCancel != nil {
+		s.smsWatchCancel()
 	}
 
 	// Graceful shutdown: keep last lat/lng in Redis as a useful fallback
@@ -413,6 +445,441 @@ func (s *Service) disableModem(ctx context.Context) {
 	s.Logger.Printf("Modem disabled")
 }
 
+// handleSMSCommand processes one outbound SMS request from the scooter:sms
+// queue. The payload is JSON: {"to":"+49...","text":"..."}. Send progress is
+// reflected in the sms.state field (sending → idle on success, error on
+// failure); on success last-sent-to/last-sent-at are also published.
+func (s *Service) handleSMSCommand(payload string) error {
+	var req sms.SendRequest
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		s.Logger.Printf("sms: invalid command payload: %v", err)
+		s.Redis.PublishSMSState("state", "error")
+		return fmt.Errorf("invalid sms command: %w", err)
+	}
+	if req.To == "" {
+		s.Logger.Printf("sms: command missing recipient")
+		s.Redis.PublishSMSState("state", "error")
+		return fmt.Errorf("sms command missing recipient")
+	}
+
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: cannot send, no modem: %v", err)
+		s.Redis.PublishSMSState("state", "error")
+		return fmt.Errorf("no modem available: %w", err)
+	}
+
+	s.Redis.PublishSMSState("state", "sending")
+	outcome, sendErr := s.SMS.Send(modemPath, req)
+	if outcome != sms.OutcomeOK {
+		s.Logger.Printf("sms: send failed (%s): %v", outcome, sendErr)
+		s.Redis.PublishSMSState("state", "error")
+		return sendErr
+	}
+
+	if err := s.Redis.PublishSMSFields(map[string]string{
+		"state":        "idle",
+		"last-sent-to": req.To,
+		"last-sent-at": time.Now().Format(time.RFC3339),
+	}, "state"); err != nil {
+		s.Logger.Printf("sms: failed to publish send result: %v", err)
+	}
+	s.Logger.Printf("sms: sent to %s", req.To)
+	return nil
+}
+
+// startSMSWatch (re-)arms the inbound-SMS signal watch on the current modem
+// path. It cancels any previous watch, drains messages already in storage, and
+// starts a fresh Added-signal goroutine. Called at startup and after every
+// modem recovery, since a reset can rebind the modem's D-Bus path.
+func (s *Service) startSMSWatch(ctx context.Context) {
+	if s.smsWatchCancel != nil {
+		s.smsWatchCancel()
+		s.smsWatchCancel = nil
+	}
+
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: no modem yet, deferring SMS watch: %v", err)
+		return
+	}
+
+	// Resolve own MSISDN once so the voice-call keepalive knows what number to dial.
+	if s.ownMSISDN == "" {
+		if msisdn := s.queryOwnMSISDN(modemPath); msisdn != "" {
+			s.ownMSISDN = msisdn
+			s.Logger.Printf("sms: own MSISDN: %s", msisdn)
+		}
+	}
+
+	// Arm the watch BEFORE draining: a message that arrives during setup then
+	// still triggers the signal, and the drain below catches whatever is
+	// already stored. Draining first would leave a race window where an inbound
+	// SMS lands after the drain but before the watch and goes unnoticed until
+	// the next message or the periodic poll.
+	watchCtx, cancel := context.WithCancel(ctx)
+	if err := s.MMClient.WatchSMSAdded(watchCtx, modemPath, func(smsPath dbus.ObjectPath, received bool) {
+		s.Logger.Printf("sms: Added signal path=%s received=%v", smsPath, received)
+		if !received {
+			return // an outbound object we created; ignore
+		}
+		// Process the signalled object directly. Some modems deliver a received
+		// message as a transient object that never lands in storage, so a
+		// re-list (drainSMS) would miss it.
+		msg := s.SMS.HandleAdded(modemPath, smsPath)
+		if msg == nil {
+			return
+		}
+		s.publishIncomingSMS(msg)
+	}); err != nil {
+		s.Logger.Printf("sms: failed to start SMS watch: %v", err)
+		cancel()
+		// Still drain once so messages already in storage aren't left behind.
+		s.drainSMS(modemPath)
+		return
+	}
+	s.smsWatchCancel = cancel
+	s.Logger.Printf("sms: watching for incoming messages on %s", modemPath)
+
+	// Make sure the modem actually tells MM about inbound SMS, and log its SMS
+	// config/storage for diagnosis.
+	s.configureAndDiagnoseSMS(modemPath)
+
+	// Pick up anything already in storage (received while offline, or before
+	// this (re-)arm).
+	s.drainSMS(modemPath)
+}
+
+// configureAndDiagnoseSMS enables new-message indications on the modem and logs
+// its SMS configuration and stored messages. On some modems ModemManager is
+// never told about inbound SMS unless AT+CNMI is set so the modem emits +CMTI on
+// receipt; we set it here (best-effort, via MM's command interface — the same
+// path the APN code uses). The logged AT+CMGL dump shows, from the journal
+// alone, whether inbound messages are landing in the modem's AT-readable store,
+// which tells us how to finish wiring up receive if MM still doesn't surface
+// them. Every command is best-effort: if MM restricts Modem.Command the errors
+// are logged and nothing else is affected.
+func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
+	if v, err := s.MMClient.GetProperty(modemPath, mm.ModemMessagingInterface, "DefaultStorage"); err == nil {
+		s.Logger.Printf("sms: MM default-storage=%v", v.Value())
+	}
+	if v, err := s.MMClient.GetProperty(modemPath, mm.ModemMessagingInterface, "SupportedStorages"); err == nil {
+		s.Logger.Printf("sms: MM supported-storages=%v", v.Value())
+	}
+
+	// Enable new-message indications so the modem notifies MM of inbound SMS.
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+CNMI=2,1,0,0,0", 5*time.Second); err != nil {
+		s.Logger.Printf("sms: enabling new-message indications (CNMI) failed: %v", err)
+	} else {
+		s.Logger.Printf("sms: enabled new-message indications (AT+CNMI=2,1,0,0,0)")
+	}
+
+	// Diagnostics: current indication/storage config and the modem's own view
+	// of stored SMS (PDU mode, so AT+CMGL=4 returns raw PDUs).
+	for _, q := range []string{"AT+CPMS?", "AT+CNMI?"} {
+		if resp, err := s.MMClient.SendCommand(modemPath, q, 5*time.Second); err == nil {
+			s.Logger.Printf("sms: %s -> %s", q, strings.TrimSpace(resp))
+		} else {
+			s.Logger.Printf("sms: %s failed: %v", q, err)
+		}
+	}
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+CMGF=0", 5*time.Second); err == nil {
+		if resp, err := s.MMClient.SendCommand(modemPath, "AT+CMGL=4", 10*time.Second); err == nil {
+			s.Logger.Printf("sms: AT+CMGL=4 (modem SMS store) -> %s", strings.TrimSpace(resp))
+		} else {
+			s.Logger.Printf("sms: AT+CMGL=4 failed: %v", err)
+		}
+	}
+}
+
+// drainSMS reads and publishes every inbound message currently in storage.
+func (s *Service) drainSMS(modemPath dbus.ObjectPath) {
+	msgs, err := s.SMS.DrainReceived(modemPath)
+	if err != nil {
+		s.Logger.Printf("sms: drain failed: %v", err)
+		return
+	}
+	for _, msg := range msgs {
+		s.publishIncomingSMS(msg)
+	}
+}
+
+// publishIncomingSMS writes one received message to the sms hash and bumps the
+// running unread counter. A single "last-received-at" notification is published
+// so subscribers wake once and HGET the rest.
+func (s *Service) publishIncomingSMS(msg *sms.Message) {
+	s.touchCSActivity()
+	count := s.unreadSMS.Add(1)
+	if err := s.Redis.PublishSMSFields(map[string]string{
+		"last-received-from": msg.Number,
+		"last-received-text": msg.Text,
+		"last-received-at":   msg.Timestamp.Format(time.RFC3339),
+		"unread-count":       strconv.FormatInt(count, 10),
+	}, "last-received-at"); err != nil {
+		s.Logger.Printf("sms: failed to publish incoming message: %v", err)
+	}
+}
+
+
+func (s *Service) touchCSActivity() {
+	s.lastCSActivity.Store(time.Now().UnixNano())
+}
+
+// queryOwnMSISDN asks the modem for its own subscriber number via AT+CNUM.
+// Returns "" if the command fails or the SIM doesn't have an MSISDN stored.
+func (s *Service) queryOwnMSISDN(modemPath dbus.ObjectPath) string {
+	resp, err := s.MMClient.SendCommand(modemPath, "AT+CNUM", 5*time.Second)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+CNUM:") {
+			continue
+		}
+		// +CNUM: "","number",129  or  +CNUM: "","+number",145
+		parts := strings.SplitN(line[6:], ",", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		num := strings.Trim(strings.TrimSpace(parts[1]), "\"")
+		if num == "" {
+			continue
+		}
+		if !strings.HasPrefix(num, "+") {
+			num = "+" + num
+		}
+		return num
+	}
+	return ""
+}
+
+
+// refreshSGsViaVoiceCall refreshes the SGs association by placing a brief MO
+// voice call to the scooter's own number. The call setup sends an Extended
+// Service Request (MO_CS_FB) to the MME via LTE NAS; the MME forwards it to
+// the MSC/VLR via SGs (SGsAP-SERVICE-REQUEST), resetting the implicit IMSI
+// detach timer. The modem does CSFB to EDGE for the duration and returns to
+// LTE after hangup — internet stays connected throughout, IP unchanged.
+//
+// The self-call never connects (the same line cannot answer an incoming call
+// while it is placing an outgoing one), so no call charges are incurred.
+func (s *Service) refreshSGsViaVoiceCall(ctx context.Context) bool {
+	if s.ownMSISDN == "" {
+		s.Logger.Printf("sms: SGs keepalive via voice call skipped: own MSISDN unknown")
+		return false
+	}
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs keepalive via voice call skipped, no modem: %v", err)
+		return false
+	}
+
+	s.Logger.Printf("sms: SGs keepalive — MO call to self (CSFB→EDGE, free)")
+	start := time.Now()
+
+	callPath, err := s.MMClient.CreateCall(modemPath, s.ownMSISDN)
+	if err != nil {
+		s.Logger.Printf("sms: SGs keepalive voice call create failed: %v", err)
+		return false
+	}
+	defer s.MMClient.DeleteCall(modemPath, callPath)
+
+	if err := s.MMClient.StartCall(callPath); err != nil {
+		s.Logger.Printf("sms: SGs keepalive voice call start failed: %v", err)
+		return false
+	}
+
+	// Hold for 2 s so the SGsAP-SERVICE-REQUEST reaches the MSC before we
+	// tear down. The Extended Service Request goes out synchronously on Start,
+	// so this is a generous margin.
+	select {
+	case <-ctx.Done():
+		s.MMClient.HangupCall(callPath)
+		return false
+	case <-time.After(2 * time.Second):
+	}
+
+	if err := s.MMClient.HangupCall(callPath); err != nil {
+		s.Logger.Printf("sms: SGs keepalive voice call hangup error (CS signaling already sent): %v", err)
+	}
+
+	s.touchCSActivity()
+	s.Logger.Printf("sms: SGs keepalive complete — voice call in %.1fs (CSFB, free)", time.Since(start).Seconds())
+	return true
+}
+
+// startSMSRegistrationWatchdog keeps the SGs association at the MSC/VLR alive
+// so that SMS delivery works indefinitely on LTE.
+//
+// On LTE with CEMODE=2 the modem does a combined EPS+IMSI Attach at boot,
+// registering with both the LTE core (PS) and the MSC/VLR via SGs (CS). That
+// SGs association is the path through which the MSC pages the UE for incoming
+// SMS. O2/Lebara DE's MSC runs a ~15-minute implicit detach timer and silently
+// drops the SGs record; the modem is never notified.
+//
+// The watchdog polls every minute and sends a keepalive only if no CS event
+// has been observed in the last 13 minutes (2-minute margin before the 15-min
+// timer expires). Any real incoming SMS counts as a CS event and resets the
+// idle clock, so active scooters that receive fleet SMS regularly pay nothing.
+//
+// Primary keepalive — refreshSGsViaVoiceCall: place a brief MO call to own
+// number. The call setup sends Extended Service Request (MO_CS_FB) to the MME
+// via NAS; MME forwards SGsAP-SERVICE-REQUEST to the MSC, resetting the timer.
+// Modem does CSFB to EDGE for ~2 s then returns to LTE. IP unchanged, free.
+//
+// Fallback — refreshSGsViaCFUN4: if both above fail (SGs already expired),
+// AT+CFUN=4/1 forces a fresh Combined Attach (~6 s SMS downtime, ~29 s
+// internet downtime). On this hardware CFUN=4 clears NAS context so CFUN=1
+// always triggers a full Combined Attach rather than a lightweight TAU.
+//
+// Last resort — refreshSGsViaRadioCycle: MM Enable(false→true), same outcome.
+func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
+	// SGs was just established by the Combined Attach at boot; start the idle
+	// clock from now so we don't fire a redundant keepalive immediately.
+	s.touchCSActivity()
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				lastActivity := time.Unix(0, s.lastCSActivity.Load())
+				idle := time.Since(lastActivity)
+				if idle < 13*time.Minute {
+					continue // CS was active recently; SGs timer not at risk
+				}
+				s.Logger.Printf("sms: no CS activity for %.0f min — sending SGs keepalive", idle.Minutes())
+				if s.refreshSGsViaVoiceCall(ctx) {
+					continue
+				}
+				s.Logger.Printf("sms: voice call keepalive failed, falling back to CFUN=4/1 cycle")
+				if !s.refreshSGsViaCFUN4(ctx) {
+					s.Logger.Printf("sms: CFUN=4/1 refresh failed, falling back to radio cycle")
+					s.refreshSGsViaRadioCycle(ctx)
+				}
+			}
+		}
+	}()
+}
+
+// refreshSGsViaCFUN4 refreshes the SGs association using AT+CFUN=4 (fly mode)
+// followed immediately by AT+CFUN=1. On the SIM7100E, CFUN=4 clears NAS
+// context, so CFUN=1 triggers a fresh Combined Attach (not a lightweight TAU),
+// causing ~6 s of SMS downtime and ~29 s of internet downtime. Used as a
+// fallback when the voice-call keepalive fails.
+//
+// Returns true if the modem reconnected and SMS was re-configured successfully.
+// Returns false if the approach fails so the caller can fall back.
+func (s *Service) refreshSGsViaCFUN4(ctx context.Context) bool {
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs refresh via CFUN=4/1 skipped, no modem: %v", err)
+		return false
+	}
+
+	s.Logger.Printf("sms: SGs refresh — AT+CFUN=4/1 fly-mode cycle (TAU, ~3-10s downtime)")
+
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+CFUN=4", 5*time.Second); err != nil {
+		s.Logger.Printf("sms: SGs refresh: AT+CFUN=4 failed: %v", err)
+		return false
+	}
+
+	// Brief fly-mode period. 500 ms is enough for the network to see the modem
+	// as unreachable; NAS context is held in modem RAM throughout.
+	select {
+	case <-ctx.Done():
+		s.MMClient.SendCommand(modemPath, "AT+CFUN=1", 5*time.Second) //nolint:errcheck
+		return false
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// Restore radio. If MM transitioned the modem to its own disabled state
+	// due to deregistration URCs, SendCommand will fail; fall back to Enable.
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+CFUN=1", 5*time.Second); err != nil {
+		s.Logger.Printf("sms: SGs refresh: AT+CFUN=1 failed (%v), trying MM Enable(true)", err)
+		if enableErr := s.MMClient.Enable(modemPath, true); enableErr != nil {
+			s.Logger.Printf("sms: SGs refresh: MM Enable(true) also failed: %v", enableErr)
+			return false
+		}
+	}
+
+	// Poll until modem reports connected or the 20-second window closes.
+	// A TAU completes in ~2-5 s; a full attach takes ~26 s.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(1 * time.Second):
+		}
+		state, err := s.Modem.GetModemInfo(s.Config.Interface)
+		if err == nil && state.Status == "connected" {
+			break
+		}
+	}
+
+	// Re-fetch modem path in case MM re-registered the modem with a new D-Bus path.
+	modemPath, err = s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs refresh: modem gone after CFUN cycle: %v", err)
+		return false
+	}
+
+	s.configureAndDiagnoseSMS(modemPath)
+	s.drainSMS(modemPath)
+	s.Logger.Printf("sms: SGs refresh complete (CFUN=4/1 fly-mode cycle)")
+	return true
+}
+
+func (s *Service) refreshSGsViaRadioCycle(ctx context.Context) {
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs refresh skipped, no modem: %v", err)
+		return
+	}
+
+	s.Logger.Printf("sms: SGs refresh — cycling modem radio (Enable false→true) for fresh combined attach")
+
+	if err := s.MMClient.Enable(modemPath, false); err != nil {
+		s.Logger.Printf("sms: SGs refresh: disable failed (%v), falling back to firmware reset", err)
+		if err := s.handleModemFailure(ctx, "sgs_refresh"); err != nil {
+			s.Logger.Printf("sms: SGs refresh firmware reset failed: %v", err)
+		}
+		return
+	}
+
+	// Brief pause to let the network clear the UE's registration state before
+	// re-enabling so the modem performs a fresh Combined Attach (not a TAU).
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(3 * time.Second):
+	}
+
+	if err := s.MMClient.Enable(modemPath, true); err != nil {
+		s.Logger.Printf("sms: SGs refresh: enable failed (%v), falling back to firmware reset", err)
+		if err := s.handleModemFailure(ctx, "sgs_refresh"); err != nil {
+			s.Logger.Printf("sms: SGs refresh firmware reset failed: %v", err)
+		}
+		return
+	}
+
+	// Wait for the modem to complete network registration and APN reconnection
+	// before re-applying CNMI settings and draining any queued messages.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+
+	s.configureAndDiagnoseSMS(modemPath)
+	s.drainSMS(modemPath)
+	s.Logger.Printf("sms: SGs refresh complete (radio cycle)")
+}
+
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	if s.Modem.IsModemPresent() {
 		s.Logger.Printf("Modem is already present via D-Bus")
@@ -500,6 +967,10 @@ func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
 	s.resetGPSAfterModemRecovery()
 	s.publishHealthState(ctx)
 	s.Redis.ClearFault(redisClient.FaultCodeModemRecoveryFailed)
+
+	// The modem's D-Bus path can change across a reset; re-arm the inbound-SMS
+	// watch on the new path (and drain anything that queued meanwhile).
+	s.startSMSWatch(ctx)
 }
 
 func (s *Service) checkHealth(ctx context.Context) error {
@@ -1352,6 +1823,12 @@ func (s *Service) monitorStatus(ctx context.Context) {
 			}
 			if err := s.checkAndPublishModemStatus(ctx); err != nil {
 				s.Logger.Printf("Periodic modem status check failed: %v", err)
+			}
+			// Poll for inbound SMS as a reliable fallback to the Added signal:
+			// some modems don't emit Added for SIM-stored messages, so a
+			// signal-only design can silently miss them.
+			if modemPath, err := s.Modem.FindModem(); err == nil {
+				s.drainSMS(modemPath)
 			}
 		case <-cellTimer.C:
 			if !s.modemEnabled.Load() {
