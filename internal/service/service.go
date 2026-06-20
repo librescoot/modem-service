@@ -70,6 +70,8 @@ type Service struct {
 	SMS                   *sms.Manager
 	smsWatchCancel        context.CancelFunc // cancels the active inbound-SMS watch; re-armed on modem recovery
 	unreadSMS             atomic.Int64       // inbound messages since start; published as sms.unread-count
+	ownMSISDN             string             // scooter's own phone number, resolved once at startup for MO-SMS keepalive
+	smsKeepaliveAck       chan struct{}       // closed/signalled when the keepalive loopback SMS arrives
 	LastState             *modem.State
 	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
 	GPSEnabledTime        time.Time  // When GPS was first enabled
@@ -160,6 +162,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		Sim:                 sim.New(mmClient, logger),
 		Apn:                 apn.New(mmClient, apn.NewNMCli(), nmWWANConnection, logger),
 		SMS:                 sms.New(mmClient, logger),
+		smsKeepaliveAck:     make(chan struct{}, 1),
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
@@ -502,6 +505,14 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 		return
 	}
 
+	// Resolve own MSISDN once so the MO-SMS keepalive knows where to send.
+	if s.ownMSISDN == "" {
+		if msisdn := s.queryOwnMSISDN(modemPath); msisdn != "" {
+			s.ownMSISDN = msisdn
+			s.Logger.Printf("sms: own MSISDN: %s", msisdn)
+		}
+	}
+
 	// Arm the watch BEFORE draining: a message that arrives during setup then
 	// still triggers the signal, and the drain below catches whatever is
 	// already stored. Draining first would leave a race window where an inbound
@@ -516,9 +527,18 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 		// Process the signalled object directly. Some modems deliver a received
 		// message as a transient object that never lands in storage, so a
 		// re-list (drainSMS) would miss it.
-		if msg := s.SMS.HandleAdded(modemPath, smsPath); msg != nil {
-			s.publishIncomingSMS(msg)
+		msg := s.SMS.HandleAdded(modemPath, smsPath)
+		if msg == nil {
+			return
 		}
+		if s.isKeepaliveMsg(msg) {
+			select {
+			case s.smsKeepaliveAck <- struct{}{}:
+			default:
+			}
+			return
+		}
+		s.publishIncomingSMS(msg)
 	}); err != nil {
 		s.Logger.Printf("sms: failed to start SMS watch: %v", err)
 		cancel()
@@ -588,6 +608,13 @@ func (s *Service) drainSMS(modemPath dbus.ObjectPath) {
 		return
 	}
 	for _, msg := range msgs {
+		if s.isKeepaliveMsg(msg) {
+			select {
+			case s.smsKeepaliveAck <- struct{}{}:
+			default:
+			}
+			continue
+		}
 		s.publishIncomingSMS(msg)
 	}
 }
@@ -607,6 +634,90 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 	}
 }
 
+// isKeepaliveMsg returns true when msg is the loopback echo of our own
+// MO-SMS keepalive (sent to self with text "k"). Keepalive messages are
+// silently discarded so they don't appear as real inbound messages in Redis.
+func (s *Service) isKeepaliveMsg(msg *sms.Message) bool {
+	return s.ownMSISDN != "" && msg.Number == s.ownMSISDN && msg.Text == "k"
+}
+
+// queryOwnMSISDN asks the modem for its own subscriber number via AT+CNUM.
+// Returns "" if the command fails or the SIM doesn't have an MSISDN stored.
+func (s *Service) queryOwnMSISDN(modemPath dbus.ObjectPath) string {
+	resp, err := s.MMClient.SendCommand(modemPath, "AT+CNUM", 5*time.Second)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+CNUM:") {
+			continue
+		}
+		// +CNUM: "","number",129  or  +CNUM: "","+number",145
+		parts := strings.SplitN(line[6:], ",", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		num := strings.Trim(strings.TrimSpace(parts[1]), "\"")
+		if num == "" {
+			continue
+		}
+		if !strings.HasPrefix(num, "+") {
+			num = "+" + num
+		}
+		return num
+	}
+	return ""
+}
+
+// refreshSGsViaMOSMS refreshes the SGs association at the MSC by sending a
+// mobile-originated SMS to the scooter's own number. The MO-SMS causes the
+// MME to emit SGsAP-UPLINK-UNITDATA to the MSC (3GPP TS 29.118), which resets
+// the MSC's implicit IMSI detach timer — identical to what a TAU or combined
+// attach does, but with zero internet downtime and no GPS disruption.
+//
+// We wait up to 30 s for the loopback delivery. Its arrival confirms that SGs
+// paging (the MT path) is also working, i.e., we can receive SMS. If the
+// loopback does not arrive the method returns false so the caller can fall back
+// to a CFUN=4/1 cycle.
+func (s *Service) refreshSGsViaMOSMS(ctx context.Context) bool {
+	if s.ownMSISDN == "" {
+		s.Logger.Printf("sms: SGs keepalive via MO-SMS skipped: own MSISDN unknown")
+		return false
+	}
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs keepalive via MO-SMS skipped, no modem: %v", err)
+		return false
+	}
+
+	// Drain any stale ack from a previous cycle before sending.
+	select {
+	case <-s.smsKeepaliveAck:
+	default:
+	}
+
+	s.Logger.Printf("sms: SGs keepalive — MO-SMS to self (%s), awaiting loopback", s.ownMSISDN)
+	start := time.Now()
+	outcome, sendErr := s.SMS.Send(modemPath, sms.SendRequest{To: s.ownMSISDN, Text: "k"})
+	if outcome != sms.OutcomeOK {
+		s.Logger.Printf("sms: SGs keepalive MO-SMS send failed: %v", sendErr)
+		return false
+	}
+
+	// Wait for the loopback to arrive (confirms SGs MT-paging is working too).
+	select {
+	case <-ctx.Done():
+		return false
+	case <-s.smsKeepaliveAck:
+		s.Logger.Printf("sms: SGs keepalive complete — loopback received in %.1fs (zero downtime)", time.Since(start).Seconds())
+		return true
+	case <-time.After(30 * time.Second):
+		s.Logger.Printf("sms: SGs keepalive loopback timeout after 30s — SGs may have expired, falling back")
+		return false
+	}
+}
+
 // startSMSRegistrationWatchdog keeps the SGs association at the MSC/VLR alive
 // so that SMS delivery works indefinitely on LTE.
 //
@@ -616,27 +727,34 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 // SMS. O2/Lebara DE's MSC runs a ~15-minute implicit detach timer and silently
 // drops the SGs record; the modem is never notified.
 //
-// Per 3GPP TS 23.272 §8.3.1, even a normal Tracking Area Update (TAU) causes
-// the MME to send SGsAP-LOCATION-UPDATE to the MSC, resetting its implicit
-// detach timer. We therefore first attempt refreshSGsViaCFUN4 which uses
-// AT+CFUN=4/1 (fly-mode cycle): CFUN=4 preserves NAS context (GUTI, security
-// keys) so CFUN=1 triggers a TAU rather than a full Combined Attach, keeping
-// internet downtime to ~3-10 s instead of ~29 s.
+// Primary strategy — refreshSGsViaMOSMS: send a 1-char SMS to the scooter's
+// own number every 10 minutes. The MO-SMS causes the MME to emit
+// SGsAP-UPLINK-UNITDATA to the MSC (3GPP TS 29.118), which resets the MSC's
+// implicit IMSI detach timer with zero internet downtime and no GPS disruption.
+// We wait for the loopback to confirm MT-paging (SGs) is also alive.
 //
-// If the CFUN=4/1 cycle fails (e.g. MM rejects the command or the modem does
-// not re-register within 20 s), we fall back to refreshSGsViaRadioCycle which
-// uses MM Enable(false→true) for a proven ~29 s full re-attach.
+// Fallback — refreshSGsViaCFUN4: if the loopback does not arrive (SGs already
+// expired), AT+CFUN=4/1 forces a fresh Combined Attach (~6 s SMS downtime,
+// ~29 s internet downtime). On this hardware CFUN=4 clears NAS context so
+// CFUN=1 always triggers a full Combined Attach rather than a lightweight TAU.
+//
+// Last resort — refreshSGsViaRadioCycle: MM Enable(false→true), same outcome
+// as CFUN=4/1 but proven independently.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(12 * time.Minute)
+		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if s.refreshSGsViaMOSMS(ctx) {
+					continue
+				}
+				s.Logger.Printf("sms: MO-SMS keepalive failed, falling back to CFUN=4/1 cycle")
 				if !s.refreshSGsViaCFUN4(ctx) {
-					s.Logger.Printf("sms: CFUN=4/1 refresh failed or uncertain, falling back to radio cycle")
+					s.Logger.Printf("sms: CFUN=4/1 refresh failed, falling back to radio cycle")
 					s.refreshSGsViaRadioCycle(ctx)
 				}
 			}
@@ -645,10 +763,10 @@ func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 }
 
 // refreshSGsViaCFUN4 refreshes the SGs association using AT+CFUN=4 (fly mode)
-// followed immediately by AT+CFUN=1. Because fly mode preserves NAS context,
-// the return triggers a TAU rather than a fresh Combined Attach — the MME then
-// sends SGsAP-LOCATION-UPDATE to the MSC (3GPP TS 23.272 §8.3.1), resetting
-// the 15-min implicit detach timer with only ~3-10 s of internet downtime.
+// followed immediately by AT+CFUN=1. On the SIM7100E, CFUN=4 clears NAS
+// context, so CFUN=1 triggers a fresh Combined Attach (not a lightweight TAU),
+// causing ~6 s of SMS downtime and ~29 s of internet downtime. Used as a
+// fallback when the MO-SMS keepalive fails.
 //
 // Returns true if the modem reconnected and SMS was re-configured successfully.
 // Returns false if the approach fails so the caller can fall back.
