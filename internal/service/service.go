@@ -498,6 +498,11 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 		s.smsWatchCancel = nil
 	}
 
+	// Modem just came up (boot or post-resume recovery): it performed a fresh
+	// Combined Attach which re-establishes SGs, so reset the idle clock. Without
+	// this the watchdog would see stale idle time and fire a redundant keepalive.
+	s.touchCSActivity()
+
 	modemPath, err := s.Modem.FindModem()
 	if err != nil {
 		s.Logger.Printf("sms: no modem yet, deferring SMS watch: %v", err)
@@ -746,6 +751,9 @@ func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if !s.modemEnabled.Load() {
+					continue // modem is off (suspend/disable); nothing to keep alive
+				}
 				lastActivity := time.Unix(0, s.lastCSActivity.Load())
 				idle := time.Since(lastActivity)
 				if idle < 13*time.Minute {
