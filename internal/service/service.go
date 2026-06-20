@@ -72,6 +72,7 @@ type Service struct {
 	unreadSMS             atomic.Int64       // inbound messages since start; published as sms.unread-count
 	ownMSISDN             string             // scooter's own phone number, resolved once at startup for MO-SMS keepalive
 	smsKeepaliveAck       chan struct{}       // closed/signalled when the keepalive loopback SMS arrives
+	lastCSActivity        atomic.Int64       // UnixNano of last confirmed CS event (any SMS sent/received)
 	LastState             *modem.State
 	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
 	GPSEnabledTime        time.Time  // When GPS was first enabled
@@ -532,6 +533,7 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 			return
 		}
 		if s.isKeepaliveMsg(msg) {
+			s.touchCSActivity()
 			select {
 			case s.smsKeepaliveAck <- struct{}{}:
 			default:
@@ -609,6 +611,7 @@ func (s *Service) drainSMS(modemPath dbus.ObjectPath) {
 	}
 	for _, msg := range msgs {
 		if s.isKeepaliveMsg(msg) {
+			s.touchCSActivity()
 			select {
 			case s.smsKeepaliveAck <- struct{}{}:
 			default:
@@ -623,6 +626,7 @@ func (s *Service) drainSMS(modemPath dbus.ObjectPath) {
 // running unread counter. A single "last-received-at" notification is published
 // so subscribers wake once and HGET the rest.
 func (s *Service) publishIncomingSMS(msg *sms.Message) {
+	s.touchCSActivity()
 	count := s.unreadSMS.Add(1)
 	if err := s.Redis.PublishSMSFields(map[string]string{
 		"last-received-from": msg.Number,
@@ -639,6 +643,10 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 // silently discarded so they don't appear as real inbound messages in Redis.
 func (s *Service) isKeepaliveMsg(msg *sms.Message) bool {
 	return s.ownMSISDN != "" && msg.Number == s.ownMSISDN && msg.Text == "k"
+}
+
+func (s *Service) touchCSActivity() {
+	s.lastCSActivity.Store(time.Now().UnixNano())
 }
 
 // queryOwnMSISDN asks the modem for its own subscriber number via AT+CNUM.
@@ -727,28 +735,41 @@ func (s *Service) refreshSGsViaMOSMS(ctx context.Context) bool {
 // SMS. O2/Lebara DE's MSC runs a ~15-minute implicit detach timer and silently
 // drops the SGs record; the modem is never notified.
 //
-// Primary strategy — refreshSGsViaMOSMS: send a 1-char SMS to the scooter's
-// own number every 10 minutes. The MO-SMS causes the MME to emit
-// SGsAP-UPLINK-UNITDATA to the MSC (3GPP TS 29.118), which resets the MSC's
-// implicit IMSI detach timer with zero internet downtime and no GPS disruption.
-// We wait for the loopback to confirm MT-paging (SGs) is also alive.
+// The watchdog polls every minute and sends a keepalive only if no CS event
+// has been observed in the last 13 minutes (2-minute margin before the 15-min
+// timer expires). Any real incoming SMS — or a previous keepalive loopback —
+// counts as a CS event and resets the idle clock, so active scooters that
+// receive fleet SMS regularly never pay for a keepalive.
 //
-// Fallback — refreshSGsViaCFUN4: if the loopback does not arrive (SGs already
-// expired), AT+CFUN=4/1 forces a fresh Combined Attach (~6 s SMS downtime,
-// ~29 s internet downtime). On this hardware CFUN=4 clears NAS context so
-// CFUN=1 always triggers a full Combined Attach rather than a lightweight TAU.
+// Primary keepalive — refreshSGsViaMOSMS: send a 1-char SMS to own number.
+// MO-SMS triggers SGsAP-UPLINK-UNITDATA at the MSC (3GPP TS 29.118), resetting
+// the implicit IMSI detach timer with zero internet downtime and no GPS
+// disruption. Loopback delivery confirms MT-paging (SGs) is also alive.
 //
-// Last resort — refreshSGsViaRadioCycle: MM Enable(false→true), same outcome
-// as CFUN=4/1 but proven independently.
+// Fallback — refreshSGsViaCFUN4: if loopback times out (SGs already expired),
+// AT+CFUN=4/1 forces a fresh Combined Attach (~6 s SMS downtime, ~29 s
+// internet downtime). On this hardware CFUN=4 clears NAS context so CFUN=1
+// always triggers a full Combined Attach rather than a lightweight TAU.
+//
+// Last resort — refreshSGsViaRadioCycle: MM Enable(false→true), same outcome.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
+	// SGs was just established by the Combined Attach at boot; start the idle
+	// clock from now so we don't fire a redundant keepalive immediately.
+	s.touchCSActivity()
 	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
+		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				lastActivity := time.Unix(0, s.lastCSActivity.Load())
+				idle := time.Since(lastActivity)
+				if idle < 13*time.Minute {
+					continue // CS was active recently; SGs timer not at risk
+				}
+				s.Logger.Printf("sms: no CS activity for %.0f min — sending SGs keepalive", idle.Minutes())
 				if s.refreshSGsViaMOSMS(ctx) {
 					continue
 				}
