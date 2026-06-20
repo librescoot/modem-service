@@ -616,30 +616,101 @@ func (s *Service) publishIncomingSMS(msg *sms.Message) {
 // SMS. O2/Lebara DE's MSC runs a ~15-minute implicit detach timer and silently
 // drops the SGs record; the modem is never notified.
 //
-// We refresh SGs every 13 minutes by cycling the modem radio via MM's Enable
-// D-Bus call (equivalent to AT+CFUN=0 then AT+CFUN=1). This clears NAS state
-// and triggers a fresh Combined EPS/IMSI Attach without a full firmware restart,
-// reducing downtime to roughly 25 seconds vs the ~60s of a firmware reset.
+// Per 3GPP TS 23.272 §8.3.1, even a normal Tracking Area Update (TAU) causes
+// the MME to send SGsAP-LOCATION-UPDATE to the MSC, resetting its implicit
+// detach timer. We therefore first attempt refreshSGsViaCFUN4 which uses
+// AT+CFUN=4/1 (fly-mode cycle): CFUN=4 preserves NAS context (GUTI, security
+// keys) so CFUN=1 triggers a TAU rather than a full Combined Attach, keeping
+// internet downtime to ~3-10 s instead of ~29 s.
 //
-// If the radio cycle fails to restore SMS (Enable/Disable uses QMI low_power
-// which may not clear NAS context fully), the fallback is handleModemFailure
-// which does the proven full firmware reset.
-//
-// The proper fix is operator-side: ask Lebara/O2 to disable the VLR implicit
-// detach timer for EPS-attached UEs, per 3GPP TS 23.272.
+// If the CFUN=4/1 cycle fails (e.g. MM rejects the command or the modem does
+// not re-register within 20 s), we fall back to refreshSGsViaRadioCycle which
+// uses MM Enable(false→true) for a proven ~29 s full re-attach.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(13 * time.Minute)
+		ticker := time.NewTicker(12 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.refreshSGsViaRadioCycle(ctx)
+				if !s.refreshSGsViaCFUN4(ctx) {
+					s.Logger.Printf("sms: CFUN=4/1 refresh failed or uncertain, falling back to radio cycle")
+					s.refreshSGsViaRadioCycle(ctx)
+				}
 			}
 		}
 	}()
+}
+
+// refreshSGsViaCFUN4 refreshes the SGs association using AT+CFUN=4 (fly mode)
+// followed immediately by AT+CFUN=1. Because fly mode preserves NAS context,
+// the return triggers a TAU rather than a fresh Combined Attach — the MME then
+// sends SGsAP-LOCATION-UPDATE to the MSC (3GPP TS 23.272 §8.3.1), resetting
+// the 15-min implicit detach timer with only ~3-10 s of internet downtime.
+//
+// Returns true if the modem reconnected and SMS was re-configured successfully.
+// Returns false if the approach fails so the caller can fall back.
+func (s *Service) refreshSGsViaCFUN4(ctx context.Context) bool {
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs refresh via CFUN=4/1 skipped, no modem: %v", err)
+		return false
+	}
+
+	s.Logger.Printf("sms: SGs refresh — AT+CFUN=4/1 fly-mode cycle (TAU, ~3-10s downtime)")
+
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+CFUN=4", 5*time.Second); err != nil {
+		s.Logger.Printf("sms: SGs refresh: AT+CFUN=4 failed: %v", err)
+		return false
+	}
+
+	// Brief fly-mode period. 500 ms is enough for the network to see the modem
+	// as unreachable; NAS context is held in modem RAM throughout.
+	select {
+	case <-ctx.Done():
+		s.MMClient.SendCommand(modemPath, "AT+CFUN=1", 5*time.Second) //nolint:errcheck
+		return false
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// Restore radio. If MM transitioned the modem to its own disabled state
+	// due to deregistration URCs, SendCommand will fail; fall back to Enable.
+	if _, err := s.MMClient.SendCommand(modemPath, "AT+CFUN=1", 5*time.Second); err != nil {
+		s.Logger.Printf("sms: SGs refresh: AT+CFUN=1 failed (%v), trying MM Enable(true)", err)
+		if enableErr := s.MMClient.Enable(modemPath, true); enableErr != nil {
+			s.Logger.Printf("sms: SGs refresh: MM Enable(true) also failed: %v", enableErr)
+			return false
+		}
+	}
+
+	// Poll until modem reports connected or the 20-second window closes.
+	// A TAU completes in ~2-5 s; a full attach takes ~26 s.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(1 * time.Second):
+		}
+		state, err := s.Modem.GetModemInfo(s.Config.Interface)
+		if err == nil && state.Status == "connected" {
+			break
+		}
+	}
+
+	// Re-fetch modem path in case MM re-registered the modem with a new D-Bus path.
+	modemPath, err = s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs refresh: modem gone after CFUN cycle: %v", err)
+		return false
+	}
+
+	s.configureAndDiagnoseSMS(modemPath)
+	s.drainSMS(modemPath)
+	s.Logger.Printf("sms: SGs refresh complete (CFUN=4/1 fly-mode cycle)")
+	return true
 }
 
 func (s *Service) refreshSGsViaRadioCycle(ctx context.Context) {
