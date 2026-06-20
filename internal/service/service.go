@@ -726,6 +726,60 @@ func (s *Service) refreshSGsViaMOSMS(ctx context.Context) bool {
 	}
 }
 
+// refreshSGsViaVoiceCall refreshes the SGs association by placing a brief MO
+// voice call to the scooter's own number. The call setup sends an Extended
+// Service Request (MO_CS_FB) to the MME via LTE NAS; the MME forwards it to
+// the MSC/VLR via SGs (SGsAP-SERVICE-REQUEST), resetting the implicit IMSI
+// detach timer. The modem does CSFB to EDGE for the duration and returns to
+// LTE after hangup — internet stays connected throughout, IP unchanged.
+//
+// The self-call never connects (the same line cannot answer an incoming call
+// while it is placing an outgoing one), so no call charges are incurred.
+func (s *Service) refreshSGsViaVoiceCall(ctx context.Context) bool {
+	if s.ownMSISDN == "" {
+		s.Logger.Printf("sms: SGs keepalive via voice call skipped: own MSISDN unknown")
+		return false
+	}
+	modemPath, err := s.Modem.FindModem()
+	if err != nil {
+		s.Logger.Printf("sms: SGs keepalive via voice call skipped, no modem: %v", err)
+		return false
+	}
+
+	s.Logger.Printf("sms: SGs keepalive — MO call to self (CSFB→EDGE, free)")
+	start := time.Now()
+
+	callPath, err := s.MMClient.CreateCall(modemPath, s.ownMSISDN)
+	if err != nil {
+		s.Logger.Printf("sms: SGs keepalive voice call create failed: %v", err)
+		return false
+	}
+	defer s.MMClient.DeleteCall(modemPath, callPath)
+
+	if err := s.MMClient.StartCall(callPath); err != nil {
+		s.Logger.Printf("sms: SGs keepalive voice call start failed: %v", err)
+		return false
+	}
+
+	// Hold for 2 s so the SGsAP-SERVICE-REQUEST reaches the MSC before we
+	// tear down. The Extended Service Request goes out synchronously on Start,
+	// so this is a generous margin.
+	select {
+	case <-ctx.Done():
+		s.MMClient.HangupCall(callPath)
+		return false
+	case <-time.After(2 * time.Second):
+	}
+
+	if err := s.MMClient.HangupCall(callPath); err != nil {
+		s.Logger.Printf("sms: SGs keepalive voice call hangup error (CS signaling already sent): %v", err)
+	}
+
+	s.touchCSActivity()
+	s.Logger.Printf("sms: SGs keepalive complete — voice call in %.1fs (CSFB, free)", time.Since(start).Seconds())
+	return true
+}
+
 // startSMSRegistrationWatchdog keeps the SGs association at the MSC/VLR alive
 // so that SMS delivery works indefinitely on LTE.
 //
@@ -737,16 +791,19 @@ func (s *Service) refreshSGsViaMOSMS(ctx context.Context) bool {
 //
 // The watchdog polls every minute and sends a keepalive only if no CS event
 // has been observed in the last 13 minutes (2-minute margin before the 15-min
-// timer expires). Any real incoming SMS — or a previous keepalive loopback —
-// counts as a CS event and resets the idle clock, so active scooters that
-// receive fleet SMS regularly never pay for a keepalive.
+// timer expires). Any real incoming SMS counts as a CS event and resets the
+// idle clock, so active scooters that receive fleet SMS regularly pay nothing.
 //
-// Primary keepalive — refreshSGsViaMOSMS: send a 1-char SMS to own number.
-// MO-SMS triggers SGsAP-UPLINK-UNITDATA at the MSC (3GPP TS 29.118), resetting
-// the implicit IMSI detach timer with zero internet downtime and no GPS
-// disruption. Loopback delivery confirms MT-paging (SGs) is also alive.
+// Primary keepalive — refreshSGsViaVoiceCall: place a brief MO call to own
+// number. The call setup sends Extended Service Request (MO_CS_FB) to the MME
+// via NAS; MME forwards SGsAP-SERVICE-REQUEST to the MSC, resetting the timer.
+// Modem does CSFB to EDGE for ~2 s then returns to LTE. IP unchanged, free.
 //
-// Fallback — refreshSGsViaCFUN4: if loopback times out (SGs already expired),
+// Secondary keepalive — refreshSGsViaMOSMS: if voice fails (e.g. no CSFB
+// available), send a 1-char SMS to own number. Costs an SMS credit but has
+// zero internet downtime. Loopback confirms MT-paging (SGs) is also alive.
+//
+// Fallback — refreshSGsViaCFUN4: if both above fail (SGs already expired),
 // AT+CFUN=4/1 forces a fresh Combined Attach (~6 s SMS downtime, ~29 s
 // internet downtime). On this hardware CFUN=4 clears NAS context so CFUN=1
 // always triggers a full Combined Attach rather than a lightweight TAU.
@@ -770,6 +827,10 @@ func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 					continue // CS was active recently; SGs timer not at risk
 				}
 				s.Logger.Printf("sms: no CS activity for %.0f min — sending SGs keepalive", idle.Minutes())
+				if s.refreshSGsViaVoiceCall(ctx) {
+					continue
+				}
+				s.Logger.Printf("sms: voice call keepalive failed, falling back to MO-SMS")
 				if s.refreshSGsViaMOSMS(ctx) {
 					continue
 				}

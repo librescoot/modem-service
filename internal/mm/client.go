@@ -24,6 +24,9 @@ const (
 	ModemMessagingInterface = "org.freedesktop.ModemManager1.Modem.Messaging"
 	SmsInterface            = "org.freedesktop.ModemManager1.Sms"
 
+	ModemVoiceInterface = "org.freedesktop.ModemManager1.Modem.Voice"
+	CallInterface       = "org.freedesktop.ModemManager1.Call"
+
 	// MobileEquipment error names returned by ModemManager when SIM PIN
 	// operations fail. Used by IsWrongPinError and IsPukRequiredError.
 	ErrIncorrectPassword = "org.freedesktop.ModemManager1.Error.MobileEquipment.IncorrectPassword"
@@ -318,6 +321,39 @@ func (c *Client) GetSuplServer(modemPath dbus.ObjectPath) (string, error) {
 		return server, nil
 	}
 	return "", errors.New("invalid SUPL server type")
+}
+
+// CreateCall creates a new outbound call object and returns its D-Bus path.
+// The call is not started until StartCall is called on the returned path.
+func (c *Client) CreateCall(modemPath dbus.ObjectPath, number string) (dbus.ObjectPath, error) {
+	properties := map[string]dbus.Variant{
+		"number": dbus.MakeVariant(number),
+	}
+	call := c.CallMethod(modemPath, ModemVoiceInterface, "CreateCall", properties)
+	if call.Err != nil {
+		return "", call.Err
+	}
+	var callPath dbus.ObjectPath
+	err := call.Store(&callPath)
+	return callPath, err
+}
+
+// StartCall dials the call object at callPath.
+func (c *Client) StartCall(callPath dbus.ObjectPath) error {
+	obj := c.conn.Object(ModemManagerService, callPath)
+	return obj.Call(CallInterface+".Start", 0).Err
+}
+
+// HangupCall terminates the call object at callPath.
+func (c *Client) HangupCall(callPath dbus.ObjectPath) error {
+	obj := c.conn.Object(ModemManagerService, callPath)
+	return obj.Call(CallInterface+".Hangup", 0).Err
+}
+
+// DeleteCall removes a call object from the modem (Modem.Voice.DeleteCall).
+func (c *Client) DeleteCall(modemPath, callPath dbus.ObjectPath) error {
+	call := c.CallMethod(modemPath, ModemVoiceInterface, "DeleteCall", callPath)
+	return call.Err
 }
 
 // WatchModems sets up signal watching for modem added/removed
