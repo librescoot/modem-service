@@ -380,6 +380,13 @@ func (s *Service) disableModem(ctx context.Context) {
 	s.Redis.PublishInternetState("modem-state", "off")
 	s.Redis.PublishModemState("power-state", "off")
 
+	// The monitor loop skips status checks while disabled, so the connectivity
+	// classifier won't run to observe the power-off. Publish "disabled"
+	// explicitly and force the classifier so it reports correctly on resume.
+	s.Redis.PublishInternetState("connectivity", string(connectivity.Disabled))
+	s.connClassifier.Force(connectivity.Disabled)
+	s.lastPubConn = connectivity.Disabled
+
 	// Keep the in-memory cache in sync with what we just wrote to Redis.
 	// publishModemState() only writes a field when it differs from LastState,
 	// so if we leave LastState holding the pre-disable values (e.g. "connected")
@@ -787,7 +794,7 @@ const enableUEBasedMode = false
 func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connectivity.State) {
 	var desired location.GPSMode
 	switch {
-	case enableUEBasedMode && conn == connectivity.Online:
+	case enableUEBasedMode && conn == connectivity.Connected:
 		desired = location.ModeUEBased
 	default:
 		desired = location.ModeStandalone
@@ -987,12 +994,18 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		s.LastState.ErrorState = currentState.ErrorState
 	}
 
-	conn := s.connClassifier.Classify(currentState.Status, currentState.SIMState)
+	conn := s.connClassifier.Classify(connectivity.Inputs{
+		ModemStatus:  currentState.Status,
+		SIMState:     currentState.SIMState,
+		Registration: currentState.Registration,
+		Enabled:      s.modemEnabled.Load(),
+		HardFailed:   s.Health.IsTerminal(),
+	})
 	if conn != s.lastPubConn {
-		if err := s.Redis.PublishModemState("connectivity", string(conn)); err != nil {
-			s.Logger.Printf("Failed to publish modem connectivity: %v", err)
+		if err := s.Redis.PublishInternetState("connectivity", string(conn)); err != nil {
+			s.Logger.Printf("Failed to publish internet connectivity: %v", err)
 		}
-		modemChanges = append(modemChanges, fmt.Sprintf("connectivity=%s", conn))
+		internetChanges = append(internetChanges, fmt.Sprintf("connectivity=%s", conn))
 		s.lastPubConn = conn
 		s.requestGPSModeForConnectivity(ctx, conn)
 	}
