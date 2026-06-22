@@ -26,12 +26,17 @@ type Client struct {
 	logger        *log.Logger
 	faults        *ipc.FaultReporter
 	modemHandler  *ipc.QueueHandler[string]
+	smsHandler    *ipc.QueueHandler[string]
 	vehicleWatch  *ipc.HashWatcher
 	settingsWatch *ipc.HashWatcher
 }
 
 // ModemCommandHandler is called when modem enable/disable commands are received
 type ModemCommandHandler func(command string) error
+
+// SMSCommandHandler is called when an outbound SMS request is received on the
+// scooter:sms queue. The payload is the raw JSON command string.
+type SMSCommandHandler func(payload string) error
 
 // VehicleStateHandler is called when vehicle state changes
 type VehicleStateHandler func(state string) error
@@ -141,11 +146,54 @@ func (c *Client) PublishCellLocationState(data map[string]interface{}) error {
 	return nil
 }
 
+// PublishSMSState sets a single field on the "sms" hash and notifies the "sms"
+// channel with the field name — the standard librescoot hash+channel
+// convention. Synchronous, like PublishModemState, so the field is readable by
+// the time we return.
+func (c *Client) PublishSMSState(field, value string) error {
+	err := c.client.Hash("sms").Set(field, value, ipc.Sync())
+	if err != nil {
+		c.logger.Printf("Unable to set sms.%s in redis: %v", field, err)
+		return fmt.Errorf("cannot write to redis: %v", err)
+	}
+	return nil
+}
+
+// PublishSMSFields sets several "sms" hash fields atomically and publishes a
+// single notification (notifyField) on the "sms" channel. Used for multi-field
+// updates — an incoming message, or a completed send — so subscribers get one
+// wake-up and then HGET the fields they need, the same batch pattern
+// PublishLocationState uses for GPS.
+func (c *Client) PublishSMSFields(fields map[string]string, notifyField string) error {
+	data := make(map[string]interface{}, len(fields))
+	for k, v := range fields {
+		data[k] = v
+	}
+	err := c.client.Hash("sms").SetManyPublishOne(data, notifyField, ipc.Sync())
+	if err != nil {
+		c.logger.Printf("Unable to set sms fields in redis: %v", err)
+		return fmt.Errorf("cannot write to redis: %v", err)
+	}
+	return nil
+}
+
 // StartModemCommandHandler starts listening for modem enable/disable commands on scooter:modem list
 func (c *Client) StartModemCommandHandler(handler ModemCommandHandler) error {
 	c.modemHandler = ipc.HandleRequests(c.client, "scooter:modem", func(cmd string) error {
 		c.logger.Printf("Received modem command: %s", cmd)
 		return handler(cmd)
+	})
+	return nil
+}
+
+// StartSMSCommandHandler starts listening for outbound SMS requests on the
+// scooter:sms list. Unlike the other queues (plain-string commands), the
+// payload is a JSON object {"to":...,"text":...}; the handler unmarshals it.
+func (c *Client) StartSMSCommandHandler(handler SMSCommandHandler) error {
+	c.smsHandler = ipc.HandleRequests(c.client, "scooter:sms", func(payload string) error {
+		// The payload carries a recipient and message body — don't log it.
+		c.logger.Printf("Received SMS send command")
+		return handler(payload)
 	})
 	return nil
 }
@@ -271,6 +319,9 @@ func (c *Client) ClearFault(code int) error {
 func (c *Client) Close() error {
 	if c.modemHandler != nil {
 		c.modemHandler.Stop()
+	}
+	if c.smsHandler != nil {
+		c.smsHandler.Stop()
 	}
 	if c.vehicleWatch != nil {
 		c.vehicleWatch.Stop()
