@@ -21,6 +21,12 @@ const (
 	ModemSimpleInterface   = "org.freedesktop.ModemManager1.Modem.Simple"
 	SimInterface           = "org.freedesktop.ModemManager1.Sim"
 
+	ModemMessagingInterface = "org.freedesktop.ModemManager1.Modem.Messaging"
+	SmsInterface            = "org.freedesktop.ModemManager1.Sms"
+
+	ModemVoiceInterface = "org.freedesktop.ModemManager1.Modem.Voice"
+	CallInterface       = "org.freedesktop.ModemManager1.Call"
+
 	// MobileEquipment error names returned by ModemManager when SIM PIN
 	// operations fail. Used by IsWrongPinError and IsPukRequiredError.
 	ErrIncorrectPassword = "org.freedesktop.ModemManager1.Error.MobileEquipment.IncorrectPassword"
@@ -159,6 +165,7 @@ func (c *Client) Reset(modemPath dbus.ObjectPath) error {
 	call := c.CallMethod(modemPath, ModemInterface, "Reset")
 	return call.Err
 }
+
 
 // SendPin sends a PIN to unlock the SIM. The pin string is never logged.
 func (c *Client) SendPin(simPath dbus.ObjectPath, pin string) error {
@@ -316,6 +323,39 @@ func (c *Client) GetSuplServer(modemPath dbus.ObjectPath) (string, error) {
 	return "", errors.New("invalid SUPL server type")
 }
 
+// CreateCall creates a new outbound call object and returns its D-Bus path.
+// The call is not started until StartCall is called on the returned path.
+func (c *Client) CreateCall(modemPath dbus.ObjectPath, number string) (dbus.ObjectPath, error) {
+	properties := map[string]dbus.Variant{
+		"number": dbus.MakeVariant(number),
+	}
+	call := c.CallMethod(modemPath, ModemVoiceInterface, "CreateCall", properties)
+	if call.Err != nil {
+		return "", call.Err
+	}
+	var callPath dbus.ObjectPath
+	err := call.Store(&callPath)
+	return callPath, err
+}
+
+// StartCall dials the call object at callPath.
+func (c *Client) StartCall(callPath dbus.ObjectPath) error {
+	obj := c.conn.Object(ModemManagerService, callPath)
+	return obj.Call(CallInterface+".Start", 0).Err
+}
+
+// HangupCall terminates the call object at callPath.
+func (c *Client) HangupCall(callPath dbus.ObjectPath) error {
+	obj := c.conn.Object(ModemManagerService, callPath)
+	return obj.Call(CallInterface+".Hangup", 0).Err
+}
+
+// DeleteCall removes a call object from the modem (Modem.Voice.DeleteCall).
+func (c *Client) DeleteCall(modemPath, callPath dbus.ObjectPath) error {
+	call := c.CallMethod(modemPath, ModemVoiceInterface, "DeleteCall", callPath)
+	return call.Err
+}
+
 // WatchModems sets up signal watching for modem added/removed
 func (c *Client) WatchModems(ctx context.Context, onAdded func(dbus.ObjectPath), onRemoved func(dbus.ObjectPath)) error {
 	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
@@ -336,8 +376,8 @@ func (c *Client) WatchModems(ctx context.Context, onAdded func(dbus.ObjectPath),
 	}
 
 	go func() {
-		defer c.conn.RemoveSignal(signals)
 		defer close(signals)
+		defer c.conn.RemoveSignal(signals)
 		for {
 			select {
 			case <-ctx.Done():
@@ -397,8 +437,8 @@ func (c *Client) WatchPropertyChanges(ctx context.Context, modemPath dbus.Object
 	}
 
 	go func() {
-		defer c.conn.RemoveSignal(signals)
 		defer close(signals)
+		defer c.conn.RemoveSignal(signals)
 		for {
 			select {
 			case <-ctx.Done():
@@ -418,6 +458,141 @@ func (c *Client) WatchPropertyChanges(ctx context.Context, modemPath dbus.Object
 									}
 								}
 							}
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// SMSProperties holds the subset of org.freedesktop.ModemManager1.Sms
+// properties the service cares about. ModemManager exposes no "direction"
+// property; PduType distinguishes inbound (DELIVER) from outbound (SUBMIT) —
+// see SmsPduTypeIsIncoming.
+type SMSProperties struct {
+	Number    string // sender (inbound) or recipient (outbound) number
+	Text      string // message body
+	State     uint32 // MMSmsState
+	PduType   uint32 // MMSmsPduType
+	Timestamp string // network timestamp (ISO 8601); empty for locally-created
+}
+
+// ListSMS returns the D-Bus paths of all SMS objects currently in modem
+// storage (Modem.Messaging.List).
+func (c *Client) ListSMS(modemPath dbus.ObjectPath) ([]dbus.ObjectPath, error) {
+	call := c.CallMethod(modemPath, ModemMessagingInterface, "List")
+	if call.Err != nil {
+		return nil, call.Err
+	}
+	var paths []dbus.ObjectPath
+	err := call.Store(&paths)
+	return paths, err
+}
+
+// CreateSMS creates a new outbound SMS object and returns its D-Bus path.
+// Messaging.Create takes a properties dict; "number" and "text" are the only
+// keys we set. The object is not transmitted until SendSMS is called on it.
+func (c *Client) CreateSMS(modemPath dbus.ObjectPath, number, text string) (dbus.ObjectPath, error) {
+	properties := map[string]dbus.Variant{
+		"number": dbus.MakeVariant(number),
+		"text":   dbus.MakeVariant(text),
+	}
+	call := c.CallMethod(modemPath, ModemMessagingInterface, "Create", properties)
+	if call.Err != nil {
+		return "", call.Err
+	}
+	var smsPath dbus.ObjectPath
+	err := call.Store(&smsPath)
+	return smsPath, err
+}
+
+// DeleteSMS removes an SMS object from modem storage (Modem.Messaging.Delete).
+func (c *Client) DeleteSMS(modemPath, smsPath dbus.ObjectPath) error {
+	call := c.CallMethod(modemPath, ModemMessagingInterface, "Delete", smsPath)
+	return call.Err
+}
+
+// SendSMS transmits a previously-created SMS object. Send is a method on the
+// Sms object itself, so it is called on smsPath rather than the modem path.
+func (c *Client) SendSMS(smsPath dbus.ObjectPath) error {
+	call := c.CallMethod(smsPath, SmsInterface, "Send")
+	return call.Err
+}
+
+// GetSMSProperties reads the relevant properties of an Sms object via
+// org.freedesktop.DBus.Properties.GetAll. Absent keys are left as zero values
+// (some are only populated for certain states/directions).
+func (c *Client) GetSMSProperties(smsPath dbus.ObjectPath) (SMSProperties, error) {
+	obj := c.conn.Object(ModemManagerService, smsPath)
+
+	var props map[string]dbus.Variant
+	if err := obj.Call(DBusPropertiesInterface+".GetAll", 0, SmsInterface).Store(&props); err != nil {
+		return SMSProperties{}, errors.Wrap(err, "failed to get SMS properties")
+	}
+
+	var p SMSProperties
+	if v, ok := props["Number"]; ok {
+		p.Number, _ = v.Value().(string)
+	}
+	if v, ok := props["Text"]; ok {
+		p.Text, _ = v.Value().(string)
+	}
+	if v, ok := props["State"]; ok {
+		p.State, _ = v.Value().(uint32)
+	}
+	if v, ok := props["PduType"]; ok {
+		p.PduType, _ = v.Value().(uint32)
+	}
+	if v, ok := props["Timestamp"]; ok {
+		p.Timestamp, _ = v.Value().(string)
+	}
+	return p, nil
+}
+
+// WatchSMSAdded subscribes to Modem.Messaging "Added" signals on modemPath and
+// invokes onAdded(smsPath, received) for each one; received is TRUE for
+// messages delivered by the network (inbound). The watch runs until ctx is
+// cancelled, so it can be re-armed after a modem reset rebinds the D-Bus path.
+// Mirrors WatchPropertyChanges.
+func (c *Client) WatchSMSAdded(ctx context.Context, modemPath dbus.ObjectPath, onAdded func(dbus.ObjectPath, bool)) error {
+	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
+	signals := make(chan *dbus.Signal, 100)
+	c.conn.Signal(signals)
+
+	rule := fmt.Sprintf("type='signal',sender='%s',path='%s',interface='%s',member='Added'",
+		ModemManagerService, modemPath, ModemMessagingInterface)
+
+	if err := c.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Err; err != nil {
+		// Unregister the channel we just added so the connection doesn't keep
+		// dispatching signals into a channel nobody reads.
+		c.conn.RemoveSignal(signals)
+		return errors.Wrap(err, "failed to add match rule")
+	}
+
+	go func() {
+		defer close(signals)
+		defer c.conn.RemoveSignal(signals)
+		// Drop the match rule when the watch is cancelled so repeated re-arms
+		// (after modem recovery) don't accumulate rules on the connection.
+		defer c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case signal, ok := <-signals:
+				if !ok {
+					return
+				}
+				if signal.Name == ModemMessagingInterface+".Added" && signal.Path == modemPath {
+					if len(signal.Body) >= 2 {
+						smsPath, _ := signal.Body[0].(dbus.ObjectPath)
+						received, _ := signal.Body[1].(bool)
+						c.log("SMS added: %s (received=%v)", smsPath, received)
+						if onAdded != nil {
+							onAdded(smsPath, received)
 						}
 					}
 				}

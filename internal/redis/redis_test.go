@@ -37,6 +37,7 @@ func setupTestClient(t *testing.T) (*Client, func()) {
 		client.client.Hash("internet").Clear()
 		client.client.Hash("modem").Clear()
 		client.client.Hash("gps").Clear()
+		client.client.Hash("sms").Clear()
 		client.Close()
 	}
 
@@ -334,6 +335,85 @@ func TestPublishLocationState(t *testing.T) {
 			// Note: We don't verify Redis state here - writes are async by default
 			// and redis-ipc tests already cover that writes work correctly.
 		})
+	}
+}
+
+func TestPublishSMSState(t *testing.T) {
+	client, cleanup := setupTestClient(t)
+	defer cleanup()
+
+	tests := []struct {
+		name    string
+		field   string
+		value   string
+		wantErr bool
+	}{
+		{
+			name:    "publish state",
+			field:   "state",
+			value:   "sending",
+			wantErr: false,
+		},
+		{
+			name:    "publish last-sent-to",
+			field:   "last-sent-to",
+			value:   "+4915112345678",
+			wantErr: false,
+		},
+		{
+			name:    "publish unread-count",
+			field:   "unread-count",
+			value:   "3",
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := client.PublishSMSState(tt.field, tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("PublishSMSState() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			// Verify the value was set
+			if !tt.wantErr {
+				val, err := client.client.Hash("sms").Get(tt.field)
+				if err != nil {
+					t.Errorf("Failed to get field %s: %v", tt.field, err)
+				}
+				if val != tt.value {
+					t.Errorf("Field %s = %v, want %v", tt.field, val, tt.value)
+				}
+			}
+		})
+	}
+}
+
+func TestPublishSMSFields(t *testing.T) {
+	client, cleanup := setupTestClient(t)
+	defer cleanup()
+
+	fields := map[string]string{
+		"last-received-from": "+4930",
+		"last-received-text": "hello there",
+		"last-received-at":   "2026-06-15T12:00:00Z",
+		"unread-count":       "1",
+	}
+
+	if err := client.PublishSMSFields(fields, "last-received-at"); err != nil {
+		t.Fatalf("PublishSMSFields() error = %v", err)
+	}
+
+	// All fields should be present in the hash after a batch publish.
+	for field, want := range fields {
+		got, err := client.client.Hash("sms").Get(field)
+		if err != nil {
+			t.Errorf("Failed to get field %s: %v", field, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("Field %s = %q, want %q", field, got, want)
+		}
 	}
 }
 

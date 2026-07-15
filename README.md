@@ -14,6 +14,7 @@ It is a free and open replacement for the `unu-modem` service on unu's Scooter P
 - Retrieval of modem connectivity information
 - Public and interface IP address tracking
 - Signal quality and access technology reporting
+- SMS send and receive via Redis
 - Redis-based state synchronization and pub/sub notifications
 
 ## Dependencies
@@ -41,6 +42,7 @@ The service supports the following command-line flags:
 | `-polling-time`    | `5s`          | Polling interval for modem checks       |
 | `-internet-check-time` | `30s`     | Interval for internet connectivity checks |
 | `-interface`       | `wwan0`       | Network interface to monitor            |
+| `-sms-keepalive`   | `false`       | Keep the CS (SGs) registration alive for SMS delivery via periodic self-calls |
 
 ## Modem State Tracking
 
@@ -139,6 +141,55 @@ GPS state transitions occur when:
 3. Losing fix: `fix-established` → `searching`
 4. Configuration failure: `searching` → `error`
 5. Disabling GPS: any state → `off`
+
+#### `sms` hash
+
+SMS send/receive state, published on the `sms` channel following the librescoot
+convention. Note that updates are often batched: an incoming message and a
+completed send each write several fields at once but publish only a *single*
+notification (`last-received-at` and `state`, respectively). Consumers should
+therefore treat any `sms` notification as "something changed" and `HGET` the
+fields they care about, rather than expecting one notification per field.
+
+- `state` send state of the last outbound message:
+  - `idle` - no send in progress (also the post-success state)
+  - `sending` - an outbound message is being transmitted
+  - `error` - the last send failed (see journal)
+- `last-sent-to` recipient number of the last outbound SMS
+- `last-sent-at` timestamp (RFC 3339) the last send completed
+- `last-received-from` sender number of the last inbound SMS
+- `last-received-text` body of the last inbound SMS
+- `last-received-at` timestamp (RFC 3339) the last inbound SMS arrived
+- `unread-count` number of inbound messages received since service start
+
+Inbound messages are read, published, and then deleted from modem storage
+immediately so the modem's limited SMS slots never fill up. Messages that
+arrived while the service was offline are drained on startup.
+
+### SGs keepalive (`-sms-keepalive`, off by default)
+
+Some operators (seen on O2/Lebara DE) run a ~15-minute implicit-detach timer
+on the CS registration that SMS delivery over LTE depends on; once it expires,
+inbound SMS silently stops until the next combined attach. With
+`-sms-keepalive` enabled, the service places a brief call to the scooter's own
+number whenever no CS activity has happened for ~13 minutes, which resets the
+operator's timer. The call never connects and costs nothing as long as the
+SIM's mailbox is not set to pick up busy calls; check that before enabling.
+Each self-call briefly falls back to 2G, and SIMs without a stored MSISDN
+can't use the keepalive at all (the service logs this once and disables it).
+
+### Sending an SMS
+
+Push a JSON payload onto the `scooter:sms` Redis list:
+
+```bash
+redis-cli LPUSH scooter:sms '{"to":"+4915112345678","text":"Hello from the scooter"}'
+```
+
+The service creates, transmits, and deletes the message, then updates the `sms`
+hash (`state`, `last-sent-to`, `last-sent-at`). This is the only command queue
+that takes a JSON payload rather than a bare string, because a send needs both a
+recipient and a body.
 
 ### Power inhibitor
 
