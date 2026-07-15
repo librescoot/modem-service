@@ -74,15 +74,31 @@ func (f *fakeDBus) GetSMSProperties(smsPath dbus.ObjectPath) (mm.SMSProperties, 
 	return f.props[smsPath], nil
 }
 
-func newManager(d *fakeDBus) *Manager {
-	return New(d, log.New(io.Discard, "", 0))
+// deliveryRecorder captures messages handed to the deliver callback and can
+// simulate a delivery failure (Redis down).
+type deliveryRecorder struct {
+	msgs []*Message
+	err  error
+}
+
+func (r *deliveryRecorder) deliver(m *Message) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.msgs = append(r.msgs, m)
+	return nil
+}
+
+func newManager(d *fakeDBus) (*Manager, *deliveryRecorder) {
+	r := &deliveryRecorder{}
+	return New(d, log.New(io.Discard, "", 0), r.deliver), r
 }
 
 // --- Send -------------------------------------------------------------------
 
 func TestSend_HappyPath(t *testing.T) {
 	d := &fakeDBus{createPath: "/sms/1"}
-	m := newManager(d)
+	m, _ := newManager(d)
 
 	out, err := m.Send(testModemPath, SendRequest{To: "+4915112345678", Text: "hello"})
 	if err != nil {
@@ -104,7 +120,7 @@ func TestSend_HappyPath(t *testing.T) {
 
 func TestSend_NoModem(t *testing.T) {
 	d := &fakeDBus{}
-	m := newManager(d)
+	m, _ := newManager(d)
 
 	out, err := m.Send("", SendRequest{To: "+49", Text: "x"})
 	if out != OutcomeNoModem {
@@ -120,7 +136,7 @@ func TestSend_NoModem(t *testing.T) {
 
 func TestSend_EmptyRecipient(t *testing.T) {
 	d := &fakeDBus{}
-	m := newManager(d)
+	m, _ := newManager(d)
 
 	out, _ := m.Send(testModemPath, SendRequest{To: "", Text: "x"})
 	if out != OutcomeError {
@@ -133,7 +149,7 @@ func TestSend_EmptyRecipient(t *testing.T) {
 
 func TestSend_CreateFails(t *testing.T) {
 	d := &fakeDBus{createErr: errors.New("bus error")}
-	m := newManager(d)
+	m, _ := newManager(d)
 
 	out, err := m.Send(testModemPath, SendRequest{To: "+49", Text: "x"})
 	if out != OutcomeError || err == nil {
@@ -149,7 +165,7 @@ func TestSend_CreateFails(t *testing.T) {
 
 func TestSend_SendFailsStillDeletes(t *testing.T) {
 	d := &fakeDBus{createPath: "/sms/1", sendErr: errors.New("send failed")}
-	m := newManager(d)
+	m, _ := newManager(d)
 
 	out, err := m.Send(testModemPath, SendRequest{To: "+49", Text: "x"})
 	if out != OutcomeError || err == nil {
@@ -169,20 +185,54 @@ func TestDrain_IncomingReceived(t *testing.T) {
 			"/sms/1": {Number: "+4930", Text: "ping", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeDeliver},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, err := m.DrainReceived(testModemPath)
-	if err != nil {
+	if err := m.DrainReceived(testModemPath); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(msgs))
+	if len(rec.msgs) != 1 {
+		t.Fatalf("expected 1 delivered message, got %d", len(rec.msgs))
 	}
-	if msgs[0].Number != "+4930" || msgs[0].Text != "ping" {
-		t.Fatalf("got number=%q text=%q", msgs[0].Number, msgs[0].Text)
+	if rec.msgs[0].Number != "+4930" || rec.msgs[0].Text != "ping" {
+		t.Fatalf("got number=%q text=%q", rec.msgs[0].Number, rec.msgs[0].Text)
 	}
 	if len(d.deleted) != 1 || d.deleted[0] != "/sms/1" {
-		t.Fatalf("received message must be deleted, got %v", d.deleted)
+		t.Fatalf("delivered message must be deleted, got %v", d.deleted)
+	}
+}
+
+func TestDrain_DeliveryFailureLeavesInStorage(t *testing.T) {
+	// If the deliver callback fails (Redis down), the message must stay in
+	// modem storage so a later drain can retry — and that retry must deliver.
+	d := &fakeDBus{
+		listPaths: []dbus.ObjectPath{"/sms/1"},
+		props: map[dbus.ObjectPath]mm.SMSProperties{
+			"/sms/1": {Number: "+4930", Text: "ping", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeDeliver},
+		},
+	}
+	m, rec := newManager(d)
+	rec.err = errors.New("redis down")
+
+	if err := m.DrainReceived(testModemPath); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rec.msgs) != 0 {
+		t.Fatalf("failed delivery must not record a message, got %d", len(rec.msgs))
+	}
+	if len(d.deleted) != 0 {
+		t.Fatalf("undelivered message must stay in modem storage, got deletes %v", d.deleted)
+	}
+
+	// Redis comes back: the next drain delivers and deletes.
+	rec.err = nil
+	if err := m.DrainReceived(testModemPath); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rec.msgs) != 1 || rec.msgs[0].Text != "ping" {
+		t.Fatalf("retry drain must deliver the message, got %+v", rec.msgs)
+	}
+	if len(d.deleted) != 1 || d.deleted[0] != "/sms/1" {
+		t.Fatalf("delivered message must be deleted on the retry, got %v", d.deleted)
 	}
 }
 
@@ -195,11 +245,11 @@ func TestDrain_DeletesStaleOutbound(t *testing.T) {
 			"/sms/1": {Number: "+4930", Text: "sent", State: mm.MMSmsStateSent, PduType: mm.MMSmsPduTypeSubmit},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 0 {
-		t.Fatalf("outbound message must not be delivered, got %d", len(msgs))
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 0 {
+		t.Fatalf("outbound message must not be delivered, got %d", len(rec.msgs))
 	}
 	if len(d.deleted) != 1 || d.deleted[0] != "/sms/1" {
 		t.Fatalf("stale outbound must be deleted, got %v", d.deleted)
@@ -213,11 +263,11 @@ func TestDrain_SkipsIncomplete(t *testing.T) {
 			"/sms/1": {Number: "+4930", Text: "part", State: mm.MMSmsStateReceiving, PduType: mm.MMSmsPduTypeDeliver},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 0 {
-		t.Fatalf("still-assembling message must be skipped, got %d", len(msgs))
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 0 {
+		t.Fatalf("still-assembling message must be skipped, got %d", len(rec.msgs))
 	}
 	if len(d.deleted) != 0 {
 		t.Fatalf("incomplete message must not be deleted, got %v", d.deleted)
@@ -236,17 +286,17 @@ func TestDrain_DeleteFailureDeliversExactlyOnce(t *testing.T) {
 		},
 		deleteErr: map[dbus.ObjectPath]error{"/sms/1": errors.New("delete failed")},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 1 || msgs[0].Text != "ping" {
-		t.Fatalf("message must be delivered despite failed delete, got %+v", msgs)
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 1 || rec.msgs[0].Text != "ping" {
+		t.Fatalf("message must be delivered despite failed delete, got %+v", rec.msgs)
 	}
 
 	// Object still listed on the next drain: no duplicate, one more delete try.
-	msgs, _ = m.DrainReceived(testModemPath)
-	if len(msgs) != 0 {
-		t.Fatalf("lingering object must not be re-delivered, got %d", len(msgs))
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 1 {
+		t.Fatalf("lingering object must not be re-delivered, got %d", len(rec.msgs))
 	}
 	if len(d.deleted) != 2 {
 		t.Fatalf("expected two delete attempts, got %v", d.deleted)
@@ -254,17 +304,17 @@ func TestDrain_DeleteFailureDeliversExactlyOnce(t *testing.T) {
 
 	// Delete starts working: the drain cleans it up without delivering.
 	d.deleteErr = nil
-	msgs, _ = m.DrainReceived(testModemPath)
-	if len(msgs) != 0 {
-		t.Fatalf("cleanup drain must not deliver, got %d", len(msgs))
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 1 {
+		t.Fatalf("cleanup drain must not deliver, got %d", len(rec.msgs))
 	}
 
 	// A NEW message under the reused path must be delivered normally.
 	d.listPaths = []dbus.ObjectPath{"/sms/1"}
 	d.props["/sms/1"] = mm.SMSProperties{Number: "+4931", Text: "new msg", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeDeliver}
-	msgs, _ = m.DrainReceived(testModemPath)
-	if len(msgs) != 1 || msgs[0].Text != "new msg" {
-		t.Fatalf("new message under reused path must be delivered, got %+v", msgs)
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 2 || rec.msgs[1].Text != "new msg" {
+		t.Fatalf("new message under reused path must be delivered, got %+v", rec.msgs)
 	}
 }
 
@@ -277,14 +327,14 @@ func TestDrain_MixedBatch(t *testing.T) {
 			"/sms/3": {Number: "+3", Text: "in2", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeDeliver},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 2 {
-		t.Fatalf("expected 2 inbound messages, got %d", len(msgs))
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 2 {
+		t.Fatalf("expected 2 inbound messages, got %d", len(rec.msgs))
 	}
-	if msgs[0].Number != "+1" || msgs[1].Number != "+3" {
-		t.Fatalf("unexpected order/content: %+v", msgs)
+	if rec.msgs[0].Number != "+1" || rec.msgs[1].Number != "+3" {
+		t.Fatalf("unexpected order/content: %+v", rec.msgs)
 	}
 	if len(d.deleted) != 3 {
 		t.Fatalf("two inbound + one stale outbound should be deleted, got %v", d.deleted)
@@ -298,11 +348,11 @@ func TestDrain_DeletesStatusReport(t *testing.T) {
 			"/sms/1": {Number: "+4930", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeStatusReport},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 0 {
-		t.Fatalf("status reports must not be delivered, got %d", len(msgs))
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 0 {
+		t.Fatalf("status reports must not be delivered, got %d", len(rec.msgs))
 	}
 	if len(d.deleted) != 1 || d.deleted[0] != "/sms/1" {
 		t.Fatalf("status report must be deleted to free the slot, got %v", d.deleted)
@@ -318,11 +368,11 @@ func TestDrain_IncomingStoredState(t *testing.T) {
 			"/sms/1": {Number: "+4930", Text: "stored msg", State: mm.MMSmsStateStored, PduType: mm.MMSmsPduTypeDeliver},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 1 || msgs[0].Text != "stored msg" {
-		t.Fatalf("DELIVER message in stored state must be delivered, got %+v", msgs)
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 1 || rec.msgs[0].Text != "stored msg" {
+		t.Fatalf("DELIVER message in stored state must be delivered, got %+v", rec.msgs)
 	}
 	if len(d.deleted) != 1 {
 		t.Fatalf("delivered message must be deleted, got %v", d.deleted)
@@ -337,11 +387,11 @@ func TestDrain_IncomingUnknownPduReceivedState(t *testing.T) {
 			"/sms/1": {Number: "+4930", Text: "hi", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeUnknown},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 1 || msgs[0].Text != "hi" {
-		t.Fatalf("received-state message must be delivered even with unknown PduType, got %+v", msgs)
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 1 || rec.msgs[0].Text != "hi" {
+		t.Fatalf("received-state message must be delivered even with unknown PduType, got %+v", rec.msgs)
 	}
 	if len(d.deleted) != 1 {
 		t.Fatalf("delivered message must be deleted, got %v", d.deleted)
@@ -349,19 +399,19 @@ func TestDrain_IncomingUnknownPduReceivedState(t *testing.T) {
 }
 
 func TestDrain_IncomingStoredUnknownPdu(t *testing.T) {
-	// The hardware case Copilot flagged: a received message the modem reports
-	// as state "stored" with no PduType. It must be delivered, not left behind.
+	// Observed on hardware: a received message the modem reports as state
+	// "stored" with no PduType. It must be delivered, not left behind.
 	d := &fakeDBus{
 		listPaths: []dbus.ObjectPath{"/sms/1"},
 		props: map[dbus.ObjectPath]mm.SMSProperties{
 			"/sms/1": {Number: "+4930", Text: "stored unknown", State: mm.MMSmsStateStored, PduType: mm.MMSmsPduTypeUnknown},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 1 || msgs[0].Text != "stored unknown" {
-		t.Fatalf("stored message with unknown PduType must be delivered, got %+v", msgs)
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 1 || rec.msgs[0].Text != "stored unknown" {
+		t.Fatalf("stored message with unknown PduType must be delivered, got %+v", rec.msgs)
 	}
 	if len(d.deleted) != 1 {
 		t.Fatalf("delivered message must be deleted, got %v", d.deleted)
@@ -377,11 +427,11 @@ func TestDrain_StoredSubmitIsOutboundNotInbound(t *testing.T) {
 			"/sms/1": {Number: "+4930", Text: "draft", State: mm.MMSmsStateStored, PduType: mm.MMSmsPduTypeSubmit},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msgs, _ := m.DrainReceived(testModemPath)
-	if len(msgs) != 0 {
-		t.Fatalf("stored SUBMIT must not be delivered as inbound, got %d", len(msgs))
+	_ = m.DrainReceived(testModemPath)
+	if len(rec.msgs) != 0 {
+		t.Fatalf("stored SUBMIT must not be delivered as inbound, got %d", len(rec.msgs))
 	}
 	if len(d.deleted) != 1 {
 		t.Fatalf("stored SUBMIT should be cleaned up, got %v", d.deleted)
@@ -390,9 +440,9 @@ func TestDrain_StoredSubmitIsOutboundNotInbound(t *testing.T) {
 
 func TestDrain_NoModem(t *testing.T) {
 	d := &fakeDBus{}
-	m := newManager(d)
+	m, _ := newManager(d)
 
-	if _, err := m.DrainReceived(""); err == nil {
+	if err := m.DrainReceived(""); err == nil {
 		t.Fatalf("expected error without modem path")
 	}
 }
@@ -420,11 +470,11 @@ func TestHandleAdded_DeliversInbound(t *testing.T) {
 			"/sms/9": {Number: "+4930", Text: "hi there", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeDeliver},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	msg := m.HandleAdded(testModemPath, "/sms/9")
-	if msg == nil || msg.Text != "hi there" || msg.Number != "+4930" {
-		t.Fatalf("expected inbound message, got %+v", msg)
+	m.HandleAdded(testModemPath, "/sms/9")
+	if len(rec.msgs) != 1 || rec.msgs[0].Text != "hi there" || rec.msgs[0].Number != "+4930" {
+		t.Fatalf("expected inbound message delivered, got %+v", rec.msgs)
 	}
 	if len(d.deleted) != 1 || d.deleted[0] != "/sms/9" {
 		t.Fatalf("handled message must be deleted, got %v", d.deleted)
@@ -439,10 +489,11 @@ func TestHandleAdded_StoredUnknownPdu(t *testing.T) {
 			"/sms/9": {Number: "+4930", Text: "stored", State: mm.MMSmsStateStored, PduType: mm.MMSmsPduTypeUnknown},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	if msg := m.HandleAdded(testModemPath, "/sms/9"); msg == nil || msg.Text != "stored" {
-		t.Fatalf("expected stored/unknown message to be delivered, got %+v", msg)
+	m.HandleAdded(testModemPath, "/sms/9")
+	if len(rec.msgs) != 1 || rec.msgs[0].Text != "stored" {
+		t.Fatalf("expected stored/unknown message to be delivered, got %+v", rec.msgs)
 	}
 }
 
@@ -452,10 +503,11 @@ func TestHandleAdded_StatusReportNotDelivered(t *testing.T) {
 			"/sms/9": {Number: "+4930", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeStatusReport},
 		},
 	}
-	m := newManager(d)
+	m, rec := newManager(d)
 
-	if msg := m.HandleAdded(testModemPath, "/sms/9"); msg != nil {
-		t.Fatalf("status report must not be delivered, got %+v", msg)
+	m.HandleAdded(testModemPath, "/sms/9")
+	if len(rec.msgs) != 0 {
+		t.Fatalf("status report must not be delivered, got %+v", rec.msgs)
 	}
 	if len(d.deleted) != 1 {
 		t.Fatalf("status report must be deleted, got %v", d.deleted)
@@ -463,11 +515,10 @@ func TestHandleAdded_StatusReportNotDelivered(t *testing.T) {
 }
 
 func TestHandleAdded_NoModemOrPath(t *testing.T) {
-	m := newManager(&fakeDBus{})
-	if msg := m.HandleAdded("", "/sms/1"); msg != nil {
-		t.Fatalf("expected nil without modem path")
-	}
-	if msg := m.HandleAdded(testModemPath, ""); msg != nil {
-		t.Fatalf("expected nil without sms path")
+	m, rec := newManager(&fakeDBus{})
+	m.HandleAdded("", "/sms/1")
+	m.HandleAdded(testModemPath, "")
+	if len(rec.msgs) != 0 {
+		t.Fatalf("expected no deliveries without modem/sms path, got %+v", rec.msgs)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	ipc "github.com/librescoot/redis-ipc"
@@ -14,6 +15,42 @@ import (
 // polling the `gps` hash. The hash is still maintained for backward-compatible
 // readers; this channel is purely additive.
 const GPSSnapshotChannel = "gps:tpv"
+
+// SMS event surface. Per-message events are appended to capped streams and
+// announced as JSON on dedicated pub/sub channels; the `sms` hash only carries
+// latest-value convenience state (state, last-*, unread-count).
+const (
+	SMSReceivedStream  = "sms:received"
+	SMSReceivedChannel = "sms:received"
+	SMSSentStream      = "sms:sent"
+	SMSSentChannel     = "sms:sent"
+
+	// smsStreamMaxLen caps both SMS streams. Redis is not persistent on
+	// librescoot, so this bounds memory, not history: everything is gone on
+	// reboot either way.
+	smsStreamMaxLen = 100
+)
+
+// IncomingSMS is one received message as it appears on the sms:received stream
+// and, as JSON, on the sms:received channel.
+type IncomingSMS struct {
+	ID        string `json:"id"` // stream entry ID, filled in on publish
+	From      string `json:"from"`
+	Text      string `json:"text"`
+	Timestamp string `json:"timestamp"` // RFC 3339
+}
+
+// SMSSendResult is one terminal send outcome as it appears on the sms:sent
+// stream and, as JSON, on the sms:sent channel.
+type SMSSendResult struct {
+	ID        string `json:"id"`         // stream entry ID, filled in on publish
+	RequestID string `json:"request-id"` // caller's token from the scooter:sms payload, may be empty
+	To        string `json:"to"`
+	Text      string `json:"text"`
+	Outcome   string `json:"outcome"` // "sent" or "error"
+	Error     string `json:"error"`   // empty on success
+	Timestamp string `json:"timestamp"`
+}
 
 // Fault codes for modem issues
 const (
@@ -29,6 +66,8 @@ type Client struct {
 	smsHandler    *ipc.QueueHandler[string]
 	vehicleWatch  *ipc.HashWatcher
 	settingsWatch *ipc.HashWatcher
+	smsReceived   *ipc.StreamPublisher
+	smsSent       *ipc.StreamPublisher
 }
 
 // ModemCommandHandler is called when modem enable/disable commands are received
@@ -55,9 +94,11 @@ func New(redisURL string, logger *log.Logger) (*Client, error) {
 	}
 
 	return &Client{
-		client: client,
-		logger: logger,
-		faults: client.NewFaultReporter("internet"),
+		client:      client,
+		logger:      logger,
+		faults:      client.NewFaultReporter("internet"),
+		smsReceived: client.NewStreamPublisher(SMSReceivedStream, ipc.WithMaxLen(smsStreamMaxLen)),
+		smsSent:     client.NewStreamPublisher(SMSSentStream, ipc.WithMaxLen(smsStreamMaxLen)),
 	}, nil
 }
 
@@ -159,20 +200,82 @@ func (c *Client) PublishSMSState(field, value string) error {
 	return nil
 }
 
-// PublishSMSFields sets several "sms" hash fields atomically and publishes a
-// single notification (notifyField) on the "sms" channel. Used for multi-field
-// updates — an incoming message, or a completed send — so subscribers get one
-// wake-up and then HGET the fields they need, the same batch pattern
-// PublishLocationState uses for GPS.
-func (c *Client) PublishSMSFields(fields map[string]string, notifyField string) error {
-	data := make(map[string]interface{}, len(fields))
-	for k, v := range fields {
-		data[k] = v
-	}
-	err := c.client.Hash("sms").SetManyPublishOne(data, notifyField, ipc.Sync())
+// PublishIncomingSMS records one received message: XADD to the sms:received
+// stream, a JSON notification on the sms:received channel, and a silent
+// refresh of the sms hash convenience fields. The XADD is the delivery commit
+// point — an error return means the message is NOT recorded and the caller
+// must leave it in modem storage for a later retry; channel and hash failures
+// after a successful XADD are logged but don't fail the delivery.
+func (c *Client) PublishIncomingSMS(msg IncomingSMS, unread int64) error {
+	id, err := c.smsReceived.Add(map[string]any{
+		"from":      msg.From,
+		"text":      msg.Text,
+		"timestamp": msg.Timestamp,
+	})
 	if err != nil {
+		c.logger.Printf("Unable to append to %s: %v", SMSReceivedStream, err)
+		return fmt.Errorf("cannot write to redis: %v", err)
+	}
+	msg.ID = id
+
+	if payload, err := json.Marshal(msg); err == nil {
+		if _, err := c.client.Publish(SMSReceivedChannel, payload); err != nil {
+			c.logger.Printf("Unable to publish on %s: %v", SMSReceivedChannel, err)
+		}
+	}
+
+	// No hash-channel notification: the dedicated channel above is the
+	// per-message signal, the hash is a polling convenience. Synchronous so a
+	// reader woken by the channel sees the refreshed fields.
+	err = c.client.Hash("sms").SetMany(map[string]any{
+		"last-received-from": msg.From,
+		"last-received-text": msg.Text,
+		"last-received-at":   msg.Timestamp,
+		"unread-count":       strconv.FormatInt(unread, 10),
+	}, ipc.NoPublish(), ipc.Sync())
+	if err != nil {
+		c.logger.Printf("Unable to set sms convenience fields in redis: %v", err)
+	}
+	return nil
+}
+
+// PublishSMSSendResult records one terminal send outcome: XADD to the sms:sent
+// stream, a JSON notification on the sms:sent channel, and the sms hash state
+// update ("state" notification on the sms hash channel, so state-watchers see
+// sending → idle/error as before). The hash update happens even when the
+// stream append fails, so sms.state can never stick at "sending".
+func (c *Client) PublishSMSSendResult(res SMSSendResult) error {
+	id, streamErr := c.smsSent.Add(map[string]any{
+		"request-id": res.RequestID,
+		"to":         res.To,
+		"text":       res.Text,
+		"outcome":    res.Outcome,
+		"error":      res.Error,
+		"timestamp":  res.Timestamp,
+	})
+	if streamErr != nil {
+		c.logger.Printf("Unable to append to %s: %v", SMSSentStream, streamErr)
+	} else {
+		res.ID = id
+		if payload, err := json.Marshal(res); err == nil {
+			if _, err := c.client.Publish(SMSSentChannel, payload); err != nil {
+				c.logger.Printf("Unable to publish on %s: %v", SMSSentChannel, err)
+			}
+		}
+	}
+
+	fields := map[string]any{"state": "error"}
+	if res.Outcome == "sent" {
+		fields["state"] = "idle"
+		fields["last-sent-to"] = res.To
+		fields["last-sent-at"] = res.Timestamp
+	}
+	if err := c.client.Hash("sms").SetManyPublishOne(fields, "state", ipc.Sync()); err != nil {
 		c.logger.Printf("Unable to set sms fields in redis: %v", err)
 		return fmt.Errorf("cannot write to redis: %v", err)
+	}
+	if streamErr != nil {
+		return fmt.Errorf("cannot write to redis: %v", streamErr)
 	}
 	return nil
 }
