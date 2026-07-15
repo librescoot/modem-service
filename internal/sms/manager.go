@@ -8,8 +8,7 @@
 // the MessagingDBus interface (satisfied by mm.Client), so it can be unit
 // tested with a recorder. Service-level concerns — Redis publishing, resolving
 // the modem path, arming the Added-signal watch — live in internal/service,
-// mirroring how internal/sim splits its decision logic from the wiring. See the
-// design doc at docs/superpowers/specs/2026-06-15-sms-support-design.md.
+// mirroring how internal/sim splits its decision logic from the wiring.
 package sms
 
 import (
@@ -34,17 +33,25 @@ type MessagingDBus interface {
 }
 
 // SendRequest is the JSON payload accepted on the scooter:sms command queue.
+// ID is an optional caller-chosen correlation token, echoed back as request-id
+// on the sms:sent stream so a sender can match outcomes to its own requests.
 type SendRequest struct {
+	ID   string `json:"id,omitempty"`
 	To   string `json:"to"`
 	Text string `json:"text"`
 }
 
-// Message is a parsed inbound SMS handed back to the service for publication.
+// Message is a parsed inbound SMS handed to the deliver callback.
 type Message struct {
 	Number    string    // sender's number
 	Text      string    // message body
 	Timestamp time.Time // network timestamp, or receive time if unavailable
 }
+
+// DeliverFunc hands one inbound message to the service. Returning an error
+// means the message was NOT durably recorded; the manager then leaves it in
+// modem storage so a later drain retries the delivery.
+type DeliverFunc func(*Message) error
 
 // Outcome is the result of a Send. The service maps it to the sms.state field.
 type Outcome string
@@ -57,8 +64,9 @@ const (
 
 // Manager performs SMS send/receive over a MessagingDBus.
 type Manager struct {
-	dbus   MessagingDBus
-	logger *log.Logger
+	dbus    MessagingDBus
+	logger  *log.Logger
+	deliver DeliverFunc
 
 	// mu serializes Send with the drain/handle paths so they never race on the
 	// modem's shared message store. Because Send holds mu for its whole
@@ -82,14 +90,17 @@ type messageIdentity struct {
 	number, text, timestamp string
 }
 
-// New returns a Manager bound to the given D-Bus surface and logger.
-func New(d MessagingDBus, logger *log.Logger) *Manager {
+// New returns a Manager bound to the given D-Bus surface and logger. deliver
+// is called (with the manager's mutex held) for every inbound message; it must
+// not be nil.
+func New(d MessagingDBus, logger *log.Logger, deliver DeliverFunc) *Manager {
 	if logger == nil {
 		logger = log.Default()
 	}
 	return &Manager{
 		dbus:               d,
 		logger:             logger,
+		deliver:            deliver,
 		deliveredUndeleted: make(map[dbus.ObjectPath]messageIdentity),
 	}
 }
@@ -133,31 +144,32 @@ func (m *Manager) Send(modemPath dbus.ObjectPath, req SendRequest) (Outcome, err
 }
 
 // HandleAdded processes a single SMS object reported by a Messaging.Added
-// signal, returning the parsed message if it was inbound (and deleting it) or
-// nil otherwise. Processing the signal's path directly (rather than only
-// re-listing storage) matters because some modems deliver a received message as
-// a transient object that never appears in Messaging.List().
-func (m *Manager) HandleAdded(modemPath, smsPath dbus.ObjectPath) *Message {
+// signal: an inbound message is delivered via the deliver callback and then
+// deleted. Processing the signal's path directly (rather than only re-listing
+// storage) matters because some modems deliver a received message as a
+// transient object that never appears in Messaging.List().
+func (m *Manager) HandleAdded(modemPath, smsPath dbus.ObjectPath) {
 	if modemPath == "" || smsPath == "" {
-		return nil
+		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.processOne(modemPath, smsPath)
+	m.processOne(modemPath, smsPath)
 }
 
 // DrainReceived processes every message currently in modem storage: inbound
-// messages are captured, deleted, and returned; status reports and stale
-// outbound objects are deleted; multipart messages still assembling are left
-// for a later drain. Deleting handled messages keeps the modem's small store
-// from filling up.
+// messages are delivered and then deleted; status reports and stale outbound
+// objects are deleted; multipart messages still assembling are left for a
+// later drain. Deleting handled messages keeps the modem's small store from
+// filling up.
 //
 // It is safe to call at startup (to pick up messages received while offline)
 // and on a periodic tick (a reliable fallback for modems that don't emit
-// Added for stored messages).
-func (m *Manager) DrainReceived(modemPath dbus.ObjectPath) ([]*Message, error) {
+// Added for stored messages, and the retry path for messages whose delivery
+// failed).
+func (m *Manager) DrainReceived(modemPath dbus.ObjectPath) error {
 	if modemPath == "" {
-		return nil, fmt.Errorf("no modem available")
+		return fmt.Errorf("no modem available")
 	}
 
 	m.mu.Lock()
@@ -165,19 +177,16 @@ func (m *Manager) DrainReceived(modemPath dbus.ObjectPath) ([]*Message, error) {
 
 	paths, err := m.dbus.ListSMS(modemPath)
 	if err != nil {
-		return nil, fmt.Errorf("list sms: %w", err)
+		return fmt.Errorf("list sms: %w", err)
 	}
 	if len(paths) > 0 {
 		m.logger.Printf("sms: drain found %d message(s) in modem storage", len(paths))
 	}
 
-	var msgs []*Message
 	for _, p := range paths {
-		if msg := m.processOne(modemPath, p); msg != nil {
-			msgs = append(msgs, msg)
-		}
+		m.processOne(modemPath, p)
 	}
-	return msgs, nil
+	return nil
 }
 
 // processOne classifies a single SMS object and acts on it. It assumes m.mu is
@@ -188,25 +197,25 @@ func (m *Manager) DrainReceived(modemPath dbus.ObjectPath) ([]*Message, error) {
 //   - status report                       → deleted (delivery report, nothing to publish)
 //   - outbound (SUBMIT / sending / sent)  → deleted as a stale leftover (mu means
 //     no send is in flight, so it can't be a live one)
-//   - everything else                     → treated as inbound: deleted and returned
+//   - everything else                     → treated as inbound: delivered, then deleted
 //
-// An inbound message is delivered even when its delete fails: some modems
-// report a delete error but drop the object anyway (e.g. when the QMI WMS and
-// AT steps disagree), and skipping delivery there would silently lose mail.
-// To keep that from turning into a duplicate on every later drain while the
-// object lingers, delivered-but-undeleted objects are remembered and only
-// have their delete retried.
-func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) *Message {
+// Delivery comes before the delete so modem storage doubles as the retry
+// buffer: if the deliver callback fails (Redis down), the object stays put and
+// the periodic drain tries again. The reverse case — delivery succeeded but
+// the delete fails — is also handled: some modems report a delete error but
+// drop the object anyway (e.g. when the QMI WMS and AT steps disagree), so
+// delivered-but-undeleted objects are remembered and later drains only retry
+// the delete, never publish a duplicate.
+func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) {
 	props, err := m.dbus.GetSMSProperties(smsPath)
 	if err != nil {
 		m.logger.Printf("sms: reading %s failed: %v", smsPath, err)
-		return nil
+		return
 	}
 
 	switch {
 	case props.State == mm.MMSmsStateReceiving:
 		m.logger.Printf("sms: %s still assembling (state=receiving), leaving for later", smsPath)
-		return nil
 
 	case props.PduType == mm.MMSmsPduTypeStatusReport:
 		if err := m.dbus.DeleteSMS(modemPath, smsPath); err != nil {
@@ -214,7 +223,6 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) *Message {
 		} else {
 			m.logger.Printf("sms: deleted status-report %s", smsPath)
 		}
-		return nil
 
 	case props.PduType == mm.MMSmsPduTypeSubmit ||
 		props.State == mm.MMSmsStateSending ||
@@ -227,12 +235,11 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) *Message {
 			m.logger.Printf("sms: deleted stale outbound %s (pdu=%s state=%s)",
 				smsPath, mm.SmsPduTypeToString(props.PduType), mm.SmsStateToString(props.State))
 		}
-		return nil
 
 	default:
 		identity := messageIdentity{number: props.Number, text: props.Text, timestamp: props.Timestamp}
 		if m.deliveredUndeleted[smsPath] == identity {
-			// Already published in an earlier round; the object just wouldn't
+			// Already delivered in an earlier round; the object just wouldn't
 			// delete. Retry the delete, never re-deliver.
 			if err := m.dbus.DeleteSMS(modemPath, smsPath); err != nil {
 				m.logger.Printf("sms: delete retry for already-delivered %s failed: %v", smsPath, err)
@@ -240,7 +247,7 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) *Message {
 				delete(m.deliveredUndeleted, smsPath)
 				m.logger.Printf("sms: delete retry for already-delivered %s succeeded", smsPath)
 			}
-			return nil
+			return
 		}
 
 		msg := &Message{
@@ -250,17 +257,20 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) *Message {
 		}
 		m.logger.Printf("sms: received from %s (%d chars, pdu=%s state=%s)",
 			msg.Number, len(msg.Text), mm.SmsPduTypeToString(props.PduType), mm.SmsStateToString(props.State))
+		if err := m.deliver(msg); err != nil {
+			// Not recorded anywhere durable yet: keep the object in modem
+			// storage so the periodic drain retries. (A transient Added-signal
+			// object that never lands in storage is lost here — acceptable
+			// until messages get persisted off-Redis.)
+			m.logger.Printf("sms: delivery of %s failed, leaving in modem storage: %v", smsPath, err)
+			return
+		}
 		if err := m.dbus.DeleteSMS(modemPath, smsPath); err != nil {
-			// MM sometimes reports a delete error but cleans up the object anyway
-			// (e.g. when QMI WMS and AT steps disagree). Deliver regardless so the
-			// message is never silently lost, and remember it so later drains only
-			// retry the delete instead of publishing a duplicate.
-			m.logger.Printf("sms: delete of %s failed (delivering anyway): %v", smsPath, err)
+			m.logger.Printf("sms: delete of %s failed (already delivered): %v", smsPath, err)
 			m.deliveredUndeleted[smsPath] = identity
 		} else {
 			delete(m.deliveredUndeleted, smsPath)
 		}
-		return msg
 	}
 }
 

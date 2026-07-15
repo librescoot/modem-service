@@ -144,27 +144,51 @@ GPS state transitions occur when:
 
 #### `sms` hash
 
-SMS send/receive state, published on the `sms` channel following the librescoot
-convention. Note that updates are often batched: an incoming message and a
-completed send each write several fields at once but publish only a *single*
-notification (`last-received-at` and `state`, respectively). Consumers should
-therefore treat any `sms` notification as "something changed" and `HGET` the
-fields they care about, rather than expecting one notification per field.
+Latest-value convenience state only. Per-message data lives on the
+`sms:received` / `sms:sent` streams (see below); don't build anything that
+needs every message on this hash.
 
-- `state` send state of the last outbound message:
+- `state` send state of the last outbound message, published as a `state`
+  notification on the `sms` channel:
   - `idle` - no send in progress (also the post-success state)
   - `sending` - an outbound message is being transmitted
-  - `error` - the last send failed (see journal)
-- `last-sent-to` recipient number of the last outbound SMS
+  - `error` - the last send failed (see the `sms:sent` stream for the reason)
+- `last-sent-to` recipient number of the last successfully sent SMS
 - `last-sent-at` timestamp (RFC 3339) the last send completed
 - `last-received-from` sender number of the last inbound SMS
 - `last-received-text` body of the last inbound SMS
 - `last-received-at` timestamp (RFC 3339) the last inbound SMS arrived
 - `unread-count` number of inbound messages received since service start
 
-Inbound messages are read, published, and then deleted from modem storage
-immediately so the modem's limited SMS slots never fill up. Messages that
-arrived while the service was offline are drained on startup.
+The `last-received-*` fields are refreshed silently; the per-message
+notification is the dedicated `sms:received` channel.
+
+### SMS streams and channels
+
+Per-message events use Redis streams (capped at 100 entries each) plus a
+dedicated pub/sub channel per direction. The channel payload is the stream
+entry as JSON, including its stream `id`, so a subscriber can act on it
+directly; a consumer that wants catch-up semantics instead XREADs from its
+last-seen ID. Redis is not persistent on librescoot, so the streams are a
+live window, not an archive - both are empty after a reboot.
+
+#### `sms:received` (stream + channel)
+
+One entry per inbound message: `from`, `text`, `timestamp` (RFC 3339).
+Channel payload: `{"id":"<stream-id>","from":...,"text":...,"timestamp":...}`.
+
+The XADD is the delivery commit point: a message is only deleted from modem
+storage after it has landed on the stream. If Redis is unreachable, the
+message stays in the modem and the periodic drain retries, so nothing is lost
+to a Redis hiccup. Messages that arrived while the service was offline are
+drained on startup.
+
+#### `sms:sent` (stream + channel)
+
+One entry per terminal send outcome: `request-id` (the caller's `id` token
+from the `scooter:sms` payload, empty if none), `to`, `text`, `outcome`
+(`sent`/`error`), `error` (empty on success), `timestamp`. Channel payload is
+the same entry as JSON including the stream `id`.
 
 ### SGs keepalive (`-sms-keepalive`, off by default)
 
@@ -184,12 +208,16 @@ Push a JSON payload onto the `scooter:sms` Redis list:
 
 ```bash
 redis-cli LPUSH scooter:sms '{"to":"+4915112345678","text":"Hello from the scooter"}'
+
+# With a correlation token, echoed back as request-id on sms:sent:
+redis-cli LPUSH scooter:sms '{"id":"trip-42","to":"+4915112345678","text":"Hello"}'
 ```
 
-The service creates, transmits, and deletes the message, then updates the `sms`
-hash (`state`, `last-sent-to`, `last-sent-at`). This is the only command queue
-that takes a JSON payload rather than a bare string, because a send needs both a
-recipient and a body.
+The service creates, transmits, and deletes the message, then records the
+outcome on the `sms:sent` stream/channel and updates the `sms` hash (`state`,
+`last-sent-to`, `last-sent-at`). This is the only command queue that takes a
+JSON payload rather than a bare string, because a send needs both a recipient
+and a body.
 
 ### Power inhibitor
 

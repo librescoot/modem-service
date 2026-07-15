@@ -38,6 +38,7 @@ func setupTestClient(t *testing.T) (*Client, func()) {
 		client.client.Hash("modem").Clear()
 		client.client.Hash("gps").Clear()
 		client.client.Hash("sms").Clear()
+		client.client.Del(SMSReceivedStream, SMSSentStream)
 		client.Close()
 	}
 
@@ -389,30 +390,98 @@ func TestPublishSMSState(t *testing.T) {
 	}
 }
 
-func TestPublishSMSFields(t *testing.T) {
+func TestPublishIncomingSMS(t *testing.T) {
 	client, cleanup := setupTestClient(t)
 	defer cleanup()
 
-	fields := map[string]string{
+	msg := IncomingSMS{
+		From:      "+4930",
+		Text:      "hello there",
+		Timestamp: "2026-06-15T12:00:00Z",
+	}
+	if err := client.PublishIncomingSMS(msg, 1); err != nil {
+		t.Fatalf("PublishIncomingSMS() error = %v", err)
+	}
+
+	// One entry on the stream carrying the message.
+	entries, err := client.client.Do("XRANGE", SMSReceivedStream, "-", "+")
+	if err != nil {
+		t.Fatalf("XRANGE failed: %v", err)
+	}
+	list, ok := entries.([]interface{})
+	if !ok || len(list) != 1 {
+		t.Fatalf("expected 1 stream entry, got %#v", entries)
+	}
+
+	// Convenience fields land on the hash.
+	want := map[string]string{
 		"last-received-from": "+4930",
 		"last-received-text": "hello there",
 		"last-received-at":   "2026-06-15T12:00:00Z",
 		"unread-count":       "1",
 	}
-
-	if err := client.PublishSMSFields(fields, "last-received-at"); err != nil {
-		t.Fatalf("PublishSMSFields() error = %v", err)
-	}
-
-	// All fields should be present in the hash after a batch publish.
-	for field, want := range fields {
+	for field, w := range want {
 		got, err := client.client.Hash("sms").Get(field)
 		if err != nil {
 			t.Errorf("Failed to get field %s: %v", field, err)
 			continue
 		}
-		if got != want {
-			t.Errorf("Field %s = %q, want %q", field, got, want)
+		if got != w {
+			t.Errorf("Field %s = %q, want %q", field, got, w)
+		}
+	}
+}
+
+func TestPublishSMSSendResult(t *testing.T) {
+	client, cleanup := setupTestClient(t)
+	defer cleanup()
+
+	ok := SMSSendResult{
+		RequestID: "req-1",
+		To:        "+4930",
+		Text:      "outbound",
+		Outcome:   "sent",
+		Timestamp: "2026-06-15T12:00:00Z",
+	}
+	if err := client.PublishSMSSendResult(ok); err != nil {
+		t.Fatalf("PublishSMSSendResult(sent) error = %v", err)
+	}
+
+	fail := SMSSendResult{
+		To:        "+4931",
+		Text:      "broken",
+		Outcome:   "error",
+		Error:     "send sms: network timeout",
+		Timestamp: "2026-06-15T12:01:00Z",
+	}
+	if err := client.PublishSMSSendResult(fail); err != nil {
+		t.Fatalf("PublishSMSSendResult(error) error = %v", err)
+	}
+
+	entries, err := client.client.Do("XRANGE", SMSSentStream, "-", "+")
+	if err != nil {
+		t.Fatalf("XRANGE failed: %v", err)
+	}
+	list, ok2 := entries.([]interface{})
+	if !ok2 || len(list) != 2 {
+		t.Fatalf("expected 2 stream entries, got %#v", entries)
+	}
+
+	// The hash reflects the LAST outcome: an error, so state=error but the
+	// last-sent-* fields still describe the earlier successful send.
+	want := map[string]string{
+		"state":        "error",
+		"last-sent-to": "+4930",
+		"last-sent-at": "2026-06-15T12:00:00Z",
+	}
+	for field, w := range want {
+		got, err := client.client.Hash("sms").Get(field)
+		if err != nil {
+			t.Errorf("Failed to get field %s: %v", field, err)
+			continue
+		}
+		if got != w {
+			t.Errorf("Field %s = %q, want %q", field, got, w)
 		}
 	}
 }

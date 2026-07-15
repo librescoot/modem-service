@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -162,7 +161,6 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		MMClient:            mmClient,
 		Sim:                 sim.New(mmClient, logger),
 		Apn:                 apn.New(mmClient, apn.NewNMCli(), nmWWANConnection, logger),
-		SMS:                 sms.New(mmClient, logger),
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
@@ -171,6 +169,9 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	}
 	// Let the location service re-resolve the modem D-Bus path when MM
 	// rebinds the modem (e.g. after mmcli --reset or AT+CFUN=0/1).
+	// The SMS manager delivers inbound messages through the service so a
+	// failed Redis write keeps the message in modem storage for retry.
+	service.SMS = sms.New(mmClient, logger, service.deliverIncomingSMS)
 	service.Location.ResolveModemPath = modemMgr.FindModem
 	service.gpsEnabled.Store(true)           // default: GPS on
 	service.cellLocationEnabled.Store(false) // default: cell location off
@@ -463,26 +464,28 @@ func (s *Service) disableModem(ctx context.Context) {
 }
 
 // handleSMSCommand processes one outbound SMS request from the scooter:sms
-// queue. The payload is JSON: {"to":"+49...","text":"..."}. Send progress is
-// reflected in the sms.state field (sending → idle on success, error on
-// failure); on success last-sent-to/last-sent-at are also published.
+// queue. The payload is JSON: {"id":"optional-token","to":"+49...","text":"..."}.
+// Every parsed request gets a terminal outcome on the sms:sent stream/channel
+// (correlated by the caller's id token); send progress is also reflected in
+// the sms.state field (sending → idle on success, error on failure).
 func (s *Service) handleSMSCommand(payload string) error {
 	var req sms.SendRequest
 	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		// Nothing to correlate a stream entry with — flag it on the hash only.
 		s.Logger.Printf("sms: invalid command payload: %v", err)
 		s.Redis.PublishSMSState("state", "error")
 		return fmt.Errorf("invalid sms command: %w", err)
 	}
 	if req.To == "" {
 		s.Logger.Printf("sms: command missing recipient")
-		s.Redis.PublishSMSState("state", "error")
+		s.recordSendResult(req, "missing recipient")
 		return fmt.Errorf("sms command missing recipient")
 	}
 
 	modemPath, err := s.Modem.FindModem()
 	if err != nil {
 		s.Logger.Printf("sms: cannot send, no modem: %v", err)
-		s.Redis.PublishSMSState("state", "error")
+		s.recordSendResult(req, fmt.Sprintf("no modem available: %v", err))
 		return fmt.Errorf("no modem available: %w", err)
 	}
 
@@ -490,7 +493,7 @@ func (s *Service) handleSMSCommand(payload string) error {
 	outcome, sendErr := s.SMS.Send(modemPath, req)
 	if outcome != sms.OutcomeOK {
 		s.Logger.Printf("sms: send failed (%s): %v", outcome, sendErr)
-		s.Redis.PublishSMSState("state", "error")
+		s.recordSendResult(req, sendErr.Error())
 		return sendErr
 	}
 
@@ -499,15 +502,29 @@ func (s *Service) handleSMSCommand(payload string) error {
 	// redundant keepalive after a send.
 	s.touchCSActivity()
 
-	if err := s.Redis.PublishSMSFields(map[string]string{
-		"state":        "idle",
-		"last-sent-to": req.To,
-		"last-sent-at": time.Now().Format(time.RFC3339),
-	}, "state"); err != nil {
-		s.Logger.Printf("sms: failed to publish send result: %v", err)
-	}
+	s.recordSendResult(req, "")
 	s.Logger.Printf("sms: sent to %s", req.To)
 	return nil
+}
+
+// recordSendResult publishes the terminal outcome of one send request to the
+// sms:sent stream/channel and updates the sms hash. An empty errStr means the
+// send succeeded.
+func (s *Service) recordSendResult(req sms.SendRequest, errStr string) {
+	res := redisClient.SMSSendResult{
+		RequestID: req.ID,
+		To:        req.To,
+		Text:      req.Text,
+		Outcome:   "sent",
+		Error:     errStr,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	if errStr != "" {
+		res.Outcome = "error"
+	}
+	if err := s.Redis.PublishSMSSendResult(res); err != nil {
+		s.Logger.Printf("sms: failed to record send result: %v", err)
+	}
 }
 
 // startSMSWatch (re-)arms the inbound-SMS signal watch on the current modem
@@ -557,11 +574,7 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 		// Process the signalled object directly. Some modems deliver a received
 		// message as a transient object that never lands in storage, so a
 		// re-list (drainSMS) would miss it.
-		msg := s.SMS.HandleAdded(modemPath, smsPath)
-		if msg == nil {
-			return
-		}
-		s.publishIncomingSMS(msg)
+		s.SMS.HandleAdded(modemPath, smsPath)
 	}); err != nil {
 		s.Logger.Printf("sms: failed to start SMS watch: %v", err)
 		cancel()
@@ -628,34 +641,30 @@ func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
 	}
 }
 
-// drainSMS reads and publishes every inbound message currently in storage.
+// drainSMS delivers every inbound message currently in modem storage.
 func (s *Service) drainSMS(modemPath dbus.ObjectPath) {
-	msgs, err := s.SMS.DrainReceived(modemPath)
-	if err != nil {
+	if err := s.SMS.DrainReceived(modemPath); err != nil {
 		s.Logger.Printf("sms: drain failed: %v", err)
-		return
-	}
-	for _, msg := range msgs {
-		s.publishIncomingSMS(msg)
 	}
 }
 
-// publishIncomingSMS writes one received message to the sms hash and bumps the
-// running unread counter. A single "last-received-at" notification is published
-// so subscribers wake once and HGET the rest.
-func (s *Service) publishIncomingSMS(msg *sms.Message) {
+// deliverIncomingSMS is the SMS manager's delivery callback: it commits one
+// received message to the sms:received stream (with a channel notification
+// and hash convenience fields). An error return makes the manager keep the
+// message in modem storage, so the periodic drain retries the delivery.
+func (s *Service) deliverIncomingSMS(msg *sms.Message) error {
 	s.touchCSActivity()
 	count := s.unreadSMS.Add(1)
-	if err := s.Redis.PublishSMSFields(map[string]string{
-		"last-received-from": msg.Number,
-		"last-received-text": msg.Text,
-		"last-received-at":   msg.Timestamp.Format(time.RFC3339),
-		"unread-count":       strconv.FormatInt(count, 10),
-	}, "last-received-at"); err != nil {
-		s.Logger.Printf("sms: failed to publish incoming message: %v", err)
+	if err := s.Redis.PublishIncomingSMS(redisClient.IncomingSMS{
+		From:      msg.Number,
+		Text:      msg.Text,
+		Timestamp: msg.Timestamp.Format(time.RFC3339),
+	}, count); err != nil {
+		s.unreadSMS.Add(-1)
+		return err
 	}
+	return nil
 }
-
 
 func (s *Service) touchCSActivity() {
 	s.lastCSActivity.Store(time.Now().UnixNano())
@@ -698,7 +707,6 @@ func (s *Service) queryOwnMSISDN(modemPath dbus.ObjectPath) string {
 	}
 	return ""
 }
-
 
 // refreshSGsViaVoiceCall refreshes the SGs association by placing a brief MO
 // voice call to the scooter's own number. The call setup sends an Extended
