@@ -21,6 +21,7 @@ import (
 	"modem-service/internal/mm"
 	"modem-service/internal/modem"
 	"modem-service/internal/modem/connectivity"
+	"modem-service/internal/modem/link"
 	redisClient "modem-service/internal/redis"
 	"modem-service/internal/sim"
 	"modem-service/internal/usb"
@@ -42,12 +43,21 @@ var modemOnlineStates = map[string]bool{
 // with the higher-precision source.
 const clockSyncInterval = 60 * time.Second
 
-// dataSessionStallTimeout is how long the modem is allowed to stay in a
-// non-"connected" status while still registered to the carrier before we
-// force a recovery cycle. Tuned generously so tunnels, underground parking,
-// and normal handoffs don't trigger spurious resets; only truly wedged data
-// sessions should cross this threshold.
-const dataSessionStallTimeout = 15 * time.Minute
+// Remedy cooldowns. A persistent fault must not loop: each remedy may fire at
+// most once per window. The modem-reset window is deliberately long, since a
+// reset drops the data session and the GPS fix along with it.
+// remedyConfirmations is how many consecutive assessments must report the same
+// failing layer before any action is taken.
+const remedyConfirmations = 2
+
+// Remedy cooldowns. A persistent fault must not loop: each remedy may fire at
+// most once per window. The modem-reset window is deliberately long, since a
+// reset drops the data session and the GPS fix along with it.
+const (
+	reattachCooldown     = 5 * time.Minute
+	bearerBounceCooldown = 5 * time.Minute
+	modemResetCooldown   = 30 * time.Minute
+)
 
 type Service struct {
 	Config                *config.Config
@@ -72,15 +82,36 @@ type Service struct {
 	gpsRecoveryMutex      sync.Mutex // Prevents concurrent GPS recovery/configuration attempts
 	gpsRecoveryInProgress bool       // Tracks if GPS recovery is currently running
 	gpsRecoveryUntil      time.Time  // Protected by gpsRecoveryMutex; monitor skips EnableGPS until this passes
-	connectivityFailures  int        // Consecutive internet connectivity check failures
+	// Layered connectivity assessment. link answers "is the local stack
+	// healthy" from ModemManager and sysfs alone, and is the only thing
+	// permitted to trigger a modem action. prober answers "did anything
+	// answer", which affects only what we publish: a fleet whose APN routes
+	// through a restrictive tunnel is unreachable by design and permanently
+	// healthy, and must never be power-cycled for it.
+	link           *link.Assessor
+	prober         *health.Prober
+	wantATCheck    bool
+	remedyCooldown map[link.Remedy]time.Time
+	probeInterval  time.Duration
+	nextProbeAt    time.Time
+	lastProbe      health.Result
+	lastAssessment link.Assessment
 
-	// disconnectedSince is set on the first tick where the modem reports
-	// status != "connected" (zero otherwise). When we're still registered to
-	// the carrier but the data session hasn't come back after
-	// dataSessionStallTimeout, we escalate to handleModemFailure. Without this
-	// path nothing triggers recovery if the modem says "disconnected" — the
-	// TCP-probe counter only runs while status == "connected".
-	disconnectedSince time.Time
+	// Change-gating for the additive diagnostic fields.
+	lastReachability string
+	lastLinkLayer    string
+
+	// Debounce: how many consecutive assessments have reported this same
+	// failing layer. Layers 0-6 act on a single observation otherwise, and a
+	// snapshot taken mid-bringup would bounce a connection that was already
+	// coming up.
+	pendingLayer  link.Layer
+	pendingRepeat int
+
+	// Injection seams for tests.
+	applyRemedyFn func(link.Remedy)
+	publishFn     func(field, value string) error
+	now           func() time.Time
 
 	lastClockSync time.Time // Last time syncClockFromGPS successfully fed chrony
 
@@ -158,6 +189,11 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		WaitingForGPSLogged: false,
 		connClassifier:      connectivity.New(),
 		monitorDone:         make(chan struct{}),
+
+		link:           link.New(),
+		prober:         health.NewProber(cfg.Interface, cfg.ConnectivityTargets()),
+		remedyCooldown: map[link.Remedy]time.Time{},
+		probeInterval:  cfg.InternetCheckTime,
 	}
 	// Let the location service re-resolve the modem D-Bus path when MM
 	// rebinds the modem (e.g. after mmcli --reset or AT+CFUN=0/1).
@@ -1071,27 +1107,186 @@ func (s *Service) syncClockFromGPS(t time.Time) bool {
 	return true
 }
 
-// shouldEscalateDisconnection decides whether the data-session stall watchdog
-// should force a recovery cycle. We only escalate when the modem is still
-// talking to the carrier (reg=home/roaming) and the error state isn't
-// something a modem reset can't fix (SIM locked/missing, registration denied
-// or outright failed). Searching/idle are left alone — those are signal or
-// coverage issues, and power-cycling the modem won't conjure a tower.
-func (s *Service) shouldEscalateDisconnection(state *modem.State) bool {
-	if s.disconnectedSince.IsZero() {
-		return false
+// reachabilityField distinguishes the two ways a probe can fail. "unreachable"
+// means nothing answered while the local stack is healthy, which is the
+// correct and permanent steady state for a scooter on a restricted APN.
+// "no-path" means the local stack is broken, which is a real fault. The old
+// code could not tell these apart, and treated both as broken hardware.
+func reachabilityField(reachable bool, a link.Assessment) string {
+	if reachable {
+		return "ok"
 	}
-	if time.Since(s.disconnectedSince) < dataSessionStallTimeout {
-		return false
+	if a.Healthy {
+		return "unreachable"
 	}
-	if state.Registration != modem.RegistrationHome && state.Registration != modem.RegistrationRoaming {
-		return false
+	return "no-path"
+}
+
+// linkLayerField renders the assessment for the Redis diagnostic field.
+func linkLayerField(a link.Assessment) string {
+	if a.Healthy {
+		return "ok"
 	}
-	switch state.ErrorState {
-	case "sim-locked", "sim-missing", "registration-denied", "registration-failed":
-		return false
+	if a.Reason == "" {
+		return a.FailedLayer.String()
 	}
-	return true
+	return a.FailedLayer.String() + ": " + a.Reason
+}
+
+// publishIfChanged writes a diagnostic field only when its value moved.
+// PublishInternetState pipelines HSET + PUBLISH, so an unconditional write
+// wakes every subscriber of the internet channel on every tick.
+func (s *Service) publishIfChanged(field, value string, last *string) {
+	if *last == value {
+		return
+	}
+	publish := s.publishFn
+	if publish == nil {
+		publish = s.Redis.PublishInternetState
+	}
+	if err := publish(field, value); err != nil {
+		if s.Logger != nil {
+			s.Logger.Printf("Failed to publish %s: %v", field, err)
+		}
+		// Leave *last untouched so the write is retried next tick.
+		return
+	}
+	*last = value
+}
+
+func (s *Service) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func remedyCooldownFor(r link.Remedy) time.Duration {
+	switch r {
+	case link.RemedyReattach:
+		return reattachCooldown
+	case link.RemedyBearerBounce:
+		return bearerBounceCooldown
+	case link.RemedyModemReset:
+		return modemResetCooldown
+	}
+	return 0
+}
+
+// handleAssessment applies the remedy for a failing layer, subject to that
+// remedy's cooldown. A healthy assessment does nothing.
+//
+// The probe result is deliberately not a parameter. Whether some destination
+// answered is not evidence about the modem, and treating it as such is the
+// defect this whole change exists to remove: one fleet's APN drops everything
+// outside its tunnel, and the old code read that as broken hardware and reset
+// a healthy modem every tick, 184 times and counting on one vehicle.
+func (s *Service) handleAssessment(a link.Assessment) {
+	if a.Healthy || a.Remedy == link.RemedyNone {
+		s.pendingRepeat = 0
+		return
+	}
+
+	// Debounce. The machinery this replaced tolerated a stalled data session
+	// for 15 minutes precisely so tunnels, underground parking and handoffs
+	// did not trigger action, and acting on a single snapshot would throw that
+	// tolerance away. Requiring the same failing layer twice also covers the
+	// window right after startup and after a recovery, when NetworkManager may
+	// not have finished bringing the connection up yet.
+	if a.FailedLayer != s.pendingLayer {
+		s.pendingLayer, s.pendingRepeat = a.FailedLayer, 1
+	} else {
+		s.pendingRepeat++
+	}
+	if s.pendingRepeat < remedyConfirmations {
+		if s.Logger != nil {
+			s.Logger.Printf("link: %s failed (%s), awaiting confirmation (%d/%d)",
+				a.FailedLayer, a.Reason, s.pendingRepeat, remedyConfirmations)
+		}
+		return
+	}
+
+	now := s.clock()
+	if until, ok := s.remedyCooldown[a.Remedy]; ok && now.Before(until) {
+		if s.Logger != nil {
+			s.Logger.Printf("link: %s failed (%s), %s suppressed for another %v",
+				a.FailedLayer, a.Reason, a.Remedy, until.Sub(now).Round(time.Second))
+		}
+		return
+	}
+	s.remedyCooldown[a.Remedy] = now.Add(remedyCooldownFor(a.Remedy))
+	if s.Logger != nil {
+		s.Logger.Printf("link: %s failed (%s), applying %s", a.FailedLayer, a.Reason, a.Remedy)
+	}
+	if s.applyRemedyFn != nil {
+		s.applyRemedyFn(a.Remedy)
+	} else {
+		s.applyRemedy(a.Remedy)
+	}
+	// Only a remedy that actually ran advances the ladder. See
+	// link.Assessor.NoteRemedyApplied.
+	if s.link != nil {
+		s.link.NoteRemedyApplied(a.FailedLayer, a.Remedy)
+	}
+}
+
+// applyRemedy performs the action. Split from handleAssessment so the policy,
+// meaning the cooldowns and the logging, is testable without a modem.
+func (s *Service) applyRemedy(r link.Remedy) {
+	switch r {
+	case link.RemedyReattach:
+		modemPath, err := s.Modem.FindModem()
+		if err != nil {
+			s.Logger.Printf("link: reattach skipped, no modem: %v", err)
+			return
+		}
+		if err := s.Apn.Reattach(modemPath); err != nil {
+			s.Logger.Printf("link: reattach failed: %v", err)
+		}
+	case link.RemedyBearerBounce:
+		if err := apn.NewNMCli().Reapply(nmWWANConnection); err != nil {
+			s.Logger.Printf("link: bearer bounce failed: %v", err)
+		}
+	case link.RemedyModemReset:
+		if err := s.handleModemFailure(s.ctx, "link_layer_failure"); err != nil {
+			s.Logger.Printf("link: modem reset failed: %v", err)
+		}
+	}
+}
+
+// nextProbeInterval doubles up to maxInterval, regardless of whether the probe
+// succeeded. Only the network probe backs off; the local layer checks run every
+// tick regardless, and a change in the local assessment resets this to base.
+func nextProbeInterval(cur, base, maxInterval time.Duration) time.Duration {
+	next := cur * 2
+	if next > maxInterval {
+		return maxInterval
+	}
+	if next < base {
+		return base
+	}
+	return next
+}
+
+// assignedResolvers gathers the resolvers the network handed us. No single
+// source is reliable: on an affected vehicle the ModemManager bearer read came
+// back empty while resolv.conf had them all along, so all three are consulted.
+func (s *Service) assignedResolvers() []string {
+	return health.ResolverSources{Sources: []func() []string{
+		func() []string {
+			modemPath, err := s.Modem.FindModem()
+			if err != nil {
+				return nil
+			}
+			bearer, err := s.MMClient.DataBearer(modemPath)
+			if err != nil {
+				return nil
+			}
+			return bearer.IP4.DNS
+		},
+		func() []string { return health.ResolvectlSource(s.Config.Interface) },
+		health.ResolvConfSource,
+	}}.Resolvers()
 }
 
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
@@ -1157,79 +1352,81 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		}
 	}
 
-	internetStatus := "disconnected"
-	if currentState.Status == "connected" {
-		// Modem reports connected, perform a real connectivity check
-		connected, connErr := health.CheckInternetConnectivity(ctx, s.Config.Interface)
-		if connected {
-			internetStatus = "connected"
-			s.connectivityFailures = 0        // Reset on success
-			s.disconnectedSince = time.Time{} // Reset the stall watchdog
-		} else {
-			s.connectivityFailures++
-			if connErr != nil {
-				s.Logger.Printf("Internet connectivity check failed (%d/%d): %v", s.connectivityFailures, 3, connErr)
-			} else {
-				s.Logger.Printf("Internet connectivity check failed (%d/%d)", s.connectivityFailures, 3)
-			}
-			internetStatus = "disconnected"
+	// Layers 0-7: local signals only, no destination involved. This is the
+	// only input allowed to trigger a modem action.
+	//
+	// currentState was already fetched above; pass it through rather than
+	// making LinkSnapshot repeat those D-Bus reads.
+	snap := s.Modem.LinkSnapshot(currentState, s.Config.Interface, s.wantATCheck)
+	assessment := s.link.Assess(snap)
+	s.wantATCheck = assessment.WantATCheck
 
-			// Only trigger recovery after 3 consecutive failures
-			if s.connectivityFailures >= 3 {
-				// Publish the disconnected status immediately
-				if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
-					s.Logger.Printf("Failed to publish internet disconnected state: %v", err)
-				}
-
-				s.Logger.Printf("Modem reports connected but internet check failed %d times, attempting recovery", s.connectivityFailures)
-				// Don't reset counter here - it will be reset on next successful connectivity check
-				// This ensures persistent connectivity issues are detected if recovery fails
-				recoveryErr := s.handleModemFailure(ctx, "internet_connectivity_failed")
-				if recoveryErr != nil {
-					s.Logger.Printf("Failed to initiate modem recovery: %v", recoveryErr)
-				}
-
-				// Return since we've already published the state
-				return nil
-			}
-		}
-	} else {
-		internetStatus = "disconnected"
-		s.connectivityFailures = 0 // Reset if modem not connected
-
-		// Data-session stall watchdog: if we're registered to the carrier
-		// but the modem's data session has been down for too long, force a
-		// recovery cycle. Without this path nothing ever triggers recovery
-		// for a wedged PDP context — the TCP probe above only runs while
-		// status == "connected".
-		if s.disconnectedSince.IsZero() {
-			s.disconnectedSince = time.Now()
-		}
-		if s.shouldEscalateDisconnection(currentState) {
-			stall := time.Since(s.disconnectedSince)
-			// Publish the disconnected state first so consumers see it
-			// before the recovery path runs.
-			if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
-				s.Logger.Printf("Failed to publish disconnected state before stall recovery: %v", err)
-			}
-			s.Logger.Printf("Data session stalled for %v with reg=%s error=%s, attempting recovery",
-				stall.Round(time.Second), currentState.Registration, currentState.ErrorState)
-			// Reset the clock so we don't re-trigger on the next tick while
-			// recovery is working; handleModemFailure success will also
-			// clear it naturally via the "connected" branch.
-			s.disconnectedSince = time.Now()
-			if recoveryErr := s.handleModemFailure(ctx, "data_session_stalled"); recoveryErr != nil {
-				s.Logger.Printf("Failed to initiate stall recovery: %v", recoveryErr)
-			}
-			return nil
+	// Layer 8: reachability. Backed off while healthy, because at a 30s
+	// interval across a fleet this is real query load on the operator's
+	// resolvers. Any change in the local assessment forces an immediate
+	// re-probe, so a genuine fault is still seen within one tick.
+	now := s.clock()
+	assessmentChanged := assessment != s.lastAssessment
+	// Skipped when the local stack is already known broken: reachabilityField
+	// reports no-path from the assessment alone in that case, so the probe
+	// would buy nothing and can block the tick for many seconds.
+	if !assessment.Healthy {
+		// Do not carry the last good probe result across a local fault. The
+		// stack is known broken, so publishing the previous success would
+		// report status=connected on a modem whose bearer has just died,
+		// which is a worse lie than the one this change set out to remove.
+		s.lastProbe = health.Result{Detail: "not probed: " + linkLayerField(assessment)}
+	}
+	if assessment.Healthy && (now.After(s.nextProbeAt) || assessmentChanged) {
+		s.lastProbe = s.prober.Probe(ctx, s.assignedResolvers())
+		// Backs off on both outcomes. Resetting on failure would keep a unit
+		// whose destinations are silent probing at full rate forever, which is
+		// the fleet this change exists for, and buys nothing: a probe failure
+		// is never a fault under this design. A change in the local assessment
+		// still forces an immediate re-probe, which is what actually needs to
+		// be responsive.
+		s.probeInterval = nextProbeInterval(s.probeInterval,
+			s.Config.InternetCheckTime, s.Config.InternetCheckMaxInterval)
+		s.nextProbeAt = now.Add(s.probeInterval)
+		if !s.lastProbe.Reachable {
+			s.Logger.Printf("connectivity: unreachable (%s)", s.lastProbe.Detail)
 		}
 	}
+	if assessmentChanged {
+		s.probeInterval = s.Config.InternetCheckTime
+	}
+	s.lastAssessment = assessment
+
+	internetStatus := "disconnected"
+	if s.lastProbe.Reachable {
+		internetStatus = "connected"
+	}
+
+	// Registered before any error return below. A remedy and a Redis write
+	// are independent concerns: a failed publish must not suppress recovery
+	// of a wedged modem. Deferred rather than called inline so it still runs
+	// after everything is published, since the reset ladder blocks for minutes
+	// and acting first would leave consumers reading stale state throughout.
+	//
+	// Deliberately not passed the probe result: reachability may never
+	// trigger a remedy.
+	defer s.handleAssessment(assessment)
 
 	if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
 		s.Logger.Printf("Failed to publish state: %v", err)
 		s.publishHealthState(ctx)
 		return err
 	}
+
+	// Additive diagnostics. status keeps its existing values so consumers are
+	// unaffected; these two carry the distinction that was previously
+	// impossible to see from Redis.
+	// Change-gated: PublishInternetState pipelines HSET + PUBLISH, so writing
+	// unconditionally would wake every subscriber of the internet channel
+	// twice per tick forever. Every other field here is gated the same way.
+	s.publishIfChanged("reachability", reachabilityField(s.lastProbe.Reachable, assessment),
+		&s.lastReachability)
+	s.publishIfChanged("link-layer", linkLayerField(assessment), &s.lastLinkLayer)
 
 	if err := s.publishHealthState(ctx); err != nil {
 		s.Logger.Printf("Failed to publish health state: %v", err)
