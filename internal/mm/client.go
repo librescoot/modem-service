@@ -572,35 +572,48 @@ func (c *Client) WatchSMSAdded(ctx context.Context, modemPath dbus.ObjectPath, o
 		return errors.Wrap(err, "failed to add match rule")
 	}
 
-	go func() {
-		defer close(signals)
-		defer c.conn.RemoveSignal(signals)
-		// Drop the match rule when the watch is cancelled so repeated re-arms
-		// (after modem recovery) don't accumulate rules on the connection.
-		defer c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
-		for {
-			select {
-			case <-ctx.Done():
+	go c.watchSMSAddedLoop(ctx, signals, rule, modemPath, onAdded)
+
+	return nil
+}
+
+// watchSMSAddedLoop is the body of the goroutine started by WatchSMSAdded. It
+// owns unregistering signals and the match rule when the watch stops, but it
+// never closes signals itself: signals was registered with the connection via
+// conn.Signal, and godbus's default signal handler closes every channel still
+// registered that way when the connection is closed (see Conn.Close ->
+// signalHandler.Terminate in godbus). If this loop also closed signals, a
+// close during shutdown -- cancelling the watch and closing the D-Bus
+// connection happen right after each other, with no handoff between them --
+// would race godbus's own close of the same channel and panic. Not closing
+// it here is safe either way: nothing else sends on signals after RemoveSignal
+// takes it out of godbus's dispatch list, so it's simply garbage collected
+// once this goroutine returns.
+func (c *Client) watchSMSAddedLoop(ctx context.Context, signals chan *dbus.Signal, rule string, modemPath dbus.ObjectPath, onAdded func(dbus.ObjectPath, bool)) {
+	defer c.conn.RemoveSignal(signals)
+	// Drop the match rule when the watch is cancelled so repeated re-arms
+	// (after modem recovery) don't accumulate rules on the connection.
+	defer c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case signal, ok := <-signals:
+			if !ok {
 				return
-			case signal, ok := <-signals:
-				if !ok {
-					return
-				}
-				if signal.Name == ModemMessagingInterface+".Added" && signal.Path == modemPath {
-					if len(signal.Body) >= 2 {
-						smsPath, _ := signal.Body[0].(dbus.ObjectPath)
-						received, _ := signal.Body[1].(bool)
-						c.log("SMS added: %s (received=%v)", smsPath, received)
-						if onAdded != nil {
-							onAdded(smsPath, received)
-						}
+			}
+			if signal.Name == ModemMessagingInterface+".Added" && signal.Path == modemPath {
+				if len(signal.Body) >= 2 {
+					smsPath, _ := signal.Body[0].(dbus.ObjectPath)
+					received, _ := signal.Body[1].(bool)
+					c.log("SMS added: %s (received=%v)", smsPath, received)
+					if onAdded != nil {
+						onAdded(smsPath, received)
 					}
 				}
 			}
 		}
-	}()
-
-	return nil
+	}
 }
 
 func (c *Client) log(format string, args ...interface{}) {
