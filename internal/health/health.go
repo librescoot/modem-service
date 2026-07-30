@@ -1,10 +1,7 @@
 package health
 
 import (
-	"context"
 	"fmt"
-	"net"
-	"syscall"
 	"time"
 )
 
@@ -79,55 +76,4 @@ func (h *Health) CanRecover() bool {
 // String returns a string representation of the health
 func (h *Health) String() string {
 	return fmt.Sprintf("Health{State: %s, RecoveryAttempts: %d}", h.State, h.RecoveryAttempts)
-}
-
-// connectivityTargets are tried in order by CheckInternetConnectivity. A
-// single target can be filtered or deprioritised on a given carrier, so we
-// spread the check across multiple providers — any one success means we
-// have a data path to the public internet. TCP port 53 is almost universally
-// open, even on networks that block ICMP or filter HTTPS.
-var connectivityTargets = []string{
-	"8.8.8.8:53",        // Google Public DNS
-	"1.1.1.1:53",        // Cloudflare
-	"9.9.9.9:53",        // Quad9
-	"208.67.222.222:53", // OpenDNS
-}
-
-const connectivityDialTimeout = 2 * time.Second
-
-// CheckInternetConnectivity attempts TCP:53 connections to a short list of
-// public DNS resolvers via the given modem interface. Returns true if any
-// target is reachable. Returns false with the accumulated errors if all of
-// them fail, so the caller can log what was tried.
-func CheckInternetConnectivity(ctx context.Context, interfaceName string) (bool, error) {
-	dialer := &net.Dialer{
-		Timeout: connectivityDialTimeout,
-		Control: func(network, address string, c syscall.RawConn) error {
-			var sockErr error
-			err := c.Control(func(fd uintptr) {
-				// Bind socket to interface using SO_BINDTODEVICE so the
-				// probe traffic never escapes via the wifi/wired path that
-				// the MDB might also have.
-				sockErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, interfaceName)
-			})
-			if err != nil {
-				return err
-			}
-			return sockErr
-		},
-	}
-
-	var errs []string
-	for _, target := range connectivityTargets {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		conn, err := dialer.DialContext(ctx, "tcp", target)
-		if err == nil {
-			conn.Close()
-			return true, nil
-		}
-		errs = append(errs, fmt.Sprintf("%s: %v", target, err))
-	}
-	return false, fmt.Errorf("all connectivity targets unreachable: %s", errs)
 }

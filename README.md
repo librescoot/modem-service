@@ -40,7 +40,9 @@ The service supports the following command-line flags:
 | `-redis-url`       | `redis://127.0.0.1:6379` | Redis URL                    |
 | `-gpsd-server`     | `localhost:2947` | GPSD server address                  |
 | `-polling-time`    | `5s`          | Polling interval for modem checks       |
-| `-internet-check-time` | `30s`     | Interval for internet connectivity checks |
+| `-internet-check-time` | `30s`     | Interval for local layer checks, and the base interval for the reachability probe |
+| `-internet-check-max-interval` | `5m` | Upper bound for probe backoff while healthy. Local layer checks are unaffected and still run every tick |
+| `-connectivity-targets` | `8.8.8.8:53,1.1.1.1:53,9.9.9.9:53,208.67.222.222:53` | Fallback probe targets, used only when no network-assigned resolver answers. Fleets on a private APN should point this at something actually reachable |
 | `-interface`       | `wwan0`       | Network interface to monitor            |
 | `-sms-keepalive`   | `false`       | Keep the CS (SGs) registration alive for SMS delivery via periodic self-calls |
 
@@ -76,6 +78,11 @@ The service maintains various Redis hashes:
 
 #### `internet` hash
 - `modem-health` (`normal`, `recovering`, `recovery-failed-waiting-reboot`, `permanent-failure-needs-replacement`)
+- `reachability` — why the probe reports what it does
+     - `ok` — a target answered
+     - `unreachable` — nothing answered, but the local stack is healthy. Normal and permanent on a fleet whose APN only routes to a private range; never a reason to touch the modem
+     - `no-path` — a local layer is failing, which is a real fault
+- `link-layer` — `ok`, or the lowest failing layer and the reason (e.g. `bearer: bearer not connected`)
 - `modem-state` (`off`, `disconnected`, `connected`, or `UNKNOWN`)
 - `ip-address` (external IPv4 address or `UNKNOWN`)
 - `access-tech` (access tech, depending on modem & SIM support)
