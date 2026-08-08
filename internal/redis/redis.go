@@ -187,6 +187,21 @@ func (c *Client) PublishCellLocationState(data map[string]interface{}) error {
 	return nil
 }
 
+// PublishDataUsage publishes the cellular byte totals to the "internet-usage"
+// hash. Silent, like cell-location: the totals move on every poll while data is
+// flowing, and waking every subscriber of the "internet" channel for a counter
+// that only a usage display reads is not a trade worth making. Consumers poll
+// the hash.
+func (c *Client) PublishDataUsage(data map[string]interface{}) error {
+	data["updated"] = time.Now().Format(time.RFC3339)
+	err := c.client.Hash("internet-usage").SetMany(data, ipc.NoPublish())
+	if err != nil {
+		c.logger.Printf("Unable to set internet-usage in redis: %v", err)
+		return fmt.Errorf("cannot write internet-usage to redis: %v", err)
+	}
+	return nil
+}
+
 // PublishSMSState sets a single field on the "sms" hash and notifies the "sms"
 // channel with the field name — the standard librescoot hash+channel
 // convention. Synchronous, like PublishModemState, so the field is readable by

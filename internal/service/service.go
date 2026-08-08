@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"modem-service/internal/apn"
 	"modem-service/internal/cell"
 	"modem-service/internal/config"
+	"modem-service/internal/datausage"
 	"modem-service/internal/health"
 	"modem-service/internal/location"
 	"modem-service/internal/mm"
@@ -109,6 +111,12 @@ type Service struct {
 	lastReachability string
 	lastLinkLayer    string
 
+	// Cellular byte accounting. The counter owns its own persistence; the
+	// service only decides when to publish and when to ask it to write.
+	Usage        *datausage.Counter
+	lastPubUsage datausage.Totals
+	havePubUsage bool
+
 	// Debounce: how many consecutive assessments have reported this same
 	// failing layer. Layers 0-6 act on a single observation otherwise, and a
 	// snapshot taken mid-bringup would bounce a connection that was already
@@ -117,9 +125,10 @@ type Service struct {
 	pendingRepeat int
 
 	// Injection seams for tests.
-	applyRemedyFn func(link.Remedy)
-	publishFn     func(field, value string) error
-	now           func() time.Time
+	applyRemedyFn  func(link.Remedy)
+	publishFn      func(field, value string) error
+	publishUsageFn func(map[string]interface{}) error
+	now            func() time.Time
 
 	lastClockSync time.Time // Last time syncClockFromGPS successfully fed chrony
 
@@ -193,6 +202,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		Sim:                 sim.New(mmClient, logger),
 		Apn:                 apn.New(mmClient, apn.NewNMCli(), nmWWANConnection, logger),
 		Location:            location.NewService(logger, cfg.GpsdServer, mmClient, cfg.SuplServer),
+		Usage:               datausage.New(cfg.DataUsageFile, logger),
 		LastState:           modem.NewState(),
 		WaitingForGPSLogged: false,
 		connClassifier:      connectivity.New(),
@@ -377,6 +387,12 @@ func (s *Service) Run(ctx context.Context) error {
 		"satellites-visible": int32(0),
 	}, false)
 
+	// Persist the byte totals. The monitor goroutine has stopped by now, so
+	// this writes everything it counted.
+	if err := s.Usage.Flush(); err != nil {
+		s.Logger.Printf("Failed to persist data usage: %v", err)
+	}
+
 	// Release service-owned resources. Modem.Close does not close the
 	// shared mm.Client — service owns it and closes it below.
 	if err := s.Modem.Close(); err != nil {
@@ -487,6 +503,14 @@ func (s *Service) disableModem(ctx context.Context) {
 
 	if err := s.Modem.PowerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
+	}
+
+	// The modem is off, so the totals are final for this power cycle. This is
+	// the intended write point: pm-service disables the modem before every
+	// suspend, hibernate and poweroff, and it happens while we still hold the
+	// inhibitor, so the write lands before the system goes down.
+	if err := s.Usage.Flush(); err != nil {
+		s.Logger.Printf("Failed to persist data usage: %v", err)
 	}
 
 	// Modem is off: drop the power inhibitor so pm-service can proceed to
@@ -1895,9 +1919,25 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	//
 	// currentState was already fetched above; pass it through rather than
 	// making LinkSnapshot repeat those D-Bus reads.
-	snap := s.Modem.LinkSnapshot(currentState, s.Config.Interface, s.wantATCheck)
+	snap, usage := s.Modem.LinkSnapshot(currentState, s.Config.Interface, s.wantATCheck)
 	assessment := s.link.Assess(snap)
 	s.wantATCheck = assessment.WantATCheck
+
+	// Byte accounting rides along on the bearer read the snapshot just did.
+	// Skipped when no bearer could be read: zeroes would look like a counter
+	// reset and get counted twice.
+	if usage.Valid {
+		s.Usage.Observe(datausage.Sample{
+			BearerPath: usage.Path,
+			RxBytes:    usage.RxBytes,
+			TxBytes:    usage.TxBytes,
+			Roaming:    currentState.IsRoaming,
+		})
+	}
+	s.publishDataUsage()
+	// Persisting happens at power transitions (disableModem) and shutdown.
+	// This only catches a unit that stays up for days without either.
+	s.Usage.Backstop()
 
 	// Layer 8: reachability. Backed off while healthy, because at a 30s
 	// interval across a fleet this is real query load on the operator's
@@ -1972,6 +2012,33 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// publishDataUsage writes the cellular byte totals when they have moved. The
+// hash is written silently, so this gate is about the Redis round trip rather
+// than about waking subscribers: an idle modem republishes nothing.
+func (s *Service) publishDataUsage() {
+	totals := s.Usage.Totals()
+	if s.havePubUsage && totals == s.lastPubUsage {
+		return
+	}
+	publish := s.publishUsageFn
+	if publish == nil {
+		publish = s.Redis.PublishDataUsage
+	}
+	err := publish(map[string]interface{}{
+		"rx-bytes":         strconv.FormatUint(totals.RxBytes, 10),
+		"tx-bytes":         strconv.FormatUint(totals.TxBytes, 10),
+		"rx-bytes-roaming": strconv.FormatUint(totals.RxBytesRoaming, 10),
+		"tx-bytes-roaming": strconv.FormatUint(totals.TxBytesRoaming, 10),
+		"since":            totals.Since,
+	})
+	if err != nil {
+		// Left ungated so the next tick retries.
+		s.Logger.Printf("Failed to publish data usage: %v", err)
+		return
+	}
+	s.lastPubUsage, s.havePubUsage = totals, true
 }
 
 func (s *Service) queryCellLocation(ctx context.Context, state *modem.State) {

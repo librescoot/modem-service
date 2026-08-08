@@ -93,6 +93,36 @@ func TestParseBearerStats(t *testing.T) {
 			},
 			want: BearerStats{RxBytes: 100, TxBytes: 200},
 		},
+		{
+			// MM 1.24 on the SIM7100E, verbatim key names. The totals are the
+			// across-reconnect figures and must not be confused with the
+			// per-attempt ones.
+			name: "with-totals",
+			in: map[string]dbus.Variant{
+				"rx-bytes":       dbus.MakeVariant(uint64(13434742)),
+				"tx-bytes":       dbus.MakeVariant(uint64(3903371)),
+				"total-rx-bytes": dbus.MakeVariant(uint64(74062451)),
+				"total-tx-bytes": dbus.MakeVariant(uint64(7986025)),
+				"duration":       dbus.MakeVariant(uint32(64770)),
+				"attempts":       dbus.MakeVariant(uint32(2)),
+			},
+			want: BearerStats{
+				RxBytes: 13434742, TxBytes: 3903371,
+				TotalRxBytes: 74062451, TotalTxBytes: 7986025, HaveTotals: true,
+				Duration: 64770, Attempts: 2,
+			},
+		},
+		{
+			// Pre-1.20 MM omits the totals entirely. Half a pair is not a pair:
+			// accounting must fall back rather than mix the two sources.
+			name: "partial-totals-ignored",
+			in: map[string]dbus.Variant{
+				"rx-bytes":       dbus.MakeVariant(uint64(10)),
+				"tx-bytes":       dbus.MakeVariant(uint64(20)),
+				"total-rx-bytes": dbus.MakeVariant(uint64(999)),
+			},
+			want: BearerStats{RxBytes: 10, TxBytes: 20},
+		},
 		{"empty", map[string]dbus.Variant{}, BearerStats{}},
 	}
 	for _, tc := range tests {

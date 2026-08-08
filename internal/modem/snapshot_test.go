@@ -4,7 +4,40 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"modem-service/internal/mm"
 )
+
+func TestBearerUsagePrefersAcrossReconnectTotals(t *testing.T) {
+	info := mm.BearerInfo{
+		Path: "/org/freedesktop/ModemManager1/Bearer/1",
+		Stats: mm.BearerStats{
+			RxBytes: 13434742, TxBytes: 3903371,
+			TotalRxBytes: 74062451, TotalTxBytes: 7986025, HaveTotals: true,
+		},
+	}
+	got := bearerUsage(info)
+	want := BearerUsage{
+		Valid:   true,
+		Path:    "/org/freedesktop/ModemManager1/Bearer/1",
+		RxBytes: 74062451,
+		TxBytes: 7986025,
+	}
+	if got != want {
+		t.Errorf("bearerUsage() = %+v, want %+v", got, want)
+	}
+}
+
+func TestBearerUsageFallsBackToPerAttemptCounters(t *testing.T) {
+	info := mm.BearerInfo{
+		Path:  "/org/freedesktop/ModemManager1/Bearer/1",
+		Stats: mm.BearerStats{RxBytes: 100, TxBytes: 200},
+	}
+	got := bearerUsage(info)
+	if got.RxBytes != 100 || got.TxBytes != 200 || !got.Valid {
+		t.Errorf("bearerUsage() = %+v, want the per-attempt counters", got)
+	}
+}
 
 func TestParseCGACT(t *testing.T) {
 	// parsed matters as much as active: an unreadable reply must not be

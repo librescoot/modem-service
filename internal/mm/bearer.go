@@ -21,14 +21,24 @@ type IP4Config struct {
 
 // BearerStats mirrors Bearer.Stats. Note that ModemManager refreshes these on
 // roughly a 30 second cadence, so byte deltas are useless for sub-30s liveness
-// checks. Attempts and Duration are the useful fields: Attempts increments on
-// each bearer reconnect and Duration resets with it, which together identify a
-// session that is flapping.
+// checks. Attempts and Duration are the useful fields for health: Attempts
+// increments on each bearer reconnect and Duration resets with it, which
+// together identify a session that is flapping.
+//
+// RxBytes/TxBytes cover the current connection attempt and zero on every
+// reconnect. TotalRxBytes/TotalTxBytes cover the bearer object's whole life and
+// do not, which makes them the better input for byte accounting: a reconnect
+// between two polls otherwise loses whatever moved in the tail of the old
+// session. They arrived in ModemManager 1.20, hence HaveTotals — MM omits the
+// keys entirely on older versions rather than reporting zero.
 type BearerStats struct {
-	RxBytes  uint64
-	TxBytes  uint64
-	Duration uint64
-	Attempts uint32
+	RxBytes      uint64
+	TxBytes      uint64
+	TotalRxBytes uint64
+	TotalTxBytes uint64
+	HaveTotals   bool
+	Duration     uint64
+	Attempts     uint32
 }
 
 // BearerInfo is one bearer's state.
@@ -153,6 +163,15 @@ func parseBearerStats(m map[string]dbus.Variant) BearerStats {
 	}
 	if v, ok := m["tx-bytes"]; ok {
 		s.TxBytes = variantUint(v)
+	}
+	// mmcli displays these as total-bytes-rx/total-bytes-tx; the dict keys are
+	// the other way around.
+	rxTotal, haveRx := m["total-rx-bytes"]
+	txTotal, haveTx := m["total-tx-bytes"]
+	if haveRx && haveTx {
+		s.TotalRxBytes = variantUint(rxTotal)
+		s.TotalTxBytes = variantUint(txTotal)
+		s.HaveTotals = true
 	}
 	if v, ok := m["duration"]; ok {
 		s.Duration = variantUint(v)

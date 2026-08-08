@@ -25,9 +25,42 @@ var procNetRoute = "/proc/net/route"
 // assessor asks for them.
 const atCommandTimeout = 5 * time.Second
 
-// LinkSnapshot gathers connectivity layers 0 through 7. Every read degrades to
-// a zero value rather than failing: link.Assess treats unknown as passing, so a
-// flaky D-Bus read can never manufacture a modem reset.
+// BearerUsage is the byte accounting half of the bearer read, returned
+// alongside the assessment snapshot rather than inside it. link.Snapshot
+// documents byte counters as deliberately absent, because layer 7 used to
+// compare tx against rx and that could not distinguish a wedged link from a
+// network that drops traffic by design. Keeping the counters out of the
+// assessor's input struct keeps them out of reach of that mistake.
+//
+// Valid reports whether a bearer was actually read. A failed read must not be
+// passed on as zeroes: datausage would take that for a counter reset and
+// double-count the session so far on the next successful poll.
+type BearerUsage struct {
+	Valid   bool
+	Path    string
+	RxBytes uint64
+	TxBytes uint64
+}
+
+// bearerUsage picks the byte counters to account from. ModemManager's
+// total-*-bytes span the bearer object's whole life, so a reconnect between two
+// polls costs nothing; the per-attempt counters zero on each reconnect and lose
+// whatever moved after the last poll of the old session. Older ModemManager
+// omits the totals, hence the fallback.
+func bearerUsage(b mm.BearerInfo) BearerUsage {
+	u := BearerUsage{Valid: true, Path: string(b.Path)}
+	if b.Stats.HaveTotals {
+		u.RxBytes, u.TxBytes = b.Stats.TotalRxBytes, b.Stats.TotalTxBytes
+		return u
+	}
+	u.RxBytes, u.TxBytes = b.Stats.RxBytes, b.Stats.TxBytes
+	return u
+}
+
+// LinkSnapshot gathers connectivity layers 0 through 7, plus the bearer's byte
+// counters for accounting. Every read degrades to a zero value rather than
+// failing: link.Assess treats unknown as passing, so a flaky D-Bus read can
+// never manufacture a modem reset.
 //
 // state is the modem state the caller already read on this tick; passing it in
 // avoids a redundant round of D-Bus reads. A nil state leaves those fields
@@ -36,13 +69,14 @@ const atCommandTimeout = 5 * time.Second
 // withAT controls the AT cross-check, which the previous assessment requests
 // via Assessment.WantATCheck. In steady state it is false and no AT commands
 // are issued.
-func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) link.Snapshot {
+func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) (link.Snapshot, BearerUsage) {
 	snap := link.Snapshot{}
+	usage := BearerUsage{}
 
 	modemPath, err := m.FindModem()
 	if err != nil {
 		// ModemPresent stays false: a layer 0 failure, which is the truth.
-		return snap
+		return snap, usage
 	}
 	snap.ModemPresent = true
 	snap.PrimaryPortOK = m.CheckPrimaryPort() == nil
@@ -70,6 +104,7 @@ func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) link.Sna
 		snap.BearerIP = normalizeAddr(bearer.IP4.Address)
 		snap.BearerAttempts = bearer.Stats.Attempts
 		snap.BearerDuration = bearer.Stats.Duration
+		usage = bearerUsage(bearer)
 	}
 
 	if withAT {
@@ -79,7 +114,7 @@ func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) link.Sna
 	snap.Carrier = readCarrier(sysfsNetRoot, iface)
 	snap.HasDefaultRoute = hasDefaultRoute(iface)
 
-	return snap
+	return snap, usage
 }
 
 // readATCrossCheck asks the modem directly what it thinks its PDP context and

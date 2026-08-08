@@ -21,6 +21,10 @@ type Config struct {
 	SuplServer   string
 	SMSKeepalive bool
 	Debug        bool
+
+	// DataUsageFile is where the cellular byte totals are persisted. Empty
+	// keeps the counters in memory only, which is what a dev box wants.
+	DataUsageFile string
 }
 
 func New() *Config {
@@ -48,6 +52,13 @@ func New() *Config {
 	// SIM's mailbox doesn't pick up busy calls. Enable per fleet/SIM setup.
 	flag.BoolVar(&cfg.SMSKeepalive, "sms-keepalive", false, "Keep the CS (SGs) registration alive for SMS delivery via periodic self-calls")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
+	// Written at power transitions and shutdown, not on a timer: see
+	// internal/datausage. /data is the only writable partition that survives
+	// an OTA, and it is flat by convention (/data/trips.db, /data/profiles.db).
+	// A /data/modem-service/ directory would also collide with the staged
+	// binary of the same name that the deploy instructions leave lying around.
+	flag.StringVar(&cfg.DataUsageFile, "data-usage-file", "/data/internet-usage.json",
+		"Where to persist cellular byte totals; empty keeps them in memory only")
 
 	return cfg
 }
