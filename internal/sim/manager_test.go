@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"log"
@@ -50,6 +51,25 @@ func pukErr() error {
 }
 
 // --- Configured PIN empty ----------------------------------------------------
+
+func TestReconcile_LogsObservationOnlyOnChange(t *testing.T) {
+	d := &fakeDBus{}
+	var logs bytes.Buffer
+	m := &Manager{dbus: d, logger: log.New(&logs, "", 0)}
+	in := Input{SIMPath: testSimPath, SIMPinLockEnabled: true, UnlockRetriesPin: 3}
+
+	m.Reconcile(in)
+	m.Reconcile(in)
+	if got, want := logs.String(), "sim-reconcile: lock=\"\" pin-configured=false enabled=true retries=3\n"; got != want {
+		t.Fatalf("unchanged input logged %q, want %q", got, want)
+	}
+
+	in.UnlockRetriesPin = 2
+	m.Reconcile(in)
+	if got, want := logs.String(), "sim-reconcile: lock=\"\" pin-configured=false enabled=true retries=3\nsim-reconcile: lock=\"\" pin-configured=false enabled=true retries=2\n"; got != want {
+		t.Fatalf("changed input logged %q, want %q", got, want)
+	}
+}
 
 func TestReconcile_NoPinConfigured(t *testing.T) {
 	d := &fakeDBus{}

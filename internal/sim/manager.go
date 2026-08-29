@@ -64,6 +64,16 @@ type Manager struct {
 
 	mu           sync.Mutex
 	triedThisRun bool
+
+	lastObservation    reconcileObservation
+	hasLastObservation bool
+}
+
+type reconcileObservation struct {
+	lockStatus       string
+	pinConfigured    bool
+	pinLockEnabled   bool
+	unlockRetriesPin uint32
 }
 
 // New returns a Manager bound to the given D-Bus surface and logger.
@@ -78,11 +88,7 @@ func New(d SimDBus, logger *log.Logger) *Manager {
 // the outcome for publication. It may make at most one D-Bus call per
 // invocation.
 func (m *Manager) Reconcile(in Input) Outcome {
-	// Diagnostic — log what the service sees each tick so we can confirm
-	// settings-service delivered a PIN. The value is sensitive and never
-	// logged; only whether one is configured.
-	m.logger.Printf("sim-reconcile: lock=%q pin-configured=%v enabled=%v retries=%d",
-		in.LockStatus, in.ConfiguredPIN != "", in.SIMPinLockEnabled, in.UnlockRetriesPin)
+	observationChanged := m.logObservation(in)
 
 	if in.ConfiguredPIN == "" {
 		return OutcomeUnconfigured
@@ -110,10 +116,37 @@ func (m *Manager) Reconcile(in Input) Outcome {
 		}
 		return m.actEnableLock(in)
 	default:
-		// Other lock reasons (ph-sim-pin etc.) — out of scope.
-		m.logger.Printf("sim: unhandled lock status %q, no action", in.LockStatus)
+		// Other lock reasons (ph-sim-pin etc.) — out of scope. Log this only
+		// when the observed SIM state changes; the diagnostic contains the
+		// same status and should not fill the journal every monitor tick.
+		if observationChanged {
+			m.logger.Printf("sim: unhandled lock status %q, no action", in.LockStatus)
+		}
 		return OutcomeOK
 	}
+}
+
+// logObservation emits the per-cycle diagnostic only when its observable
+// state changes. The configured PIN is deliberately represented only by its
+// presence, never by its value.
+func (m *Manager) logObservation(in Input) bool {
+	observation := reconcileObservation{
+		lockStatus:       in.LockStatus,
+		pinConfigured:    in.ConfiguredPIN != "",
+		pinLockEnabled:   in.SIMPinLockEnabled,
+		unlockRetriesPin: in.UnlockRetriesPin,
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.hasLastObservation && m.lastObservation == observation {
+		return false
+	}
+	m.lastObservation = observation
+	m.hasLastObservation = true
+	m.logger.Printf("sim-reconcile: lock=%q pin-configured=%v enabled=%v retries=%d",
+		in.LockStatus, observation.pinConfigured, in.SIMPinLockEnabled, in.UnlockRetriesPin)
+	return true
 }
 
 func (m *Manager) actUnlock(in Input) Outcome {
