@@ -8,25 +8,21 @@ import (
 )
 
 const (
-	// USB device path for modem
-	USBDevice = "1-1"
+	USBDevice = "1-1" // Physical USB topology path of the modem.
 
-	// USB sysfs paths
 	USBUnbindPath = "/sys/bus/usb/drivers/usb/unbind"
 	USBBindPath   = "/sys/bus/usb/drivers/usb/bind"
 
-	// Timing
-	UnbindWaitMS = 2000 // Wait 2 seconds after unbind
-	BindWaitMS   = 2000 // Wait 2 seconds after bind
+	// The modem requires these delays to disappear and enumerate after reset.
+	UnbindWaitMS = 2000
+	BindWaitMS   = 2000
 )
 
-// Recovery manages USB recovery operations
 type Recovery struct {
 	device string
 	logger func(string, ...interface{})
 }
 
-// NewRecovery creates a new USB recovery manager
 func NewRecovery(logger func(string, ...interface{})) *Recovery {
 	if logger == nil {
 		logger = func(string, ...interface{}) {}
@@ -46,14 +42,12 @@ func NewRecovery(logger func(string, ...interface{})) *Recovery {
 // USB recovery rather than as a failure.
 var ErrDeviceNotPresent = errors.New("USB device not present on bus")
 
-// Present reports whether the USB device is currently bound to the bus.
 func (r *Recovery) Present() bool {
 	_, err := os.Stat("/sys/bus/usb/devices/" + r.device)
 	return err == nil
 }
 
-// Unbind unbinds the USB device from the driver. Returns ErrDeviceNotPresent
-// if the device isn't currently bound (transient absence during MM reset).
+// Unbind treats transient modem absence during a ModemManager reset as non-fatal.
 func (r *Recovery) Unbind() error {
 	if !r.Present() {
 		r.log("USB device %s not present on bus, skipping unbind", r.device)
@@ -83,7 +77,6 @@ func (r *Recovery) Unbind() error {
 	return nil
 }
 
-// Bind binds the USB device to the driver
 func (r *Recovery) Bind() error {
 	r.log("Binding USB device %s...", r.device)
 
@@ -105,7 +98,7 @@ func (r *Recovery) Bind() error {
 
 	r.log("USB device bound, waiting up to %dms for enumeration...", BindWaitMS)
 
-	// Poll for device to re-enumerate (up to BindWaitMS)
+	// Binding is asynchronous; wait for the modem's sysfs node to reappear.
 	deadline := time.Now().Add(time.Duration(BindWaitMS) * time.Millisecond)
 	devicePath := "/sys/bus/usb/devices/" + r.device
 	for time.Now().Before(deadline) {
@@ -118,7 +111,6 @@ func (r *Recovery) Bind() error {
 	return errors.Errorf("USB device %s did not re-enumerate within %dms", r.device, BindWaitMS)
 }
 
-// Recover performs a full USB recovery (unbind + bind)
 func (r *Recovery) Recover() error {
 	r.log("Starting USB recovery...")
 
