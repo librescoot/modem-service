@@ -50,7 +50,9 @@ type SimDBus interface {
 type Input struct {
 	SIMPath           dbus.ObjectPath
 	LockStatus        string // "" if unlocked, otherwise mm.LockReasonToString
+	LockStatusKnown   bool
 	SIMPinLockEnabled bool
+	SIMPinLockKnown   bool
 	UnlockRetriesPin  uint32
 	ConfiguredPIN     string
 }
@@ -71,8 +73,10 @@ type Manager struct {
 
 type reconcileObservation struct {
 	lockStatus       string
+	lockStatusKnown  bool
 	pinConfigured    bool
 	pinLockEnabled   bool
+	pinLockKnown     bool
 	unlockRetriesPin uint32
 }
 
@@ -110,7 +114,12 @@ func (m *Manager) Reconcile(in Input) Outcome {
 	case "sim-pin":
 		return m.actUnlock(in)
 	case "":
-		// Unlocked. Enable lock if it isn't already.
+		if !in.LockStatusKnown || !in.SIMPinLockKnown {
+			if observationChanged {
+				m.logger.Printf("sim: lock state unavailable, no action")
+			}
+			return OutcomeError
+		}
 		if in.SIMPinLockEnabled {
 			return OutcomeOK
 		}
@@ -132,8 +141,10 @@ func (m *Manager) Reconcile(in Input) Outcome {
 func (m *Manager) logObservation(in Input) bool {
 	observation := reconcileObservation{
 		lockStatus:       in.LockStatus,
+		lockStatusKnown:  in.LockStatusKnown,
 		pinConfigured:    in.ConfiguredPIN != "",
 		pinLockEnabled:   in.SIMPinLockEnabled,
+		pinLockKnown:     in.SIMPinLockKnown,
 		unlockRetriesPin: in.UnlockRetriesPin,
 	}
 

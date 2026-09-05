@@ -71,9 +71,11 @@ type State struct {
 	PowerState         string
 	SIMState           string
 	SIMLockStatus      string
+	SIMLockStatusKnown bool
 	SIMPath            dbus.ObjectPath // SIM D-Bus object path; "" if no SIM
 	SIMPinLockEnabled  bool            // sim-pin facility enabled in EnabledFacilityLocks
-	UnlockRetriesPin   uint32          // remaining sim-pin attempts; 0 means unknown/exhausted
+	SIMPinLockKnown    bool
+	UnlockRetriesPin   uint32 // remaining sim-pin attempts; 0 means unknown/exhausted
 	OperatorName       string
 	OperatorCode       string
 	IsRoaming          bool
@@ -230,9 +232,12 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 	if lockVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "UnlockRequired"); err == nil {
 		if lock, ok := lockVar.Value().(uint32); ok {
 			lockStr := mm.LockReasonToString(lock)
-			if lockStr != "none" && lockStr != "unknown" {
-				state.SIMLockStatus = lockStr
-				state.SIMState = SIMStateLocked
+			if lockStr != "unknown" {
+				state.SIMLockStatusKnown = true
+				if lockStr != "none" {
+					state.SIMLockStatus = lockStr
+					state.SIMState = SIMStateLocked
+				}
 			}
 		}
 	}
@@ -242,6 +247,7 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 	// PIN reconcile path treats missing values conservatively (won't act).
 	if locks, err := m.client.GetEnabledFacilityLocks(modemPath); err == nil {
 		state.SIMPinLockEnabled = (locks & mm.MMModem3gppFacilitySim) != 0
+		state.SIMPinLockKnown = true
 	}
 	if retries, err := m.client.GetUnlockRetries(modemPath); err == nil {
 		state.UnlockRetriesPin = retries[mm.MMLockSimPin]

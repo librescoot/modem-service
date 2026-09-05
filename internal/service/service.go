@@ -1926,7 +1926,9 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	currentState.PinAction = string(s.Sim.Reconcile(sim.Input{
 		SIMPath:           currentState.SIMPath,
 		LockStatus:        currentState.SIMLockStatus,
+		LockStatusKnown:   currentState.SIMLockStatusKnown,
 		SIMPinLockEnabled: currentState.SIMPinLockEnabled,
+		SIMPinLockKnown:   currentState.SIMPinLockKnown,
 		UnlockRetriesPin:  currentState.UnlockRetriesPin,
 		ConfiguredPIN:     pin,
 	}))

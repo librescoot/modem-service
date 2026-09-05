@@ -260,7 +260,9 @@ func TestReconcile_UnlockedEnablesLockWhenDisabled(t *testing.T) {
 	out := m.Reconcile(Input{
 		SIMPath:           testSimPath,
 		LockStatus:        "",
+		LockStatusKnown:   true,
 		SIMPinLockEnabled: false,
+		SIMPinLockKnown:   true,
 		UnlockRetriesPin:  3,
 		ConfiguredPIN:     "0000",
 	})
@@ -281,7 +283,9 @@ func TestReconcile_UnlockedNoOpWhenLockAlreadyEnabled(t *testing.T) {
 	out := m.Reconcile(Input{
 		SIMPath:           testSimPath,
 		LockStatus:        "",
+		LockStatusKnown:   true,
 		SIMPinLockEnabled: true,
+		SIMPinLockKnown:   true,
 		UnlockRetriesPin:  3,
 		ConfiguredPIN:     "0000",
 	})
@@ -301,7 +305,9 @@ func TestReconcile_UnlockedWrongPinOnEnableTriedOnce(t *testing.T) {
 	in := Input{
 		SIMPath:           testSimPath,
 		LockStatus:        "",
+		LockStatusKnown:   true,
 		SIMPinLockEnabled: false,
+		SIMPinLockKnown:   true,
 		UnlockRetriesPin:  3,
 		ConfiguredPIN:     "0000",
 	}
@@ -329,7 +335,9 @@ func TestReconcile_UnlockedRefusesEnableWhenRetriesLow(t *testing.T) {
 	out := m.Reconcile(Input{
 		SIMPath:           testSimPath,
 		LockStatus:        "",
+		LockStatusKnown:   true,
 		SIMPinLockEnabled: false,
+		SIMPinLockKnown:   true,
 		UnlockRetriesPin:  2,
 		ConfiguredPIN:     "0000",
 	})
@@ -343,6 +351,46 @@ func TestReconcile_UnlockedRefusesEnableWhenRetriesLow(t *testing.T) {
 }
 
 // --- Cross-state safety -----------------------------------------------------
+
+func TestReconcile_UnlockedRefusesUnknownLockStatus(t *testing.T) {
+	d := &fakeDBus{}
+	m := newManager(d)
+
+	out := m.Reconcile(Input{
+		SIMPath:           testSimPath,
+		SIMPinLockEnabled: false,
+		SIMPinLockKnown:   true,
+		UnlockRetriesPin:  3,
+		ConfiguredPIN:     "0000",
+	})
+
+	if out != OutcomeError {
+		t.Fatalf("got %q, want %q", out, OutcomeError)
+	}
+	if d.sendPinCalls != 0 || d.enablePinCalls != 0 {
+		t.Fatal("must not act when UnlockRequired is unavailable")
+	}
+}
+
+func TestReconcile_UnlockedRefusesUnknownFacilityLock(t *testing.T) {
+	d := &fakeDBus{}
+	m := newManager(d)
+
+	out := m.Reconcile(Input{
+		SIMPath:           testSimPath,
+		LockStatusKnown:   true,
+		SIMPinLockEnabled: false,
+		UnlockRetriesPin:  3,
+		ConfiguredPIN:     "0000",
+	})
+
+	if out != OutcomeError {
+		t.Fatalf("got %q, want %q", out, OutcomeError)
+	}
+	if d.sendPinCalls != 0 || d.enablePinCalls != 0 {
+		t.Fatal("must not act when EnabledFacilityLocks is unavailable")
+	}
+}
 
 func TestReconcile_NoSimPath(t *testing.T) {
 	d := &fakeDBus{}
