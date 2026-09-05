@@ -8,11 +8,61 @@ import (
 	"testing"
 	"time"
 
+	"github.com/godbus/dbus/v5"
+
 	"modem-service/internal/config"
 	"modem-service/internal/health"
 	"modem-service/internal/location"
 	"modem-service/internal/modem"
 )
+
+func TestSMSPresenceTransitions(t *testing.T) {
+	steps := []struct {
+		name        string
+		path        dbus.ObjectPath
+		wantPresent bool
+		wantArm     bool
+		wantStop    bool
+	}{
+		{name: "missing at startup", path: "/"},
+		{name: "inserted", path: "/org/freedesktop/ModemManager1/SIM/0", wantPresent: true, wantArm: true},
+		{name: "still present", path: "/org/freedesktop/ModemManager1/SIM/0", wantPresent: true},
+		{name: "removed", path: "/", wantStop: true},
+		{name: "still missing", path: ""},
+	}
+
+	present := false
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			gotPresent, gotArm, gotStop := smsPresenceTransition(present, step.path)
+			if gotPresent != step.wantPresent || gotArm != step.wantArm || gotStop != step.wantStop {
+				t.Fatalf("transition = (present=%t arm=%t stop=%t), want (%t %t %t)",
+					gotPresent, gotArm, gotStop, step.wantPresent, step.wantArm, step.wantStop)
+			}
+			present = gotPresent
+		})
+	}
+}
+
+func TestReconcileSMSPresenceCancelsWatchOnRemoval(t *testing.T) {
+	s := &Service{}
+	s.smsSIMPresent.Store(true)
+	cancelled := 0
+	s.smsWatchCancel = func() { cancelled++ }
+
+	s.reconcileSMSPresence(context.Background(), "/")
+	s.reconcileSMSPresence(context.Background(), "")
+
+	if cancelled != 1 {
+		t.Fatalf("watch cancelled %d times, want 1", cancelled)
+	}
+	if s.smsSIMPresent.Load() {
+		t.Fatal("SIM remains marked present after removal")
+	}
+	if s.smsWatchCancel != nil {
+		t.Fatal("watch cancel function remains armed after removal")
+	}
+}
 
 // TestGPSRecoveryConcurrency tests that multiple concurrent GPS recovery attempts
 // are properly serialized and don't cause race conditions
@@ -473,7 +523,6 @@ func TestGPSStatusMapping(t *testing.T) {
 		t.Errorf("Expected state to be 'off', got '%s'", status["state"])
 	}
 }
-
 func TestGPSLifecycleOperationsAreSerialized(t *testing.T) {
 	s := &Service{}
 	firstEntered := make(chan struct{})

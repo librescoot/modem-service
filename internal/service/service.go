@@ -81,9 +81,10 @@ type Service struct {
 	SMS                   *sms.Manager
 	smsWatchMu            sync.Mutex         // guards smsWatchCancel; startSMSWatch runs from the Run, monitor, and watchdog goroutines
 	smsWatchCancel        context.CancelFunc // cancels the active inbound-SMS watch; re-armed on modem recovery
-	unreadSMS             atomic.Int64       // inbound messages since start; published as sms.unread-count
-	ownMSISDN             atomic.Value       // string; own phone number for the voice-call keepalive, resolved via AT+CNUM
-	lastCSActivity        atomic.Int64       // UnixNano of last confirmed CS event (any SMS sent/received)
+	smsSIMPresent         atomic.Bool
+	unreadSMS             atomic.Int64 // inbound messages since start; published as sms.unread-count
+	ownMSISDN             atomic.Value // string; own phone number for the voice-call keepalive, resolved via AT+CNUM
+	lastCSActivity        atomic.Int64 // UnixNano of last confirmed CS event (any SMS sent/received)
 	LastState             *modem.State
 	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
 	GPSEnabledTime        time.Time  // When GPS was first enabled
@@ -330,10 +331,6 @@ func (s *Service) Run(ctx context.Context) error {
 		s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
 	}
 
-	// Arm the inbound-SMS watch now that the modem should be present; this
-	// also drains any messages that arrived while we were offline.
-	s.startSMSWatch(ctx)
-
 	// Periodically check that the SGs CS registration at the MSC/VLR is still
 	// alive and force a fresh combined attach if it has expired (LAC=0xFFFE).
 	// Opt-in: the keepalive targets operators with a short CS implicit-detach
@@ -362,12 +359,8 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// Stop the inbound-SMS watch. It also stops when ctx is cancelled (its
 	// context is derived from ctx), but cancel explicitly for a tidy shutdown.
-	s.smsWatchMu.Lock()
-	if s.smsWatchCancel != nil {
-		s.smsWatchCancel()
-		s.smsWatchCancel = nil
-	}
-	s.smsWatchMu.Unlock()
+	s.smsSIMPresent.Store(false)
+	s.stopSMSWatch()
 
 	// Graceful shutdown: keep last lat/lng in Redis as a useful fallback
 	// for consumers, but clear the fix indicators so nobody treats the
@@ -452,6 +445,8 @@ func (s *Service) handleVehicleState(state string) error {
 // disableModem turns off the modem and publishes the off state
 func (s *Service) disableModem(ctx context.Context) {
 	s.Logger.Printf("Disabling modem...")
+
+	s.reconcileSMSPresence(ctx, "")
 
 	// Close GPS first. Preserve last lat/lng but clear the fix indicators
 	// so consumers don't treat stale coords as a current position.
@@ -587,11 +582,35 @@ func (s *Service) recordSendResult(req sms.SendRequest, errStr string) {
 	}
 }
 
-// startSMSWatch (re-)arms the inbound-SMS signal watch on the current modem
-// path. It cancels any previous watch, drains messages already in storage, and
-// starts a fresh Added-signal goroutine. Called at startup, after every modem
-// recovery (a reset can rebind the modem's D-Bus path), and after an SGs
-// refresh; smsWatchMu makes those call sites safe against each other.
+func smsPresenceTransition(previous bool, simPath dbus.ObjectPath) (present, arm, stop bool) {
+	present = simPath != "" && simPath != "/"
+	return present, present && !previous, !present && previous
+}
+
+func (s *Service) reconcileSMSPresence(ctx context.Context, simPath dbus.ObjectPath) {
+	present := simPath != "" && simPath != "/"
+	previous := s.smsSIMPresent.Swap(present)
+	_, arm, stop := smsPresenceTransition(previous, simPath)
+	if stop {
+		s.stopSMSWatch()
+	} else if arm {
+		s.startSMSWatch(ctx)
+	}
+}
+
+func (s *Service) stopSMSWatch() {
+	s.smsWatchMu.Lock()
+	defer s.smsWatchMu.Unlock()
+	if s.smsSIMPresent.Load() {
+		return
+	}
+	if s.smsWatchCancel != nil {
+		s.smsWatchCancel()
+		s.smsWatchCancel = nil
+	}
+}
+
+// startSMSWatch replaces the active watcher and drains stored messages.
 func (s *Service) startSMSWatch(ctx context.Context) {
 	s.smsWatchMu.Lock()
 	defer s.smsWatchMu.Unlock()
@@ -599,6 +618,9 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 	if s.smsWatchCancel != nil {
 		s.smsWatchCancel()
 		s.smsWatchCancel = nil
+	}
+	if !s.smsSIMPresent.Load() {
+		return
 	}
 
 	// Modem just came up (boot or post-resume recovery): it performed a fresh
@@ -1895,6 +1917,8 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		return err // Return the original error from GetModemInfo
 	}
 
+	s.reconcileSMSPresence(ctx, currentState.SIMPath)
+
 	// Reconcile SIM PIN state with the configured cellular.sim-pin setting.
 	// The manager owns retry-counter gating so the service can never push the
 	// SIM into PUK lock by itself.
@@ -2197,8 +2221,10 @@ func (s *Service) monitorStatus(ctx context.Context) {
 			// Poll for inbound SMS as a reliable fallback to the Added signal:
 			// some modems don't emit Added for SIM-stored messages, so a
 			// signal-only design can silently miss them.
-			if modemPath, err := s.Modem.FindModem(); err == nil {
-				s.drainSMS(modemPath)
+			if s.smsSIMPresent.Load() {
+				if modemPath, err := s.Modem.FindModem(); err == nil {
+					s.drainSMS(modemPath)
+				}
 			}
 		case <-cellTimer.C:
 			if !s.modemEnabled.Load() {
