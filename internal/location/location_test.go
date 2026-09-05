@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"modem-service/internal/mm"
 	"testing"
 	"time"
 
@@ -131,6 +132,42 @@ func TestRefreshModemPathIfStale(t *testing.T) {
 			t.Fatal("expected false when path unchanged")
 		}
 	})
+}
+
+func TestIsConfiguringTracksConfigurationLock(t *testing.T) {
+	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
+	if s.IsConfiguring() {
+		t.Fatal("new service reports configuration in progress")
+	}
+
+	s.configMutex.Lock()
+	defer s.configMutex.Unlock()
+	if !s.IsConfiguring() {
+		t.Fatal("service does not report configuration while lock is held")
+	}
+}
+
+func TestLocationSourceMasksKeepGPSIndependentFromCellFallback(t *testing.T) {
+	current := mm.MMModemLocationSourceGpsNmea |
+		mm.MMModemLocationSourceAgpsMsb |
+		mm.MMModemLocationSource3gppLacCi
+	gpsSources, allSources := locationSourceMasks(current)
+
+	if gpsSources&mm.MMModemLocationSourceGpsUnmanaged == 0 {
+		t.Error("GPS-only mask does not enable gps-unmanaged")
+	}
+	if gpsSources&mm.MMModemLocationSource3gppLacCi != 0 {
+		t.Error("GPS-only mask unexpectedly requires 3gpp-lac-ci")
+	}
+	if gpsSources&mm.MMModemLocationSourceGpsNmea != 0 {
+		t.Error("GPS-only mask preserves conflicting gps-nmea")
+	}
+	if gpsSources&mm.MMModemLocationSourceAgpsMsb == 0 {
+		t.Error("GPS-only mask does not preserve unrelated sources")
+	}
+	if allSources != gpsSources|mm.MMModemLocationSource3gppLacCi {
+		t.Errorf("all-sources mask = 0x%x, want GPS mask plus 3gpp-lac-ci", allSources)
+	}
 }
 
 func TestConfigRetryDelayBacksOffAndCaps(t *testing.T) {

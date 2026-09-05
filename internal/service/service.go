@@ -2175,6 +2175,10 @@ const (
 )
 
 func (s *Service) checkGPSHealth() error {
+	if s.Location.IsConfiguring() {
+		return nil
+	}
+
 	now := time.Now()
 
 	// "Are we getting any NMEA from the chip?" — fed on every TPV/SKY

@@ -217,6 +217,14 @@ func (s *Service) GpsdConnected() bool { return s.gpsdConnected.Load() }
 func (s *Service) State() string       { return s.state.Load().(string) }
 func (s *Service) GPSFreshInit() bool  { return s.gpsFreshInit.Load() }
 
+func (s *Service) IsConfiguring() bool {
+	if s.configMutex.TryLock() {
+		s.configMutex.Unlock()
+		return false
+	}
+	return true
+}
+
 func (s *Service) SetGPSFreshInit(v bool) {
 	s.gpsFreshInit.Store(v)
 }
@@ -343,7 +351,8 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 
 					s.Logger.Printf("Configuring GPS (attempt %d)", attempt+1)
 
-					if err := s.configureGPS(); err != nil {
+					err := s.configureGPS()
+					if err != nil {
 						s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
 						s.configMutex.Unlock()
 						select {
@@ -367,6 +376,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 						continue
 					}
 
+					s.SetLastDataReceived(time.Now())
 					s.Logger.Printf("Successfully connected to gpsd")
 					attempt = 0
 				}
@@ -866,57 +876,60 @@ func (s *Service) disableConflictingSources(ctx context.Context, enabledSources 
 	return nil
 }
 
+func locationSourceMasks(currentSources uint32) (gpsSources, allSources uint32) {
+	excludedMask := mm.MMModemLocationSourceGpsNmea |
+		mm.MMModemLocationSourceGpsRaw |
+		mm.MMModemLocationSource3gppLacCi
+	gpsSources = (currentSources | mm.MMModemLocationSourceGpsUnmanaged) &^ excludedMask
+	allSources = gpsSources | mm.MMModemLocationSource3gppLacCi
+	return gpsSources, allSources
+}
+
+func (s *Service) setupLocationSources(ctx context.Context, sources uint32) error {
+	var setupErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		setupErr = s.MMClient.SetupLocation(s.ModemPath, sources, false)
+		if setupErr != nil && s.refreshModemPathIfStale(setupErr) {
+			setupErr = s.MMClient.SetupLocation(s.ModemPath, sources, false)
+		}
+		if setupErr == nil {
+			return nil
+		}
+		s.Logger.Printf("Warning: Failed to enable sources (attempt %d/3): %v", attempt+1, setupErr)
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(1 * time.Second):
+			}
+		}
+	}
+	return setupErr
+}
+
 func (s *Service) enableLocationSources(ctx context.Context, currentSources uint32) error {
-	// Required sources: 3gpp-lac-ci (cell-tower fallback), gps-unmanaged (we drive GPS via AT).
-	// agps-msb is not included — the SimTech MM plugin does not act on it, and
-	// we configure SUPL ourselves via AT commands when online.
-	requiredSources := mm.MMModemLocationSource3gppLacCi |
-		mm.MMModemLocationSourceGpsUnmanaged
+	gpsSources, allSources := locationSourceMasks(currentSources)
 
-	// Check which sources need to be enabled
-	missingSourcesDisplay := []string{}
-	if currentSources&mm.MMModemLocationSource3gppLacCi == 0 {
-		missingSourcesDisplay = append(missingSourcesDisplay, "3gpp-lac-ci")
-	}
 	if currentSources&mm.MMModemLocationSourceGpsUnmanaged == 0 {
-		missingSourcesDisplay = append(missingSourcesDisplay, "gps-unmanaged")
+		s.Logger.Printf("Enabling required location source: gps-unmanaged")
+		if err := s.setupLocationSources(ctx, gpsSources); err != nil {
+			return fmt.Errorf("failed to enable gps-unmanaged after 3 attempts: %v", err)
+		}
+		currentSources = gpsSources
+		s.Logger.Printf("Required GPS location source enabled successfully")
+	} else {
+		s.Logger.Printf("Required GPS location source already configured")
 	}
 
-	// Calculate final sources (current + required, minus conflicting)
-	conflictingMask := mm.MMModemLocationSourceGpsNmea | mm.MMModemLocationSourceGpsRaw
-	finalSources := (currentSources | requiredSources) &^ conflictingMask
-
-	if len(missingSourcesDisplay) > 0 {
-		s.Logger.Printf("Enabling location sources: %s", strings.Join(missingSourcesDisplay, ", "))
-
-		// Try enabling with retries
-		var enableErr error
-		for attempt := 0; attempt < 3; attempt++ {
-			enableErr = s.MMClient.SetupLocation(s.ModemPath, finalSources, false)
-			if enableErr != nil && s.refreshModemPathIfStale(enableErr) {
-				enableErr = s.MMClient.SetupLocation(s.ModemPath, finalSources, false)
-			}
-			if enableErr == nil {
-				s.Logger.Printf("Location sources enabled successfully")
-				break
-			}
-			s.Logger.Printf("Warning: Failed to enable sources (attempt %d/3): %v", attempt+1, enableErr)
-
-			// Brief pause before retry
-			if attempt < 2 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(1 * time.Second):
-				}
-			}
+	// Cell-tower location is an optional fallback. ModemManager refuses it
+	// while the modem is in sim-missing, but gps-unmanaged remains usable.
+	if currentSources&mm.MMModemLocationSource3gppLacCi == 0 {
+		s.Logger.Printf("Enabling optional location source: 3gpp-lac-ci")
+		if err := s.setupLocationSources(ctx, allSources); err != nil {
+			s.Logger.Printf("Warning: Cell location source unavailable; continuing with GPS only: %v", err)
+		} else {
+			s.Logger.Printf("Cell location source enabled successfully")
 		}
-
-		if enableErr != nil {
-			return fmt.Errorf("failed to enable location sources after 3 attempts: %v", enableErr)
-		}
-	} else {
-		s.Logger.Printf("Required location sources already configured")
 	}
 
 	// Wait 3 seconds after enabling GPS before restarting gpsd
