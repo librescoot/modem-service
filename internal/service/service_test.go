@@ -474,3 +474,34 @@ func TestGPSStatusMapping(t *testing.T) {
 	}
 }
 
+func TestGPSLifecycleOperationsAreSerialized(t *testing.T) {
+	s := &Service{}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+	secondEntered := make(chan struct{})
+
+	go func() {
+		s.withGPSLifecycleLock(func() {
+			close(firstEntered)
+			<-releaseFirst
+		})
+		close(firstDone)
+	}()
+	<-firstEntered
+
+	go s.withGPSLifecycleLock(func() { close(secondEntered) })
+	select {
+	case <-secondEntered:
+		t.Fatal("GPS lifecycle operations overlapped")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	<-firstDone
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second GPS lifecycle operation did not proceed")
+	}
+}

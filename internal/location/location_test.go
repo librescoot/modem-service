@@ -132,3 +132,22 @@ func TestRefreshModemPathIfStale(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigRetryDelayBacksOffAndCaps(t *testing.T) {
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, GPSRetryInterval},
+		{1, 10 * time.Second},
+		{2, 20 * time.Second},
+		{3, 40 * time.Second},
+		{4, MaxGPSRetryInterval},
+		{50, MaxGPSRetryInterval},
+	}
+	for _, c := range cases {
+		if got := configRetryDelay(c.attempt); got != c.want {
+			t.Errorf("configRetryDelay(%d) = %v, want %v", c.attempt, got, c.want)
+		}
+	}
+}

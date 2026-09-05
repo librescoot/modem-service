@@ -21,6 +21,7 @@ const (
 	GPSTimeout                 = 10 * time.Minute
 	MaxGPSRetries              = 10
 	GPSRetryInterval           = 5 * time.Second
+	MaxGPSRetryInterval        = 60 * time.Second
 	GPSConfigTimeout           = 30 * time.Second
 	MaxConfigRetries           = 3
 
@@ -88,6 +89,17 @@ func correctGPSWeekRollover(t time.Time) (time.Time, bool) {
 		corrected = corrected.Add(gpsWeekRollover)
 	}
 	return corrected, !corrected.Equal(t)
+}
+
+func configRetryDelay(attempt int) time.Duration {
+	delay := GPSRetryInterval
+	for range attempt {
+		delay *= 2
+		if delay >= MaxGPSRetryInterval {
+			return MaxGPSRetryInterval
+		}
+	}
+	return delay
 }
 
 type Config struct {
@@ -337,7 +349,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 						select {
 						case <-stopChan:
 							return
-						case <-time.After(GPSRetryInterval):
+						case <-time.After(configRetryDelay(attempt)):
 						}
 						attempt++
 						continue
@@ -349,7 +361,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 						select {
 						case <-stopChan:
 							return
-						case <-time.After(GPSRetryInterval):
+						case <-time.After(configRetryDelay(attempt)):
 						}
 						attempt++
 						continue

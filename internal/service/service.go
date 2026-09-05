@@ -455,7 +455,7 @@ func (s *Service) disableModem(ctx context.Context) {
 
 	// Close GPS first. Preserve last lat/lng but clear the fix indicators
 	// so consumers don't treat stale coords as a current position.
-	s.Location.Close()
+	s.withGPSLifecycleLock(s.Location.Close)
 	s.Redis.PublishLocationState(map[string]interface{}{
 		"state":              "off",
 		"fix":                "none",
@@ -1280,6 +1280,11 @@ func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
 // Pacing is handled via s.gpsRecoveryUntil (see the monitor loop) — this
 // function does not sleep while holding any mutex.
 func (s *Service) attemptGPSRecovery(trigger error) error {
+	if !s.modemEnabled.Load() {
+		s.Logger.Printf("GPS recovery skipped, modem is disabled")
+		return nil
+	}
+
 	// Acquire lock to prevent concurrent GPS recovery attempts
 	s.gpsRecoveryMutex.Lock()
 	// Check if recovery is already in progress
@@ -1343,19 +1348,40 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 	s.WaitingForGPSLogged = false
 	s.Location.SetLastDataReceived(time.Time{})
 
-	// Try to re-enable GPS
-	modemPath, err := s.Modem.FindModem()
-	if err != nil {
-		return fmt.Errorf("modem not found for GPS recovery: %v", err)
+	var recoveryErr error
+	reenabled := false
+	s.withGPSLifecycleLock(func() {
+		if !s.modemEnabled.Load() {
+			return
+		}
+		modemPath, err := s.Modem.FindModem()
+		if err != nil {
+			recoveryErr = fmt.Errorf("modem not found for GPS recovery: %v", err)
+			return
+		}
+		if err := s.Location.EnableGPS(modemPath); err != nil {
+			recoveryErr = fmt.Errorf("failed to re-enable GPS: %v", err)
+			return
+		}
+		reenabled = true
+	})
+	if recoveryErr != nil {
+		return recoveryErr
 	}
-
-	if err := s.Location.EnableGPS(modemPath); err != nil {
-		return fmt.Errorf("failed to re-enable GPS: %v", err)
+	if !reenabled {
+		s.Logger.Printf("GPS recovery aborted, modem was disabled while recovering")
+		return nil
 	}
 
 	s.GPSEnabledTime = time.Now()
 	s.Logger.Printf("GPS recovery completed, waiting for fix...")
 	return nil
+}
+
+func (s *Service) withGPSLifecycleLock(fn func()) {
+	s.gpsRecoveryMutex.Lock()
+	defer s.gpsRecoveryMutex.Unlock()
+	fn()
 }
 
 // requestGPSModeForConnectivity kicks off a GPS mode change to match the new
