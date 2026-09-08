@@ -168,6 +168,10 @@ func (c *Counter) Observe(s Sample) {
 		rx -= c.lastRx
 		tx -= c.lastTx
 	}
+	// A zero-byte reset still changes the baseline needed after a restart.
+	if !c.haveLast || c.lastPath != s.BearerPath || c.lastRx != s.RxBytes || c.lastTx != s.TxBytes {
+		c.dirty = true
+	}
 	c.haveLast, c.lastPath, c.lastRx, c.lastTx = true, s.BearerPath, s.RxBytes, s.TxBytes
 
 	if rx == 0 && tx == 0 {
@@ -179,7 +183,6 @@ func (c *Counter) Observe(s Sample) {
 		c.totals.RxBytesRoaming += rx
 		c.totals.TxBytesRoaming += tx
 	}
-	c.dirty = true
 }
 
 // Totals returns the current totals.

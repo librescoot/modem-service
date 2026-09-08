@@ -58,7 +58,7 @@ type Client struct {
 
 // NewClient creates a new ModemManager D-Bus client
 func NewClient(debug bool, logger func(string, ...interface{})) (*Client, error) {
-	conn, err := dbus.SystemBus()
+	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to connect to system bus")
 	}
@@ -100,15 +100,19 @@ func (c *Client) FindModem() (dbus.ObjectPath, error) {
 
 // GetProperty gets a property from the modem
 func (c *Client) GetProperty(modemPath dbus.ObjectPath, iface, property string) (dbus.Variant, error) {
+	return c.GetPropertyContext(context.Background(), modemPath, iface, property)
+}
+
+func (c *Client) GetPropertyContext(ctx context.Context, modemPath dbus.ObjectPath, iface, property string) (dbus.Variant, error) {
 	obj := c.conn.Object(ModemManagerService, modemPath)
 
 	var value dbus.Variant
-	err := obj.Call(DBusPropertiesInterface+".Get", 0, iface, property).Store(&value)
+	err := obj.CallWithContext(ctx, DBusPropertiesInterface+".Get", 0, iface, property).Store(&value)
 	if err != nil {
 		return value, errors.Wrapf(err, "failed to get property %s.%s", iface, property)
 	}
 
-	c.log("Get %s.%s = %v", iface, property, value.Value())
+	c.log("Get %s.%s = %v", iface, property, propertyLogValue(property, value))
 	return value, nil
 }
 
@@ -127,6 +131,10 @@ func (c *Client) SetProperty(modemPath dbus.ObjectPath, iface, property string, 
 
 // SendCommand sends an AT command to the modem
 func (c *Client) SendCommand(modemPath dbus.ObjectPath, command string, timeout time.Duration) (string, error) {
+	return c.SendCommandContext(context.Background(), modemPath, command, timeout)
+}
+
+func (c *Client) SendCommandContext(ctx context.Context, modemPath dbus.ObjectPath, command string, timeout time.Duration) (string, error) {
 	obj := c.conn.Object(ModemManagerService, modemPath)
 
 	timeoutSec := uint32(timeout.Seconds())
@@ -134,15 +142,31 @@ func (c *Client) SendCommand(modemPath dbus.ObjectPath, command string, timeout 
 		timeoutSec = 120
 	}
 
-	c.log(">> %s (timeout: %ds)", command, timeoutSec)
+	label := command
+	sensitive := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(command)), "AT+CGAUTH=")
+	if sensitive {
+		label = "AT+CGAUTH=[REDACTED]"
+	}
+	c.log(">> %s (timeout: %ds)", label, timeoutSec)
 
 	var response string
-	err := obj.Call(ModemInterface+".Command", 0, command, timeoutSec).Store(&response)
+	err := obj.CallWithContext(ctx, ModemInterface+".Command", 0, command, timeoutSec).Store(&response)
 	if err != nil {
-		return "", errors.Wrapf(err, "AT command failed: %s", command)
+		if sensitive {
+			if ctx.Err() != nil {
+				return "", errors.Wrapf(ctx.Err(), "AT command failed: %s", label)
+			}
+			// Modem errors may echo the credential-bearing command.
+			return "", fmt.Errorf("AT command failed: %s", label)
+		}
+		return "", errors.Wrapf(err, "AT command failed: %s", label)
 	}
 
-	c.log("<< %s", strings.TrimSpace(response))
+	if sensitive {
+		c.log("<< [REDACTED]")
+	} else {
+		c.log("<< %s", strings.TrimSpace(response))
+	}
 	return response, nil
 }
 
@@ -300,7 +324,11 @@ func (c *Client) GetLocationCapabilities(modemPath dbus.ObjectPath) (uint32, err
 
 // GetEnabledLocationSources returns the currently enabled location sources
 func (c *Client) GetEnabledLocationSources(modemPath dbus.ObjectPath) (uint32, error) {
-	variant, err := c.GetProperty(modemPath, ModemLocationInterface, "Enabled")
+	return c.GetEnabledLocationSourcesContext(context.Background(), modemPath)
+}
+
+func (c *Client) GetEnabledLocationSourcesContext(ctx context.Context, modemPath dbus.ObjectPath) (uint32, error) {
+	variant, err := c.GetPropertyContext(ctx, modemPath, ModemLocationInterface, "Enabled")
 	if err != nil {
 		return 0, err
 	}
@@ -353,133 +381,6 @@ func (c *Client) HangupCall(callPath dbus.ObjectPath) error {
 func (c *Client) DeleteCall(modemPath, callPath dbus.ObjectPath) error {
 	call := c.CallMethod(modemPath, ModemVoiceInterface, "DeleteCall", callPath)
 	return call.Err
-}
-
-// WatchModems sets up signal watching for modem added/removed
-func (c *Client) WatchModems(ctx context.Context, onAdded func(dbus.ObjectPath), onRemoved func(dbus.ObjectPath)) error {
-	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
-	signals := make(chan *dbus.Signal, 100)
-	c.conn.Signal(signals)
-
-	matchRules := []string{
-		fmt.Sprintf("type='signal',sender='%s',interface='%s',member='InterfacesAdded'",
-			ModemManagerService, DBusObjectManager),
-		fmt.Sprintf("type='signal',sender='%s',interface='%s',member='InterfacesRemoved'",
-			ModemManagerService, DBusObjectManager),
-	}
-
-	addedRules := make([]string, 0, len(matchRules))
-	for _, rule := range matchRules {
-		if err := c.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Err; err != nil {
-			for _, added := range addedRules {
-				c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, added)
-			}
-			c.conn.RemoveSignal(signals)
-			close(signals)
-			return errors.Wrap(err, "failed to add match rule")
-		}
-		addedRules = append(addedRules, rule)
-	}
-
-	go func() {
-		defer close(signals)
-		defer c.conn.RemoveSignal(signals)
-		defer func() {
-			for _, rule := range addedRules {
-				c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
-			}
-		}()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case signal, ok := <-signals:
-				if !ok {
-					return
-				}
-				switch signal.Name {
-				case DBusObjectManager + ".InterfacesAdded":
-					if len(signal.Body) >= 2 {
-						if path, ok := signal.Body[0].(dbus.ObjectPath); ok {
-							if interfaces, ok := signal.Body[1].(map[string]map[string]dbus.Variant); ok {
-								if _, hasModem := interfaces[ModemInterface]; hasModem {
-									c.log("Modem added: %s", path)
-									if onAdded != nil {
-										onAdded(path)
-									}
-								}
-							}
-						}
-					}
-				case DBusObjectManager + ".InterfacesRemoved":
-					if len(signal.Body) >= 2 {
-						if path, ok := signal.Body[0].(dbus.ObjectPath); ok {
-							if interfaces, ok := signal.Body[1].([]string); ok {
-								for _, iface := range interfaces {
-									if iface == ModemInterface {
-										c.log("Modem removed: %s", path)
-										if onRemoved != nil {
-											onRemoved(path)
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	return nil
-}
-
-// WatchPropertyChanges watches for property changes on a modem
-func (c *Client) WatchPropertyChanges(ctx context.Context, modemPath dbus.ObjectPath, onChange func(string, string, dbus.Variant)) error {
-	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
-	signals := make(chan *dbus.Signal, 100)
-	c.conn.Signal(signals)
-
-	rule := fmt.Sprintf("type='signal',sender='%s',path='%s',interface='%s',member='PropertiesChanged'",
-		ModemManagerService, modemPath, DBusPropertiesInterface)
-
-	if err := c.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Err; err != nil {
-		c.conn.RemoveSignal(signals)
-		close(signals)
-		return errors.Wrap(err, "failed to add match rule")
-	}
-
-	go func() {
-		defer close(signals)
-		defer c.conn.RemoveSignal(signals)
-		defer c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case signal, ok := <-signals:
-				if !ok {
-					return
-				}
-				if signal.Name == DBusPropertiesInterface+".PropertiesChanged" && signal.Path == modemPath {
-					if len(signal.Body) >= 2 {
-						if iface, ok := signal.Body[0].(string); ok {
-							if changed, ok := signal.Body[1].(map[string]dbus.Variant); ok {
-								for prop, value := range changed {
-									c.log("Property changed: %s.%s = %v", iface, prop, value.Value())
-									if onChange != nil {
-										onChange(iface, prop, value)
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	return nil
 }
 
 // SMSProperties holds the subset of org.freedesktop.ModemManager1.Sms
@@ -566,68 +467,11 @@ func (c *Client) GetSMSProperties(smsPath dbus.ObjectPath) (SMSProperties, error
 	return p, nil
 }
 
-// WatchSMSAdded subscribes to Modem.Messaging "Added" signals on modemPath and
-// invokes onAdded(smsPath, received) for each one; received is TRUE for
-// messages delivered by the network (inbound). The watch runs until ctx is
-// cancelled, so it can be re-armed after a modem reset rebinds the D-Bus path.
-// Mirrors WatchPropertyChanges.
-func (c *Client) WatchSMSAdded(ctx context.Context, modemPath dbus.ObjectPath, onAdded func(dbus.ObjectPath, bool)) error {
-	// Use a larger buffer to handle signal bursts and prevent D-Bus blocking
-	signals := make(chan *dbus.Signal, 100)
-	c.conn.Signal(signals)
-
-	rule := fmt.Sprintf("type='signal',sender='%s',path='%s',interface='%s',member='Added'",
-		ModemManagerService, modemPath, ModemMessagingInterface)
-
-	if err := c.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Err; err != nil {
-		// Unregister the channel we just added so the connection doesn't keep
-		// dispatching signals into a channel nobody reads.
-		c.conn.RemoveSignal(signals)
-		return errors.Wrap(err, "failed to add match rule")
+func propertyLogValue(property string, value dbus.Variant) interface{} {
+	if property == "InitialEpsBearerSettings" {
+		return "[REDACTED]"
 	}
-
-	go c.watchSMSAddedLoop(ctx, signals, rule, modemPath, onAdded)
-
-	return nil
-}
-
-// watchSMSAddedLoop is the body of the goroutine started by WatchSMSAdded. It
-// owns unregistering signals and the match rule when the watch stops, but it
-// never closes signals itself: signals was registered with the connection via
-// conn.Signal, and godbus's default signal handler closes every channel still
-// registered that way when the connection is closed (see Conn.Close ->
-// signalHandler.Terminate in godbus). If this loop also closed signals, a
-// close during shutdown -- cancelling the watch and closing the D-Bus
-// connection happen right after each other, with no handoff between them --
-// would race godbus's own close of the same channel and panic. Not closing
-// it here is safe either way: nothing else sends on signals after RemoveSignal
-// takes it out of godbus's dispatch list, so it's simply garbage collected
-// once this goroutine returns.
-func (c *Client) watchSMSAddedLoop(ctx context.Context, signals chan *dbus.Signal, rule string, modemPath dbus.ObjectPath, onAdded func(dbus.ObjectPath, bool)) {
-	defer c.conn.RemoveSignal(signals)
-	// Drop the match rule when the watch is cancelled so repeated re-arms
-	// (after modem recovery) don't accumulate rules on the connection.
-	defer c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case signal, ok := <-signals:
-			if !ok {
-				return
-			}
-			if signal.Name == ModemMessagingInterface+".Added" && signal.Path == modemPath {
-				if len(signal.Body) >= 2 {
-					smsPath, _ := signal.Body[0].(dbus.ObjectPath)
-					received, _ := signal.Body[1].(bool)
-					c.log("SMS added: %s (received=%v)", smsPath, received)
-					if onAdded != nil {
-						onAdded(smsPath, received)
-					}
-				}
-			}
-		}
-	}
+	return value.Value()
 }
 
 func (c *Client) log(format string, args ...interface{}) {

@@ -515,39 +515,10 @@ func (s *Service) refreshModemPathIfStale(err error) bool {
 	return true
 }
 
-// sendATCommand is a helper to send AT commands with context and logging support.
-//
-// When ctx is cancelled while a command is in flight we return immediately,
-// but the inner goroutine keeps running until the underlying D-Bus
-// SendCommand call completes (bounded by its 10-second timeout) — there is
-// no interruptible D-Bus call on godbus, so we accept that bounded drift.
-// The done channel is buffered so the goroutine never blocks on send even
-// after the caller has given up, guaranteeing it exits within the timeout.
-//
-// On a stale-path error (ModemManager rebound the modem under a new D-Bus
-// object path, e.g. after AT+CFUN=0/1 or mmcli --reset) we re-resolve via
-// the configured ModemPathResolver and retry once.
+// sendATCommand retries once if ModemManager rebound the modem's object path.
 func (s *Service) sendATCommand(ctx context.Context, command string, logResponse bool) (string, error) {
 	send := func() (string, error) {
-		done := make(chan struct {
-			response string
-			err      error
-		}, 1)
-
-		go func() {
-			response, err := s.MMClient.SendCommand(s.ModemPath, command, 10*time.Second)
-			done <- struct {
-				response string
-				err      error
-			}{response, err}
-		}()
-
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case result := <-done:
-			return result.response, result.err
-		}
+		return s.MMClient.SendCommandContext(ctx, s.ModemPath, command, 10*time.Second)
 	}
 
 	response, err := send()
@@ -826,34 +797,14 @@ type LocationStatus struct {
 }
 
 func (s *Service) getLocationStatusWithTimeout(ctx context.Context) (*LocationStatus, error) {
-	type result struct {
-		status *LocationStatus
-		err    error
+	enabled, err := s.MMClient.GetEnabledLocationSourcesContext(ctx, s.ModemPath)
+	if err != nil && s.refreshModemPathIfStale(err) {
+		enabled, err = s.MMClient.GetEnabledLocationSourcesContext(ctx, s.ModemPath)
 	}
-
-	done := make(chan result, 1)
-
-	go func() {
-		enabled, err := s.MMClient.GetEnabledLocationSources(s.ModemPath)
-		if err != nil && s.refreshModemPathIfStale(err) {
-			enabled, err = s.MMClient.GetEnabledLocationSources(s.ModemPath)
-		}
-		if err != nil {
-			done <- result{nil, err}
-			return
-		}
-
-		done <- result{&LocationStatus{
-			EnabledSources: enabled,
-		}, nil}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-done:
-		return r.status, r.err
+	if err != nil {
+		return nil, err
 	}
+	return &LocationStatus{EnabledSources: enabled}, nil
 }
 
 func (s *Service) disableConflictingSources(ctx context.Context, enabledSources uint32) error {

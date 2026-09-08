@@ -301,3 +301,30 @@ func TestEmptyPathDisablesPersistence(t *testing.T) {
 		t.Fatalf("rx = %d, want the counter still accumulating in memory", got)
 	}
 }
+
+func TestObservePersistsZeroCounterReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	c := New(path, nil)
+	c.Observe(Sample{BearerPath: "/b/1", RxBytes: 100, TxBytes: 50})
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	c.Observe(Sample{BearerPath: "/b/1"})
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed := New(path, nil)
+	resumed.Observe(Sample{BearerPath: "/b/1", RxBytes: 150, TxBytes: 75})
+	got := resumed.Totals()
+	if got.RxBytes != 250 || got.TxBytes != 125 {
+		t.Fatalf("totals after zero reset and restart = %+v, want rx=250 tx=125", got)
+	}
+	if c.dirty {
+		t.Fatal("successful baseline flush left counter dirty")
+	}
+	c.Observe(Sample{BearerPath: "/b/1"})
+	if c.dirty {
+		t.Fatal("unchanged zero sample dirtied persisted baseline")
+	}
+}

@@ -128,6 +128,7 @@ type Service struct {
 	// Injection seams for tests.
 	applyRemedyFn  func(link.Remedy)
 	publishFn      func(field, value string) error
+	publishModemFn func(field, value string) error
 	publishUsageFn func(map[string]interface{}) error
 	now            func() time.Time
 
@@ -184,6 +185,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	// Create ModemManager D-Bus client
 	mmClient, err := mm.NewClient(cfg.Debug, logger.Printf)
 	if err != nil {
+		redis.Close()
 		return nil, fmt.Errorf("failed to create ModemManager client: %v", err)
 	}
 
@@ -191,6 +193,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	modemMgr, err := modem.NewManager(mmClient, logger)
 	if err != nil {
 		mmClient.Close()
+		redis.Close()
 		return nil, fmt.Errorf("failed to create modem manager: %v", err)
 	}
 
@@ -1485,6 +1488,9 @@ func (s *Service) withGPSLifecycleLock(fn func()) {
 const enableUEBasedMode = false
 
 func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connectivity.State) {
+	if ctx.Err() != nil {
+		return
+	}
 	var desired location.GPSMode
 	switch {
 	case enableUEBasedMode && conn == connectivity.Connected:
@@ -1530,12 +1536,20 @@ func (s *Service) publishGPSMode() {
 // publishModemState publishes the detailed modem and derived internet state to Redis.
 // It now takes the determined internetStatus as an argument.
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State, internetStatus string) error {
+	publishInternet := s.publishFn
+	if publishInternet == nil {
+		publishInternet = s.Redis.PublishInternetState
+	}
+	publishModem := s.publishModemFn
+	if publishModem == nil {
+		publishModem = s.Redis.PublishModemState
+	}
 	// Track which fields changed for consolidated logging
 	var internetChanges, modemChanges []string
 
 	// Publish internet state fields
 	if s.LastState.Status != internetStatus {
-		if err := s.Redis.PublishInternetState("status", internetStatus); err != nil {
+		if err := publishInternet("status", internetStatus); err != nil {
 			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("status=%s", internetStatus))
@@ -1543,15 +1557,15 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.LastRawModemStatus != currentState.Status {
-		if err := s.Redis.PublishInternetState("modem-state", currentState.Status); err != nil {
-			s.Logger.Printf("Failed to publish internet modem-state: %v", err)
+		if err := publishInternet("modem-state", currentState.Status); err != nil {
+			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("modem-state=%s", currentState.Status))
 		s.LastState.LastRawModemStatus = currentState.Status
 	}
 
 	if s.LastState.IfIPAddr != currentState.IfIPAddr {
-		if err := s.Redis.PublishInternetState("ip-address", currentState.IfIPAddr); err != nil {
+		if err := publishInternet("ip-address", currentState.IfIPAddr); err != nil {
 			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("ip=%s", currentState.IfIPAddr))
@@ -1559,7 +1573,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.AccessTech != currentState.AccessTech {
-		if err := s.Redis.PublishInternetState("access-tech", currentState.AccessTech); err != nil {
+		if err := publishInternet("access-tech", currentState.AccessTech); err != nil {
 			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("tech=%s", currentState.AccessTech))
@@ -1567,7 +1581,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.SignalQuality != currentState.SignalQuality {
-		if err := s.Redis.PublishInternetState("signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
+		if err := publishInternet("signal-quality", fmt.Sprintf("%d", currentState.SignalQuality)); err != nil {
 			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("signal=%d", currentState.SignalQuality))
@@ -1575,7 +1589,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.IMEI != currentState.IMEI {
-		if err := s.Redis.PublishInternetState("sim-imei", currentState.IMEI); err != nil {
+		if err := publishInternet("sim-imei", currentState.IMEI); err != nil {
 			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("imei=%s", currentState.IMEI))
@@ -1583,7 +1597,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.IMSI != currentState.IMSI {
-		if err := s.Redis.PublishInternetState("sim-imsi", currentState.IMSI); err != nil {
+		if err := publishInternet("sim-imsi", currentState.IMSI); err != nil {
 			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("imsi=%s", currentState.IMSI))
@@ -1591,7 +1605,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.ICCID != currentState.ICCID {
-		if err := s.Redis.PublishInternetState("sim-iccid", currentState.ICCID); err != nil {
+		if err := publishInternet("sim-iccid", currentState.ICCID); err != nil {
 			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("iccid=%s", currentState.ICCID))
@@ -1600,7 +1614,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 
 	// Publish modem state fields
 	if s.LastState.PowerState != currentState.PowerState {
-		if err := s.Redis.PublishModemState("power-state", currentState.PowerState); err != nil {
+		if err := publishModem("power-state", currentState.PowerState); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("power=%s", currentState.PowerState))
@@ -1608,7 +1622,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.SIMState != currentState.SIMState {
-		if err := s.Redis.PublishModemState("sim-state", currentState.SIMState); err != nil {
+		if err := publishModem("sim-state", currentState.SIMState); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("sim=%s", currentState.SIMState))
@@ -1616,7 +1630,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.SIMLockStatus != currentState.SIMLockStatus {
-		if err := s.Redis.PublishModemState("sim-lock", currentState.SIMLockStatus); err != nil {
+		if err := publishModem("sim-lock", currentState.SIMLockStatus); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("sim-lock=%s", currentState.SIMLockStatus))
@@ -1624,7 +1638,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.PinAction != currentState.PinAction {
-		if err := s.Redis.PublishModemState("pin-action", currentState.PinAction); err != nil {
+		if err := publishModem("pin-action", currentState.PinAction); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("pin-action=%s", currentState.PinAction))
@@ -1632,7 +1646,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.ApnAction != currentState.ApnAction {
-		if err := s.Redis.PublishModemState("apn-action", currentState.ApnAction); err != nil {
+		if err := publishModem("apn-action", currentState.ApnAction); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("apn-action=%s", currentState.ApnAction))
@@ -1640,7 +1654,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.OperatorName != currentState.OperatorName {
-		if err := s.Redis.PublishModemState("operator-name", currentState.OperatorName); err != nil {
+		if err := publishModem("operator-name", currentState.OperatorName); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("operator=%s", currentState.OperatorName))
@@ -1648,7 +1662,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.OperatorCode != currentState.OperatorCode {
-		if err := s.Redis.PublishModemState("operator-code", currentState.OperatorCode); err != nil {
+		if err := publishModem("operator-code", currentState.OperatorCode); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("mcc-mnc=%s", currentState.OperatorCode))
@@ -1656,7 +1670,7 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.IsRoaming != currentState.IsRoaming {
-		if err := s.Redis.PublishModemState("is-roaming", fmt.Sprintf("%t", currentState.IsRoaming)); err != nil {
+		if err := publishModem("is-roaming", fmt.Sprintf("%t", currentState.IsRoaming)); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("roaming=%t", currentState.IsRoaming))
@@ -1664,15 +1678,15 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.Registration != currentState.Registration {
-		if err := s.Redis.PublishModemState("registration", currentState.Registration); err != nil {
-			s.Logger.Printf("Failed to publish modem registration: %v", err)
+		if err := publishModem("registration", currentState.Registration); err != nil {
+			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("reg=%s", currentState.Registration))
 		s.LastState.Registration = currentState.Registration
 	}
 
 	if s.LastState.RegistrationFail != currentState.RegistrationFail {
-		if err := s.Redis.PublishModemState("registration-fail", currentState.RegistrationFail); err != nil {
+		if err := publishModem("registration-fail", currentState.RegistrationFail); err != nil {
 			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("reg-fail=%s", currentState.RegistrationFail))
@@ -1680,8 +1694,8 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	}
 
 	if s.LastState.ErrorState != currentState.ErrorState {
-		if err := s.Redis.PublishModemState("error-state", currentState.ErrorState); err != nil {
-			s.Logger.Printf("Failed to publish modem error-state: %v", err)
+		if err := publishModem("error-state", currentState.ErrorState); err != nil {
+			return err
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("error=%s", currentState.ErrorState))
 		s.LastState.ErrorState = currentState.ErrorState
@@ -1695,8 +1709,8 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		HardFailed:   s.Health.IsTerminal(),
 	})
 	if conn != s.lastPubConn {
-		if err := s.Redis.PublishInternetState("connectivity", string(conn)); err != nil {
-			s.Logger.Printf("Failed to publish internet connectivity: %v", err)
+		if err := publishInternet("connectivity", string(conn)); err != nil {
+			return err
 		}
 		internetChanges = append(internetChanges, fmt.Sprintf("connectivity=%s", conn))
 		s.lastPubConn = conn
