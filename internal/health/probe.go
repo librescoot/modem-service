@@ -20,9 +20,8 @@ var DefaultConnectivityTargets = []string{
 	"208.67.222.222:53",
 }
 
-// probeName is the name we ask for. The answer is never inspected: some
-// networks run hijacking resolvers, so a returned A record proves only that
-// the path works, which is exactly what we are measuring.
+// probeName is used by the legacy permissive probe. A deployment can instead
+// configure a TXT record and expected value to prove end-to-end reachability.
 const probeName = "connectivity-probe.invalid"
 
 // Result is the layer-8 verdict. It deliberately has no notion of path
@@ -39,25 +38,45 @@ type Prober struct {
 	Targets     []string // host:port fallbacks
 	DNSTimeout  time.Duration
 	DialTimeout time.Duration
+
+	VerificationName  string // DNS TXT name; empty keeps the permissive probe
+	VerificationValue string // exact TXT value expected from VerificationName
 }
 
-// NewProber returns a Prober with the default timeouts.
+// NewProber returns a permissive Prober with the default timeouts.
 func NewProber(iface string, targets []string) *Prober {
+	return NewProberWithVerification(iface, targets, "", "")
+}
+
+// NewProberWithVerification returns a Prober that requires an exact TXT value
+// when both verification arguments are non-empty. The empty default preserves
+// the pre-verification behaviour for existing deployments.
+func NewProberWithVerification(iface string, targets []string, name, value string) *Prober {
 	if len(targets) == 0 {
 		targets = DefaultConnectivityTargets
 	}
 	return &Prober{
-		Interface:   iface,
-		Targets:     targets,
-		DNSTimeout:  2 * time.Second,
-		DialTimeout: 2 * time.Second,
+		Interface:         iface,
+		Targets:           targets,
+		DNSTimeout:        2 * time.Second,
+		DialTimeout:       2 * time.Second,
+		VerificationName:  strings.TrimSuffix(strings.TrimSpace(name), "."),
+		VerificationValue: value,
 	}
 }
 
 // Probe tries the network-assigned resolvers first, then the configured
-// targets. Any DNS response, whatever the rcode, counts: NXDOMAIN, SERVFAIL and
-// REFUSED all prove bytes made the round trip.
+// targets. When TXT verification is configured, only the expected content
+// counts. Otherwise the legacy behaviour remains: any DNS response, whatever
+// the rcode, or an open fallback TCP port proves bytes made the round trip.
 func (p *Prober) Probe(ctx context.Context, assignedDNS []string) Result {
+	if p.VerificationName != "" || p.VerificationValue != "" {
+		if p.VerificationName == "" || p.VerificationValue == "" {
+			return Result{Detail: "connectivity verification requires both name and value"}
+		}
+		return p.probeVerifiedTXT(ctx, assignedDNS)
+	}
+
 	var tried []string
 
 	for _, resolver := range assignedDNS {
@@ -84,6 +103,26 @@ func (p *Prober) Probe(ctx context.Context, assignedDNS []string) Result {
 	}
 
 	return Result{Detail: "no target answered: " + strings.Join(tried, "; ")}
+}
+
+func (p *Prober) probeVerifiedTXT(ctx context.Context, assignedDNS []string) Result {
+	resolvers := make([]string, 0, len(assignedDNS)+len(p.Targets))
+	resolvers = append(resolvers, assignedDNS...)
+	resolvers = append(resolvers, p.Targets...)
+
+	var tried []string
+	for _, resolver := range resolvers {
+		if err := ctx.Err(); err != nil {
+			return Result{Detail: fmt.Sprintf("cancelled after %v", tried)}
+		}
+		addr := withDefaultPort(resolver, "53")
+		if err := p.dnsTXTQuery(ctx, addr, p.VerificationName, p.VerificationValue); err == nil {
+			return Result{Reachable: true, Detail: "verified dns " + addr}
+		} else {
+			tried = append(tried, fmt.Sprintf("verified dns %s: %v", addr, err))
+		}
+	}
+	return Result{Detail: "no verified target answered: " + strings.Join(tried, "; ")}
 }
 
 // dialer builds a dialer bound to the modem interface, so probe traffic cannot
@@ -148,8 +187,144 @@ func (p *Prober) dnsQuery(ctx context.Context, addr string) error {
 	}
 }
 
+// dnsTXTQuery requires a NOERROR response containing an exact TXT value.
+func (p *Prober) dnsTXTQuery(ctx context.Context, addr, name, expected string) error {
+	dialer := p.dialer(p.DialTimeout)
+	conn, err := dialer.DialContext(ctx, "udp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	query, id, err := buildDNSQueryType(name, 16)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(p.DNSTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if _, err := conn.Write(query); err != nil {
+		return err
+	}
+
+	buf := make([]byte, 1500)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return err
+		}
+		if n < 12 || binary.BigEndian.Uint16(buf[0:2]) != id || buf[2]&0x80 == 0 {
+			continue
+		}
+		if rcode := buf[3] & 0x0f; rcode != 0 {
+			return fmt.Errorf("rcode %d", rcode)
+		}
+		values, err := parseTXTAnswers(buf[:n])
+		if err != nil {
+			return err
+		}
+		for _, value := range values {
+			if value == expected {
+				return nil
+			}
+		}
+		return fmt.Errorf("expected TXT value not found")
+	}
+}
+
+// parseTXTAnswers returns TXT strings from a DNS response. It supports both
+// literal and compressed owner names and concatenates multi-string TXT RDATA.
+func parseTXTAnswers(msg []byte) ([]string, error) {
+	if len(msg) < 12 {
+		return nil, fmt.Errorf("short dns response")
+	}
+	off := 12
+	qdcount := int(binary.BigEndian.Uint16(msg[4:6]))
+	ancount := int(binary.BigEndian.Uint16(msg[6:8]))
+	for i := 0; i < qdcount; i++ {
+		var err error
+		off, err = skipDNSName(msg, off)
+		if err != nil {
+			return nil, err
+		}
+		if off+4 > len(msg) {
+			return nil, fmt.Errorf("truncated dns question")
+		}
+		off += 4
+	}
+
+	var values []string
+	for i := 0; i < ancount; i++ {
+		var err error
+		off, err = skipDNSName(msg, off)
+		if err != nil {
+			return nil, err
+		}
+		if off+10 > len(msg) {
+			return nil, fmt.Errorf("truncated dns answer")
+		}
+		typ := binary.BigEndian.Uint16(msg[off : off+2])
+		class := binary.BigEndian.Uint16(msg[off+2 : off+4])
+		rdlen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
+		off += 10
+		if off+rdlen > len(msg) {
+			return nil, fmt.Errorf("truncated dns rdata")
+		}
+		if typ == 16 && class == 1 {
+			end := off + rdlen
+			var value strings.Builder
+			for pos := off; pos < end; {
+				length := int(msg[pos])
+				pos++
+				if pos+length > end {
+					return nil, fmt.Errorf("truncated TXT string")
+				}
+				value.Write(msg[pos : pos+length])
+				pos += length
+			}
+			values = append(values, value.String())
+		}
+		off += rdlen
+	}
+	return values, nil
+}
+
+func skipDNSName(msg []byte, off int) (int, error) {
+	for {
+		if off >= len(msg) {
+			return 0, fmt.Errorf("truncated dns name")
+		}
+		n := int(msg[off])
+		switch {
+		case n == 0:
+			return off + 1, nil
+		case n&0xc0 == 0xc0:
+			if off+1 >= len(msg) {
+				return 0, fmt.Errorf("truncated dns compression pointer")
+			}
+			return off + 2, nil
+		case n&0xc0 != 0:
+			return 0, fmt.Errorf("invalid dns label")
+		default:
+			off++
+			if off+n > len(msg) {
+				return 0, fmt.Errorf("truncated dns label")
+			}
+			off += n
+		}
+	}
+}
+
 // buildDNSQuery assembles a standard recursive A query.
 func buildDNSQuery(name string) ([]byte, uint16, error) {
+	return buildDNSQueryType(name, 1)
+}
+
+func buildDNSQueryType(name string, qtype uint16) ([]byte, uint16, error) {
 	var idBytes [2]byte
 	if _, err := rand.Read(idBytes[:]); err != nil {
 		return nil, 0, err
@@ -171,9 +346,9 @@ func buildDNSQuery(name string) ([]byte, uint16, error) {
 		msg = append(msg, byte(len(label)))
 		msg = append(msg, label...)
 	}
-	msg = append(msg, 0)                        // root
-	msg = binary.BigEndian.AppendUint16(msg, 1) // QTYPE A
-	msg = binary.BigEndian.AppendUint16(msg, 1) // QCLASS IN
+	msg = append(msg, 0)                            // root
+	msg = binary.BigEndian.AppendUint16(msg, qtype) // QTYPE
+	msg = binary.BigEndian.AppendUint16(msg, 1)     // QCLASS IN
 	return msg, id, nil
 }
 

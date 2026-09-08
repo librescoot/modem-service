@@ -16,6 +16,12 @@ type Config struct {
 
 	connectivityTargetsRaw string
 
+	// ConnectivityVerificationName and ConnectivityVerificationValue enable a
+	// content-verified DNS TXT probe. Both are empty by default, preserving the
+	// legacy permissive probe until a deployment configures its own record.
+	ConnectivityVerificationName  string
+	ConnectivityVerificationValue string
+
 	Interface    string
 	GpsdServer   string
 	SuplServer   string
@@ -42,6 +48,10 @@ func New() *Config {
 	flag.StringVar(&cfg.connectivityTargetsRaw, "connectivity-targets",
 		"8.8.8.8:53,1.1.1.1:53,9.9.9.9:53,208.67.222.222:53",
 		"Comma-separated host:port fallback targets for the connectivity probe")
+	flag.StringVar(&cfg.ConnectivityVerificationName, "connectivity-verification-name", "",
+		"DNS name whose TXT record verifies internet reachability (empty disables verification)")
+	flag.StringVar(&cfg.ConnectivityVerificationValue, "connectivity-verification-value", "",
+		"Expected TXT value for the connectivity verification name (empty disables verification)")
 	flag.StringVar(&cfg.Interface, "interface", "wwan0", "Network interface to monitor")
 	flag.StringVar(&cfg.GpsdServer, "gpsd-server", "localhost:2947", "GPSD server address")
 	// Port 7276 is the plain-TCP SUPL port; 7275 is TLS-only and requires

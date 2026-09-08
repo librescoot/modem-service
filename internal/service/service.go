@@ -209,8 +209,13 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		connClassifier:      connectivity.New(),
 		monitorDone:         make(chan struct{}),
 
-		link:           link.New(),
-		prober:         health.NewProber(cfg.Interface, cfg.ConnectivityTargets()),
+		link: link.New(),
+		prober: health.NewProberWithVerification(
+			cfg.Interface,
+			cfg.ConnectivityTargets(),
+			cfg.ConnectivityVerificationName,
+			cfg.ConnectivityVerificationValue,
+		),
 		remedyCooldown: map[link.Remedy]time.Time{},
 		probeInterval:  cfg.InternetCheckTime,
 	}

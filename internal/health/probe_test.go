@@ -49,6 +49,26 @@ func echoHeader(rcode byte) func([]byte) []byte {
 	}
 }
 
+func txtResponse(value string) func([]byte) []byte {
+	return func(req []byte) []byte {
+		if len(req) < 12 || len(value) > 255 {
+			return nil
+		}
+		resp := append([]byte(nil), req...)
+		resp[2] = 0x81
+		resp[3] = 0x80
+		binary.BigEndian.PutUint16(resp[6:8], 1) // ANCOUNT
+		resp = append(resp, 0xc0, 0x0c)          // owner name -> question name
+		resp = binary.BigEndian.AppendUint16(resp, 16)
+		resp = binary.BigEndian.AppendUint16(resp, 1)
+		resp = binary.BigEndian.AppendUint32(resp, 30)
+		resp = binary.BigEndian.AppendUint16(resp, uint16(len(value)+1))
+		resp = append(resp, byte(len(value)))
+		resp = append(resp, value...)
+		return resp
+	}
+}
+
 func testProber(t *testing.T) *Prober {
 	t.Helper()
 	p := NewProber("", nil)
@@ -82,6 +102,35 @@ func TestProbeAssignedResolverNOERROR(t *testing.T) {
 	p.Targets = []string{"127.0.0.1:1"} // unreachable: a TCP fallback must not be able to rescue this
 	got := p.Probe(context.Background(), []string{addr})
 	assertReachableViaDNS(t, got)
+}
+
+func TestProbeVerifiedTXT(t *testing.T) {
+	addr := udpResponder(t, txtResponse("librescoot-online-v1"))
+	p := testProber(t)
+	p.Targets = nil
+	p.VerificationName = "reachability.example.test"
+	p.VerificationValue = "librescoot-online-v1"
+	got := p.Probe(context.Background(), []string{addr})
+	if !got.Reachable {
+		t.Fatalf("Probe() Reachable = false, want true (detail: %s)", got.Detail)
+	}
+	if !strings.HasPrefix(got.Detail, "verified dns ") {
+		t.Errorf("Probe() Detail = %q, want verified DNS result", got.Detail)
+	}
+}
+
+func TestProbeVerifiedTXTRejectsCaptiveResolverForgery(t *testing.T) {
+	// A captive resolver can synthesize a well-formed answer, but it cannot
+	// guess the deployment-controlled TXT token.
+	addr := udpResponder(t, txtResponse("captive-portal"))
+	p := testProber(t)
+	p.Targets = nil
+	p.VerificationName = "reachability.example.test"
+	p.VerificationValue = "librescoot-online-v1"
+	got := p.Probe(context.Background(), []string{addr})
+	if got.Reachable {
+		t.Fatalf("Probe() Reachable = true for forged TXT content (detail: %s)", got.Detail)
+	}
 }
 
 func TestProbeAssignedResolverNXDOMAIN(t *testing.T) {
