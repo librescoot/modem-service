@@ -1,7 +1,9 @@
 package usb
 
 import (
+	"io"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -17,6 +19,16 @@ const (
 	UnbindWaitMS = 2000
 	BindWaitMS   = 2000
 )
+
+type controlFile interface {
+	WriteString(string) (int, error)
+	Sync() error
+	Close() error
+}
+
+var openControlFile = func(path string) (controlFile, error) {
+	return os.OpenFile(path, os.O_WRONLY, 0)
+}
 
 type Recovery struct {
 	device string
@@ -55,20 +67,8 @@ func (r *Recovery) Unbind() error {
 	}
 	r.log("Unbinding USB device %s...", r.device)
 
-	f, err := os.OpenFile(USBUnbindPath, os.O_WRONLY, 0)
-	if err != nil {
-		return errors.Wrap(err, "failed to open unbind path")
-	}
-	if _, err := f.WriteString(r.device); err != nil {
-		f.Close()
-		return errors.Wrap(err, "failed to write to unbind")
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return errors.Wrap(err, "failed to sync unbind")
-	}
-	if err := f.Close(); err != nil {
-		return errors.Wrap(err, "failed to close unbind")
+	if err := writeControl(USBUnbindPath, r.device); err != nil {
+		return errors.Wrap(err, "failed to write unbind control")
 	}
 
 	r.log("USB device unbound, waiting %dms...", UnbindWaitMS)
@@ -80,20 +80,8 @@ func (r *Recovery) Unbind() error {
 func (r *Recovery) Bind() error {
 	r.log("Binding USB device %s...", r.device)
 
-	f, err := os.OpenFile(USBBindPath, os.O_WRONLY, 0)
-	if err != nil {
-		return errors.Wrap(err, "failed to open bind path")
-	}
-	if _, err := f.WriteString(r.device); err != nil {
-		f.Close()
-		return errors.Wrap(err, "failed to write to bind")
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return errors.Wrap(err, "failed to sync bind")
-	}
-	if err := f.Close(); err != nil {
-		return errors.Wrap(err, "failed to close bind")
+	if err := writeControl(USBBindPath, r.device); err != nil {
+		return errors.Wrap(err, "failed to write bind control")
 	}
 
 	r.log("USB device bound, waiting up to %dms for enumeration...", BindWaitMS)
@@ -109,6 +97,29 @@ func (r *Recovery) Bind() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return errors.Errorf("USB device %s did not re-enumerate within %dms", r.device, BindWaitMS)
+}
+
+func writeControl(path, value string) error {
+	f, err := openControlFile(path)
+	if err != nil {
+		return errors.Wrap(err, "open")
+	}
+	if n, err := f.WriteString(value); err != nil {
+		_ = f.Close()
+		return errors.Wrap(err, "write")
+	} else if n != len(value) {
+		_ = f.Close()
+		return io.ErrShortWrite
+	}
+	if err := f.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) &&
+		!errors.Is(err, syscall.ENOTSUP) && !errors.Is(err, syscall.EOPNOTSUPP) {
+		_ = f.Close()
+		return errors.Wrap(err, "sync")
+	}
+	if err := f.Close(); err != nil {
+		return errors.Wrap(err, "close")
+	}
+	return nil
 }
 
 func (r *Recovery) Recover() error {

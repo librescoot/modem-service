@@ -333,11 +333,13 @@ func TestPersistentFlapEventuallyRemediates(t *testing.T) {
 	s.applyRemedyFn = func(r link.Remedy) { applied = append(applied, r) }
 
 	snap := link.Snapshot{
-		ModemPresent: true, PrimaryPortOK: true, PowerState: "on",
+		ModemPresent: true, PrimaryPortKnown: true, PrimaryPortOK: true, PowerState: "on",
 		Registration: "roaming", PacketService: "attached",
-		BearerConnected: true, BearerInterface: "wwan0", BearerIP: "10.64.13.241",
-		Carrier: true, NetdevIP: "10.64.13.241", HasDefaultRoute: true,
-		BearerAttempts: 1, BearerDuration: 1200,
+		BearerKnown: true, BearerConnected: true, BearerConnectedKnown: true,
+		BearerSuspendedKnown: true, BearerInterface: "wwan0", BearerIP: "10.64.13.241",
+		CarrierKnown: true, Carrier: true, NetdevIP: "10.64.13.241",
+		DefaultRouteKnown: true, HasDefaultRoute: true,
+		BearerStatsKnown: true, BearerAttempts: 1, BearerDuration: 1200,
 	}
 	a.Assess(snap)
 

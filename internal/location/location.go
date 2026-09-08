@@ -128,7 +128,6 @@ type Service struct {
 	ResolveModemPath ModemPathResolver
 	MMClient         *mm.Client
 	Config           Config
-	Enabled          bool
 	Logger           *log.Logger
 	GpsdConn         *gpsd.Session
 	GpsdServer       string
@@ -160,12 +159,13 @@ type Service struct {
 	GPSLostTime  time.Time   // Time when GPS fix was lost
 	gpsFreshInit atomic.Bool // True if GPS has just been initialized
 
-	configMutex      sync.Mutex    // Protects GPS configuration to prevent concurrent attempts
-	currentMode      GPSMode       // Current GPS mode; protected by configMutex
-	monitoringActive atomic.Bool   // True if monitoring goroutine is already running
-	stopChan         chan struct{} // Signals monitoring goroutine to stop
+	configMutex sync.Mutex
+	currentMode GPSMode
 
-	closeMu sync.Mutex // Serializes stopChan create/close so Close() can be called concurrently without double-closing
+	lifecycleMu      sync.Mutex
+	monitorCancel    context.CancelFunc
+	monitorDone      chan struct{}
+	monitoringActive atomic.Bool
 
 	rolloverLogged sync.Once // Logs GPS week-rollover correction at most once per session
 }
@@ -216,6 +216,7 @@ func (s *Service) SatsVisible() int32  { return s.satsVisible.Load() }
 func (s *Service) GpsdConnected() bool { return s.gpsdConnected.Load() }
 func (s *Service) State() string       { return s.state.Load().(string) }
 func (s *Service) GPSFreshInit() bool  { return s.gpsFreshInit.Load() }
+func (s *Service) IsEnabled() bool     { return s.monitoringActive.Load() }
 
 func (s *Service) IsConfiguring() bool {
 	if s.configMutex.TryLock() {
@@ -252,36 +253,34 @@ func (s *Service) SetHasValidFix(v bool) {
 }
 
 func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
-	s.ModemPath = modemPath
-	s.Enabled = true
-
-	// Prevent multiple monitoring goroutines from running
-	if s.monitoringActive.Load() {
+	s.lifecycleMu.Lock()
+	if s.monitorCancel != nil {
+		s.lifecycleMu.Unlock()
 		s.Logger.Printf("GPS monitoring already active, skipping duplicate EnableGPS call")
 		return nil
 	}
-
+	s.configMutex.Lock()
+	s.ModemPath = modemPath
+	s.configMutex.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.monitorCancel = cancel
+	s.monitorDone = done
 	s.monitoringActive.Store(true)
-	s.closeMu.Lock()
-	s.stopChan = make(chan struct{})
-	stopChan := s.stopChan
-	s.closeMu.Unlock()
+	s.lifecycleMu.Unlock()
 
 	go func() {
 		defer func() {
 			s.monitoringActive.Store(false)
+			close(done)
 		}()
 
 		attempt := 0
 		for {
-			// Check both Enabled flag and stop channel for shutdown
 			select {
-			case <-stopChan:
+			case <-ctx.Done():
 				return
 			default:
-			}
-			if !s.Enabled {
-				return
 			}
 
 			if s.GpsdConn == nil {
@@ -301,7 +300,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 
 							// Log current chip state so post-hibernation half-configured
 							// cases are visible in the journal.
-							probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+							probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
 							s.probeChipState(probeCtx)
 							probeCancel()
 
@@ -315,7 +314,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 									break
 								}
 								select {
-								case <-stopChan:
+								case <-ctx.Done():
 									return
 								case <-time.After(500 * time.Millisecond):
 								}
@@ -332,7 +331,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 								s.Logger.Printf("GPS already running with valid fix, reusing existing connection")
 								// Probe so currentMode reflects the actual
 								// modem state instead of a zero-value default.
-								s.ProbeGPSMode(context.Background())
+								s.ProbeGPSMode(ctx)
 								s.gpsFreshInit.Store(false)
 								attempt = 0
 								continue
@@ -351,12 +350,12 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 
 					s.Logger.Printf("Configuring GPS (attempt %d)", attempt+1)
 
-					err := s.configureGPS()
+					err := s.configureGPS(ctx)
 					if err != nil {
 						s.Logger.Printf("GPS configuration attempt %d failed: %v", attempt+1, err)
 						s.configMutex.Unlock()
 						select {
-						case <-stopChan:
+						case <-ctx.Done():
 							return
 						case <-time.After(configRetryDelay(attempt)):
 						}
@@ -368,7 +367,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 						s.Logger.Printf("Failed to connect to gpsd: %v", err)
 						s.configMutex.Unlock()
 						select {
-						case <-stopChan:
+						case <-ctx.Done():
 							return
 						case <-time.After(configRetryDelay(attempt)):
 						}
@@ -399,7 +398,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 			}
 
 			select {
-			case <-stopChan:
+			case <-ctx.Done():
 				return
 			case <-time.After(GPSRetryInterval):
 			}
@@ -409,13 +408,12 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 	return nil
 }
 
-func (s *Service) configureGPS() error {
+func (s *Service) configureGPS(parent context.Context) error {
 	if s.MMClient == nil {
 		return fmt.Errorf("MMClient not configured")
 	}
 
-	// Use timeout context for the entire configuration process
-	ctx, cancel := context.WithTimeout(context.Background(), GPSConfigTimeout)
+	ctx, cancel := context.WithTimeout(parent, GPSConfigTimeout)
 	defer cancel()
 
 	return s.configureGPSWithRetries(ctx)
@@ -1095,14 +1093,14 @@ func (s *Service) StopGPSD() error {
 }
 
 func (s *Service) Close() {
-	s.closeMu.Lock()
-	if s.stopChan != nil {
-		close(s.stopChan)
-		s.stopChan = nil
+	s.lifecycleMu.Lock()
+	if s.monitorCancel != nil {
+		s.monitorCancel()
+		<-s.monitorDone
+		s.monitorCancel = nil
+		s.monitorDone = nil
 	}
-	s.closeMu.Unlock()
 
-	s.Enabled = false
 	// Mark disconnected first so concurrent GetGPSStatus() never observes
 	// state="off" while connected=true.
 	s.gpsdConnected.Store(false)
@@ -1129,6 +1127,7 @@ func (s *Service) Close() {
 		s.GpsdConn = nil
 	}
 	s.configMutex.Unlock()
+	s.lifecycleMu.Unlock()
 }
 
 func (s *Service) GetGPSStatus() map[string]interface{} {

@@ -12,6 +12,47 @@ import (
 	"modem-service/internal/modem/connectivity"
 )
 
+func TestPublishModemStateClearsUnavailableIdentityFields(t *testing.T) {
+	current := modem.NewState()
+	last := *current
+	last.IMEI = "old-imei"
+	last.IMSI = "old-imsi"
+	last.ICCID = "old-iccid"
+	last.OperatorName = "old-operator"
+	last.OperatorCode = "00101"
+
+	classifier := connectivity.New()
+	classifier.Force(connectivity.Disconnected)
+	s := &Service{
+		Logger: log.New(io.Discard, "", 0), Health: health.New(),
+		LastState: &last, connClassifier: classifier,
+		lastPubConn: connectivity.Disconnected,
+	}
+	s.modemEnabled.Store(true)
+	published := make(map[string]string)
+	s.publishFn = func(key, value string) error {
+		published["internet."+key] = value
+		return nil
+	}
+	s.publishModemFn = func(key, value string) error {
+		published["modem."+key] = value
+		return nil
+	}
+
+	if err := s.publishModemState(context.Background(), current, current.Status); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"internet.sim-imei", "internet.sim-imsi", "internet.sim-iccid",
+		"modem.operator-name", "modem.operator-code",
+	} {
+		value, ok := published[key]
+		if !ok || value != "" {
+			t.Errorf("%s = %q, present=%v; want an explicit empty value", key, value, ok)
+		}
+	}
+}
+
 func TestPublishModemStateRetriesFailedFields(t *testing.T) {
 	for _, field := range []string{"modem-state", "registration", "error-state", "connectivity"} {
 		t.Run(field, func(t *testing.T) {

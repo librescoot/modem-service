@@ -11,6 +11,23 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+func TestRapidEnableCloseHandoff(t *testing.T) {
+	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
+
+	for i := 0; i < 20; i++ {
+		if err := s.EnableGPS(dbus.ObjectPath("/Modem/1")); err != nil {
+			t.Fatal(err)
+		}
+		if !s.IsEnabled() {
+			t.Fatal("GPS monitor did not start")
+		}
+		s.Close()
+		if s.IsEnabled() {
+			t.Fatal("GPS monitor remained active after Close")
+		}
+	}
+}
+
 func TestCloseClearsFixState(t *testing.T) {
 	logger := log.New(io.Discard, "", 0)
 	s := NewService(logger, "", nil, "")

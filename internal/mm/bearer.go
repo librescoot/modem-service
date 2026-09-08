@@ -8,6 +8,11 @@ import (
 // BearerInterface is the D-Bus interface name for a ModemManager bearer.
 const BearerInterface = "org.freedesktop.ModemManager1.Bearer"
 
+var (
+	ErrNoDataBearer                 = errors.New("no data bearer with an interface")
+	ErrBearerObservationUnavailable = errors.New("bearer interface unavailable")
+)
+
 // IP4Config is the subset of Bearer.Ip4Config we act on. DNS carries the
 // resolvers the network delivered via PCO during bearer activation; there is
 // no DHCP on a mobile bearer, so this is the only in-band source.
@@ -43,12 +48,17 @@ type BearerStats struct {
 
 // BearerInfo is one bearer's state.
 type BearerInfo struct {
-	Path      dbus.ObjectPath
-	Connected bool
-	Suspended bool
-	Interface string
-	IP4       IP4Config
-	Stats     BearerStats
+	Path           dbus.ObjectPath
+	Connected      bool
+	ConnectedKnown bool
+	Suspended      bool
+	SuspendedKnown bool
+	Interface      string
+	InterfaceKnown bool
+	IP4            IP4Config
+	IP4Known       bool
+	Stats          BearerStats
+	StatsKnown     bool
 }
 
 // ListBearers returns the modem's bearer object paths.
@@ -72,22 +82,24 @@ func (c *Client) GetBearerInfo(bearerPath dbus.ObjectPath) (BearerInfo, error) {
 	info := BearerInfo{Path: bearerPath}
 
 	if v, err := c.GetProperty(bearerPath, BearerInterface, "Connected"); err == nil {
-		info.Connected, _ = v.Value().(bool)
+		info.Connected, info.ConnectedKnown = v.Value().(bool)
 	}
 	if v, err := c.GetProperty(bearerPath, BearerInterface, "Suspended"); err == nil {
-		info.Suspended, _ = v.Value().(bool)
+		info.Suspended, info.SuspendedKnown = v.Value().(bool)
 	}
 	if v, err := c.GetProperty(bearerPath, BearerInterface, "Interface"); err == nil {
-		info.Interface, _ = v.Value().(string)
+		info.Interface, info.InterfaceKnown = v.Value().(string)
 	}
 	if v, err := c.GetProperty(bearerPath, BearerInterface, "Ip4Config"); err == nil {
 		if m, ok := v.Value().(map[string]dbus.Variant); ok {
 			info.IP4 = parseIP4Config(m)
+			info.IP4Known = true
 		}
 	}
 	if v, err := c.GetProperty(bearerPath, BearerInterface, "Stats"); err == nil {
 		if m, ok := v.Value().(map[string]dbus.Variant); ok {
 			info.Stats = parseBearerStats(m)
+			info.StatsKnown = true
 		}
 	}
 	return info, nil
@@ -103,16 +115,24 @@ func (c *Client) DataBearer(modemPath dbus.ObjectPath) (BearerInfo, error) {
 		return BearerInfo{}, err
 	}
 	infos := make([]BearerInfo, 0, len(paths))
+	observationComplete := true
 	for _, p := range paths {
 		info, err := c.GetBearerInfo(p)
 		if err != nil {
+			observationComplete = false
 			continue
+		}
+		if !info.InterfaceKnown {
+			observationComplete = false
 		}
 		infos = append(infos, info)
 	}
 	got, ok := selectDataBearer(infos)
 	if !ok {
-		return BearerInfo{}, errors.New("no data bearer with an interface")
+		if !observationComplete {
+			return BearerInfo{}, ErrBearerObservationUnavailable
+		}
+		return BearerInfo{}, ErrNoDataBearer
 	}
 	return got, nil
 }

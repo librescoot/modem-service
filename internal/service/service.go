@@ -142,13 +142,14 @@ type Service struct {
 	lastCellTower       *cell.CellTower
 	lastCellLoc         *cell.CellLocation
 
-	// Modem enable/disable target state. Atomic because it's read from the
-	// monitor goroutine and written from the Redis command/vehicle-state
-	// watcher goroutines.
-	modemEnabled atomic.Bool
+	modemEnabled      atomic.Bool
+	modemStateChange  chan struct{}
+	smsRefreshRequest chan chan struct{}
+	recoveryRunMu     sync.Mutex
+	modemOpCancelMu   sync.Mutex
+	modemOpCancel     context.CancelFunc
+	modemOpGeneration uint64
 
-	// Service-level context, captured in Run() so handlers spawned from
-	// Redis watchers (e.g. disableModem goroutine) can respect shutdown.
 	ctx context.Context
 
 	// Connectivity classifier derives online/searching/offline/no-sim from
@@ -212,6 +213,8 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		WaitingForGPSLogged: false,
 		connClassifier:      connectivity.New(),
 		monitorDone:         make(chan struct{}),
+		modemStateChange:    make(chan struct{}, 1),
+		smsRefreshRequest:   make(chan chan struct{}),
 
 		link: link.New(),
 		prober: health.NewProberWithVerification(
@@ -245,8 +248,6 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 }
 
 func (s *Service) Run(ctx context.Context) error {
-	// Capture the service context so handlers spawned from Redis watchers
-	// (e.g. the disableModem goroutine) can respect shutdown.
 	s.ctx = ctx
 
 	if err := s.Redis.Ping(); err != nil {
@@ -324,21 +325,24 @@ func (s *Service) Run(ctx context.Context) error {
 	})
 	s.Redis.StartSettingsWatching()
 
-	// Try to enable the modem if it's not present
-	if err := s.ensureModemEnabled(ctx); err != nil {
-		s.Logger.Printf("SEVERE ERROR: Failed to ensure modem is enabled: %v", err)
-
-		// If the modem interface is still not present, we cannot continue
-		if !modem.IsInterfacePresent(s.Config.Interface) && !s.Modem.IsModemPresent() {
-			s.Logger.Printf("Cannot continue without modem interface or D-Bus presence")
-			return fmt.Errorf("modem not available: %v", err)
+	// Try to enable the modem if it's not present.
+	if s.modemEnabled.Load() {
+		opCtx, finish := s.startModemOperation(ctx)
+		err := s.ensureModemEnabled(opCtx)
+		finish()
+		if err != nil && s.modemEnabled.Load() {
+			s.Logger.Printf("SEVERE ERROR: Failed to ensure modem is enabled: %v", err)
+			if !modem.IsInterfacePresent(s.Config.Interface) && !s.Modem.IsModemPresent() {
+				s.Logger.Printf("Cannot continue without modem interface or D-Bus presence")
+				return fmt.Errorf("modem not available: %v", err)
+			}
 		}
 	}
 
-	// Hold a power inhibitor while the modem is up so pm-service won't suspend
-	// the MDB until the modem has been told to shut down and confirmed off.
-	if err := s.Redis.AddModemInhibitor(); err != nil {
-		s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
+	if s.modemEnabled.Load() {
+		if err := s.Redis.AddModemInhibitor(); err != nil {
+			s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
+		}
 	}
 
 	// Periodically check that the SGs CS registration at the MSC/VLR is still
@@ -416,7 +420,39 @@ func (s *Service) Run(ctx context.Context) error {
 	return nil
 }
 
-// handleModemCommand handles enable/disable commands from pm-service
+func (s *Service) signalModemStateChange() {
+	select {
+	case s.modemStateChange <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) cancelModemOperation() {
+	s.modemOpCancelMu.Lock()
+	cancel := s.modemOpCancel
+	s.modemOpCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Service) startModemOperation(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	s.modemOpCancelMu.Lock()
+	s.modemOpGeneration++
+	generation := s.modemOpGeneration
+	s.modemOpCancel = cancel
+	s.modemOpCancelMu.Unlock()
+	return ctx, func() {
+		cancel()
+		s.modemOpCancelMu.Lock()
+		if s.modemOpGeneration == generation {
+			s.modemOpCancel = nil
+		}
+		s.modemOpCancelMu.Unlock()
+	}
+}
+
 func (s *Service) handleModemCommand(command string) error {
 	switch command {
 	case "enable":
@@ -426,12 +462,12 @@ func (s *Service) handleModemCommand(command string) error {
 		if err := s.Redis.AddModemInhibitor(); err != nil {
 			s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
 		}
-		// Modem will be enabled by ensureModemEnabled or monitor loop
+		s.signalModemStateChange()
 	case "disable":
 		s.Logger.Printf("Received modem disable command")
 		s.modemEnabled.Store(false)
-		// Disable the modem
-		go s.disableModem(s.ctx)
+		s.cancelModemOperation()
+		s.signalModemStateChange()
 	default:
 		s.Logger.Printf("Unknown modem command: %s", command)
 	}
@@ -447,6 +483,7 @@ func (s *Service) handleVehicleState(state string) error {
 			if err := s.Redis.AddModemInhibitor(); err != nil {
 				s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
 			}
+			s.signalModemStateChange()
 		}
 	}
 	return nil
@@ -913,18 +950,33 @@ func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
 					continue
 				}
 				msisdnWarned = false
-				s.Logger.Printf("sms: no CS activity for %.0f min — sending SGs keepalive", idle.Minutes())
-				if s.refreshSGsViaVoiceCall(ctx) {
-					continue
+				done := make(chan struct{})
+				select {
+				case <-ctx.Done():
+					return
+				case s.smsRefreshRequest <- done:
 				}
-				s.Logger.Printf("sms: voice call keepalive failed, falling back to CFUN=4/1 cycle")
-				if !s.refreshSGsViaCFUN4(ctx) {
-					s.Logger.Printf("sms: CFUN=4/1 refresh failed, falling back to radio cycle")
-					s.refreshSGsViaRadioCycle(ctx)
+				select {
+				case <-ctx.Done():
+					return
+				case <-done:
 				}
 			}
 		}
 	}()
+}
+
+func (s *Service) refreshSMSRegistration(ctx context.Context) {
+	lastActivity := time.Unix(0, s.lastCSActivity.Load())
+	s.Logger.Printf("sms: no CS activity for %.0f min — sending SGs keepalive", time.Since(lastActivity).Minutes())
+	if s.refreshSGsViaVoiceCall(ctx) {
+		return
+	}
+	s.Logger.Printf("sms: voice call keepalive failed, falling back to CFUN=4/1 cycle")
+	if !s.refreshSGsViaCFUN4(ctx) {
+		s.Logger.Printf("sms: CFUN=4/1 refresh failed, falling back to radio cycle")
+		s.refreshSGsViaRadioCycle(ctx)
+	}
 }
 
 // refreshSGsViaCFUN4 refreshes the SGs association using AT+CFUN=4 (fly mode)
@@ -1168,9 +1220,16 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 	s.Logger.Printf("Modem failure detected: %s", reason)
 	s.Redis.RaiseFault(redisClient.FaultCodeModemUnavailable, "Modem unavailable: "+reason)
 
-	if s.Health.IsRecovering() {
+	if !s.recoveryRunMu.TryLock() {
 		return fmt.Errorf("recovery in progress")
 	}
+	defer s.recoveryRunMu.Unlock()
+	if !s.modemEnabled.Load() {
+		return fmt.Errorf("modem disabled")
+	}
+
+	recoveryCtx, finish := s.startModemOperation(ctx)
+	defer finish()
 
 	// Exhausted retries: publish terminal Wait state, back off 2 minutes,
 	// then reset and allow recovery to try again on the next failure.
@@ -1183,8 +1242,8 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 			fmt.Sprintf("Max recovery attempts (%d) exhausted, entering recovery-failed-wait", health.MaxRecoveryAttempts))
 		s.Logger.Printf("Max recovery attempts reached, entering %s state", s.Health.State)
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-recoveryCtx.Done():
+			return recoveryCtx.Err()
 		case <-time.After(2 * time.Minute):
 		}
 		s.Health.MarkNormal() // clears both state and RecoveryAttempts
@@ -1193,11 +1252,16 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 		return nil
 	}
 
-	return s.attemptRecovery(ctx)
+	return s.attemptRecovery(recoveryCtx)
 }
 
 func (s *Service) attemptRecovery(ctx context.Context) error {
 	s.Health.StartRecovery()
+	defer func() {
+		if s.Health.FinishRecoveryAttempt() {
+			s.publishHealthState(ctx)
+		}
+	}()
 
 	s.Logger.Printf("Attempting modem recovery (attempt %d/%d)",
 		s.Health.RecoveryAttempts, health.MaxRecoveryAttempts)
@@ -1456,11 +1520,6 @@ func (s *Service) withGPSLifecycleLock(fn func()) {
 	fn()
 }
 
-// requestGPSModeForConnectivity kicks off a GPS mode change to match the new
-// connectivity state. Runs asynchronously because the AT stop/start dance
-// takes several seconds; we don't want to stall the modem state loop. The
-// location service serializes mode changes internally via configMutex.
-//
 // UE-Based mode is disabled for now. In the field (2026-04-15) we observed a
 // fleet scooter on Telefónica DE hang for 180 s in UE-Based after a switch,
 // with no NMEA timestamp updates, until the stuck-timestamp recovery path
@@ -1502,13 +1561,11 @@ func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connec
 	prev := s.Location.CurrentGPSMode()
 	s.Logger.Printf("gps-transition request from=%s to=%s connectivity=%s", prev, desired, conn)
 
-	go func() {
-		if err := s.Location.SetGPSMode(ctx, desired); err != nil {
-			s.Logger.Printf("Failed to switch GPS to %s mode: %v", desired, err)
-			return
-		}
-		s.publishGPSMode()
-	}()
+	if err := s.Location.SetGPSMode(ctx, desired); err != nil {
+		s.Logger.Printf("Failed to switch GPS to %s mode: %v", desired, err)
+		return
+	}
+	s.publishGPSMode()
 }
 
 // publishGPSMode updates the gps.mode Redis field if the current mode has
@@ -2282,14 +2339,47 @@ func (s *Service) monitorStatus(ctx context.Context) {
 		s.Logger.Printf("Failed to watch ModemManager events: %v", err)
 	}
 
-	if err := s.checkAndPublishModemStatus(ctx); err != nil {
-		s.Logger.Printf("Initial modem status check failed: %v", err)
+	appliedModemEnabled := s.modemEnabled.Load()
+	if appliedModemEnabled {
+		if err := s.checkAndPublishModemStatus(ctx); err != nil {
+			s.Logger.Printf("Initial modem status check failed: %v", err)
+		}
+	} else {
+		s.disableModem(ctx)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case done := <-s.smsRefreshRequest:
+			if s.modemEnabled.Load() {
+				refreshCtx, finish := s.startModemOperation(ctx)
+				s.refreshSMSRegistration(refreshCtx)
+				finish()
+			}
+			close(done)
+		case <-s.modemStateChange:
+			targetEnabled := s.modemEnabled.Load()
+			if targetEnabled == appliedModemEnabled {
+				continue
+			}
+			if !targetEnabled {
+				appliedModemEnabled = false
+				s.disableModem(ctx)
+				continue
+			}
+			opCtx, finish := s.startModemOperation(ctx)
+			err := s.ensureModemEnabled(opCtx)
+			finish()
+			if err != nil {
+				s.Logger.Printf("Failed to enable modem: %v", err)
+				continue
+			}
+			appliedModemEnabled = true
+			if err := s.checkAndPublishModemStatus(ctx); err != nil {
+				s.Logger.Printf("Post-enable modem status check failed: %v", err)
+			}
 		case event := <-modemEvents:
 			if !s.modemEnabled.Load() {
 				continue
@@ -2344,7 +2434,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					continue
 				}
 
-				if !s.Location.Enabled {
+				if !s.Location.IsEnabled() {
 					if err := s.Location.EnableGPS(modemPath); err != nil {
 						s.Logger.Printf("Failed to enable GPS: %v", err)
 						continue

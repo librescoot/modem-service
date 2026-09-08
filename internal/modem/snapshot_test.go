@@ -10,7 +10,8 @@ import (
 
 func TestBearerUsagePrefersAcrossReconnectTotals(t *testing.T) {
 	info := mm.BearerInfo{
-		Path: "/org/freedesktop/ModemManager1/Bearer/1",
+		Path:       "/org/freedesktop/ModemManager1/Bearer/1",
+		StatsKnown: true,
 		Stats: mm.BearerStats{
 			RxBytes: 13434742, TxBytes: 3903371,
 			TotalRxBytes: 74062451, TotalTxBytes: 7986025, HaveTotals: true,
@@ -28,10 +29,18 @@ func TestBearerUsagePrefersAcrossReconnectTotals(t *testing.T) {
 	}
 }
 
+func TestBearerUsageRequiresObservedStats(t *testing.T) {
+	got := bearerUsage(mm.BearerInfo{Path: "/bearer/1"})
+	if got.Valid {
+		t.Fatalf("bearerUsage() = %+v, want invalid", got)
+	}
+}
+
 func TestBearerUsageFallsBackToPerAttemptCounters(t *testing.T) {
 	info := mm.BearerInfo{
-		Path:  "/org/freedesktop/ModemManager1/Bearer/1",
-		Stats: mm.BearerStats{RxBytes: 100, TxBytes: 200},
+		Path:       "/org/freedesktop/ModemManager1/Bearer/1",
+		StatsKnown: true,
+		Stats:      mm.BearerStats{RxBytes: 100, TxBytes: 200},
 	}
 	got := bearerUsage(info)
 	if got.RxBytes != 100 || got.TxBytes != 200 || !got.Valid {

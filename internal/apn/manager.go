@@ -68,6 +68,10 @@ func (c Config) IsEmpty() bool {
 }
 
 // Equal compares two configs treating empty Auth as "none".
+func (c Config) EqualNM(o Config) bool {
+	return c.APN == o.APN && c.Username == o.Username && c.Password == o.Password
+}
+
 func (c Config) Equal(o Config) bool {
 	a := c.Auth
 	if a == "" {
@@ -82,9 +86,9 @@ func (c Config) Equal(o Config) bool {
 
 // Input is the per-cycle snapshot passed to Reconcile.
 type Input struct {
-	ICCID     string          // current SIM ICCID; empty if no SIM
-	ModemPath dbus.ObjectPath // for MM SetInitialEpsBearerSettings; "" skips MM side
-	Desired   Config          // from cellular.* settings (empty fields == cleared)
+	ICCID     string
+	ModemPath dbus.ObjectPath
+	Desired   Config
 }
 
 // MMDBus is the narrow ModemManager surface the manager needs.
@@ -115,6 +119,8 @@ type Manager struct {
 
 	mu               sync.Mutex
 	lastAppliedICCID string
+	blockedICCID     string
+	blockedConfig    Config
 }
 
 // New returns a manager bound to the given backends. connection is the NM
@@ -154,8 +160,17 @@ func (m *Manager) Reconcile(in Input) Outcome {
 			m.logger.Printf("apn: clear after ICCID change failed: %v", err)
 			return OutcomeError
 		}
-		m.lastAppliedICCID = ""
+		m.lastAppliedICCID = in.ICCID
+		m.blockedICCID = in.ICCID
+		m.blockedConfig = in.Desired
 		return OutcomeICCIDChangedClear
+	}
+
+	if m.blockedICCID == in.ICCID {
+		if m.blockedConfig.Equal(in.Desired) {
+			return OutcomeUnconfigured
+		}
+		m.blockedICCID = ""
 	}
 
 	if in.Desired.IsEmpty() {
@@ -184,13 +199,13 @@ func (m *Manager) Reconcile(in Input) Outcome {
 		m.logger.Printf("apn: read current failed: %v", err)
 		return OutcomeError
 	}
-	if nmCur.Equal(in.Desired) && mmCur.Equal(in.Desired) && m.lastAppliedICCID == in.ICCID {
+	if nmCur.EqualNM(in.Desired) && mmCur.Equal(in.Desired) && m.lastAppliedICCID == in.ICCID {
 		return OutcomeOK
 	}
 
 	m.logger.Printf("apn: applying apn=%q user=%q auth=%q (nm-change=%v mm-change=%v)",
 		in.Desired.APN, in.Desired.Username, in.Desired.Auth,
-		!nmCur.Equal(in.Desired), !mmCur.Equal(in.Desired))
+		!nmCur.EqualNM(in.Desired), !mmCur.Equal(in.Desired))
 
 	if err := m.applyBoth(in.ModemPath, in.Desired); err != nil {
 		m.logger.Printf("apn: apply failed: %v", err)

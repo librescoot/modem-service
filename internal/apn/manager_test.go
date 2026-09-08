@@ -151,6 +151,7 @@ func TestReconcileIdempotent(t *testing.T) {
 		t.Fatalf("first apply: got %s", got)
 	}
 	nmFake.lastSet = nil
+	nmFake.current.Auth = ""
 	if got := m.Reconcile(Input{ICCID: "ICCID-A", ModemPath: testPath, Desired: desired}); got != OutcomeOK {
 		t.Fatalf("second apply: got %s want %s", got, OutcomeOK)
 	}
@@ -181,23 +182,26 @@ func TestReconcileICCIDChangeClears(t *testing.T) {
 
 func TestReconcileAfterICCIDClearAwaitsUserAction(t *testing.T) {
 	m, _, nmFake := newTestManager()
-	// Apply for SIM A.
-	if got := m.Reconcile(Input{ICCID: "ICCID-A", ModemPath: testPath, Desired: Config{APN: "a"}}); got != OutcomeApplied {
+	input := Input{ICCID: "ICCID-A", ModemPath: testPath, Desired: Config{APN: "a"}}
+	if got := m.Reconcile(input); got != OutcomeApplied {
 		t.Fatalf("apply A: got %s", got)
 	}
-	// SIM swap; clears.
-	if got := m.Reconcile(Input{ICCID: "ICCID-B", ModemPath: testPath, Desired: Config{APN: "a"}}); got != OutcomeICCIDChangedClear {
+	input.ICCID = "ICCID-B"
+	if got := m.Reconcile(input); got != OutcomeICCIDChangedClear {
 		t.Fatalf("swap: got %s", got)
 	}
-	// Subsequent tick with the same (stale) settings should re-apply for
-	// the new SIM, because clear path resets lastAppliedICCID. That's the
-	// pragmatic choice: settings reflect the user's intent and we honor
-	// it; if they don't want this APN on the new SIM, they have to
-	// change settings.
+
 	nmFake.lastSet = nil
-	got := m.Reconcile(Input{ICCID: "ICCID-B", ModemPath: testPath, Desired: Config{APN: "a"}})
-	if got != OutcomeApplied {
-		t.Fatalf("after-clear apply: got %s want %s", got, OutcomeApplied)
+	if got := m.Reconcile(input); got != OutcomeUnconfigured {
+		t.Fatalf("unchanged settings: got %s want %s", got, OutcomeUnconfigured)
+	}
+	if nmFake.lastSet != nil {
+		t.Fatalf("stale settings reapplied: %+v", nmFake.lastSet)
+	}
+
+	input.Desired.APN = "b"
+	if got := m.Reconcile(input); got != OutcomeApplied {
+		t.Fatalf("re-armed settings: got %s want %s", got, OutcomeApplied)
 	}
 }
 

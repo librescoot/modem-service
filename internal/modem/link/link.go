@@ -95,9 +95,10 @@ var livenessLadder = []Remedy{RemedyBearerBounce, RemedyReattach}
 // "not read": Assess treats unknown as passing, so a flaky D-Bus read can never
 // manufacture a remedy.
 type Snapshot struct {
-	ModemPresent  bool
-	PrimaryPortOK bool
-	PowerState    string
+	ModemPresent     bool
+	PrimaryPortKnown bool
+	PrimaryPortOK    bool
+	PowerState       string
 
 	SIMLock string // "" when unlocked; sim-pin2 does not count as locked
 
@@ -105,21 +106,27 @@ type Snapshot struct {
 
 	PacketService string // attached / detached / ""
 
-	BearerConnected bool
-	BearerSuspended bool
-	BearerInterface string
-	BearerIP        string
-	BearerAttempts  uint32
-	BearerDuration  uint64
+	BearerKnown          bool
+	BearerConnected      bool
+	BearerConnectedKnown bool
+	BearerSuspended      bool
+	BearerSuspendedKnown bool
+	BearerInterface      string
+	BearerIP             string
+	BearerStatsKnown     bool
+	BearerAttempts       uint32
+	BearerDuration       uint64
 
 	// AT cross-check, populated only when the previous Assess asked for it.
 	ATChecked   bool
 	CGACTActive bool
 	CGPADDR     string
 
-	Carrier         bool
-	NetdevIP        string
-	HasDefaultRoute bool
+	CarrierKnown      bool
+	Carrier           bool
+	NetdevIP          string
+	DefaultRouteKnown bool
+	HasDefaultRoute   bool
 
 	// Byte counters are deliberately absent. Layer 7 used to compare tx
 	// against rx, which cannot distinguish a wedged link from a network that
@@ -161,7 +168,7 @@ func (a *Assessor) Assess(cur Snapshot) Assessment {
 	if havePrev {
 		if sessionFlapped(prev, cur) {
 			a.flaps++
-		} else if cur.BearerDuration >= stableSessionSeconds {
+		} else if cur.BearerStatsKnown && cur.BearerDuration >= stableSessionSeconds {
 			// The session has been up long enough to count as stable, so past
 			// flaps are history and the ladder starts over. This must be
 			// evaluated before the threshold below, or a recovered session
@@ -217,7 +224,7 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 	if !s.ModemPresent {
 		return fail(LayerHardware, RemedyModemReset, "modem not present on D-Bus")
 	}
-	if !s.PrimaryPortOK {
+	if s.PrimaryPortKnown && !s.PrimaryPortOK {
 		return fail(LayerHardware, RemedyModemReset, "primary port unavailable")
 	}
 	if s.PowerState != "" && s.PowerState != "on" {
@@ -238,13 +245,13 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 		return fail(LayerPacketService, RemedyReattach, "packet service detached")
 	}
 
-	if !s.BearerConnected {
+	if s.BearerKnown && s.BearerConnectedKnown && !s.BearerConnected {
 		return fail(LayerBearer, RemedyBearerBounce, "bearer not connected")
 	}
-	if s.BearerSuspended {
+	if s.BearerKnown && s.BearerSuspendedKnown && s.BearerSuspended {
 		return fail(LayerBearer, RemedyBearerBounce, "bearer suspended")
 	}
-	if s.BearerIP == "" {
+	if s.BearerKnown && s.BearerConnected && s.BearerIP == "" {
 		return fail(LayerBearer, RemedyBearerBounce, "bearer has no address")
 	}
 	if s.ATChecked {
@@ -258,10 +265,10 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 		}
 	}
 
-	if !s.Carrier {
+	if s.CarrierKnown && !s.Carrier {
 		return fail(LayerNetdev, RemedyBearerBounce, "no carrier on %s", s.BearerInterface)
 	}
-	if !s.HasDefaultRoute {
+	if s.DefaultRouteKnown && !s.HasDefaultRoute {
 		return fail(LayerNetdev, RemedyBearerBounce, "no default route via %s", s.BearerInterface)
 	}
 	if s.NetdevIP != "" && s.NetdevIP != s.BearerIP {
@@ -286,6 +293,9 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 // duration with it, so a rising attempts count paired with a short duration
 // means the session did not survive.
 func sessionFlapped(prev, cur Snapshot) bool {
+	if !prev.BearerStatsKnown || !cur.BearerStatsKnown {
+		return false
+	}
 	if cur.BearerAttempts <= prev.BearerAttempts {
 		return false // no reconnect happened in this window
 	}
@@ -298,7 +308,7 @@ func sessionFlapped(prev, cur Snapshot) bool {
 // next tick. The AT ports are shared with GPS and ModemManager serialises
 // access, so the cross-check is not run in steady state.
 func suspicious(s Snapshot) bool {
-	if !s.BearerConnected || s.BearerSuspended {
+	if s.BearerKnown && ((s.BearerConnectedKnown && !s.BearerConnected) || (s.BearerSuspendedKnown && s.BearerSuspended)) {
 		return true
 	}
 	if s.PacketService == "detached" {

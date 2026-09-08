@@ -48,7 +48,7 @@ type BearerUsage struct {
 // whatever moved after the last poll of the old session. Older ModemManager
 // omits the totals, hence the fallback.
 func bearerUsage(b mm.BearerInfo) BearerUsage {
-	u := BearerUsage{Valid: true, Path: string(b.Path)}
+	u := BearerUsage{Valid: b.StatsKnown, Path: string(b.Path)}
 	if b.Stats.HaveTotals {
 		u.RxBytes, u.TxBytes = b.Stats.TotalRxBytes, b.Stats.TotalTxBytes
 		return u
@@ -79,9 +79,16 @@ func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) (link.Sn
 		return snap, usage
 	}
 	snap.ModemPresent = true
-	snap.PrimaryPortOK = m.CheckPrimaryPort() == nil
-	if err := m.CheckPowerState(); err == nil {
-		snap.PowerState = PowerStateOn
+	if v, err := m.client.GetProperty(modemPath, mm.ModemInterface, "PrimaryPort"); err == nil {
+		if port, ok := v.Value().(string); ok {
+			snap.PrimaryPortKnown = true
+			snap.PrimaryPortOK = port == "cdc-wdm0"
+		}
+	}
+	if v, err := m.client.GetProperty(modemPath, mm.ModemInterface, "PowerState"); err == nil {
+		if power, ok := v.Value().(uint32); ok {
+			snap.PowerState = mm.PowerStateToString(int32(power))
+		}
 	}
 
 	if state != nil {
@@ -98,21 +105,28 @@ func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) (link.Sn
 	}
 
 	if bearer, err := m.client.DataBearer(modemPath); err == nil {
+		snap.BearerKnown = true
 		snap.BearerConnected = bearer.Connected
+		snap.BearerConnectedKnown = bearer.ConnectedKnown
 		snap.BearerSuspended = bearer.Suspended
+		snap.BearerSuspendedKnown = bearer.SuspendedKnown
 		snap.BearerInterface = bearer.Interface
 		snap.BearerIP = normalizeAddr(bearer.IP4.Address)
+		snap.BearerStatsKnown = bearer.StatsKnown
 		snap.BearerAttempts = bearer.Stats.Attempts
 		snap.BearerDuration = bearer.Stats.Duration
 		usage = bearerUsage(bearer)
+	} else if err == mm.ErrNoDataBearer {
+		snap.BearerKnown = true
+		snap.BearerConnectedKnown = true
 	}
 
 	if withAT {
 		m.readATCrossCheck(modemPath, &snap)
 	}
 
-	snap.Carrier = readCarrier(sysfsNetRoot, iface)
-	snap.HasDefaultRoute = hasDefaultRoute(iface)
+	snap.Carrier, snap.CarrierKnown = readCarrierObservation(sysfsNetRoot, iface)
+	snap.HasDefaultRoute, snap.DefaultRouteKnown = defaultRouteObservation(iface)
 
 	return snap, usage
 }
@@ -212,20 +226,29 @@ func normalizeAddr(s string) string {
 // readCarrier reads the link state. operstate is useless on this hardware: the
 // modem netdev is POINTOPOINT/NOARP and reports "unknown" even when fully up.
 func readCarrier(root, iface string) bool {
-	data, err := os.ReadFile(filepath.Join(root, iface, "carrier"))
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(data)) == "1"
+	carrier, _ := readCarrierObservation(root, iface)
+	return carrier
 }
 
-// hasDefaultRoute reports whether a default route exists via the interface.
+func readCarrierObservation(root, iface string) (bool, bool) {
+	data, err := os.ReadFile(filepath.Join(root, iface, "carrier"))
+	if err != nil {
+		return false, false
+	}
+	return strings.TrimSpace(string(data)) == "1", true
+}
+
 func hasDefaultRoute(iface string) bool {
+	hasRoute, _ := defaultRouteObservation(iface)
+	return hasRoute
+}
+
+func defaultRouteObservation(iface string) (bool, bool) {
 	data, err := os.ReadFile(procNetRoute)
 	if err != nil {
-		return false
+		return false, false
 	}
-	return parseDefaultRoute(data, iface)
+	return parseDefaultRoute(data, iface), true
 }
 
 // parseDefaultRoute scans /proc/net/route content. Destination 00000000 marks

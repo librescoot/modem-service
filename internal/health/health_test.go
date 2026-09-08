@@ -30,6 +30,24 @@ func TestMarkNormalResetsRecoveryAttempts(t *testing.T) {
 	}
 }
 
+func TestFinishRecoveryAttemptPreservesRetryCount(t *testing.T) {
+	h := New()
+	h.StartRecovery()
+
+	if !h.FinishRecoveryAttempt() {
+		t.Fatal("FinishRecoveryAttempt did not finish active recovery")
+	}
+	if h.State != StateNormal {
+		t.Fatalf("state = %q, want %q", h.State, StateNormal)
+	}
+	if h.RecoveryAttempts != 1 {
+		t.Fatalf("attempts = %d, want 1", h.RecoveryAttempts)
+	}
+	if h.FinishRecoveryAttempt() {
+		t.Fatal("FinishRecoveryAttempt finished an inactive recovery")
+	}
+}
+
 func TestCanRecoverBoundary(t *testing.T) {
 	h := New()
 	for range MaxRecoveryAttempts - 1 {

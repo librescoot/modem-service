@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -15,6 +16,30 @@ import (
 	"modem-service/internal/location"
 	"modem-service/internal/modem"
 )
+
+func TestDisableCommandCancelsModemOperation(t *testing.T) {
+	s := &Service{
+		Logger:           log.New(io.Discard, "", 0),
+		modemStateChange: make(chan struct{}, 1),
+	}
+	s.modemEnabled.Store(true)
+	opCtx, finish := s.startModemOperation(context.Background())
+	defer finish()
+
+	if err := s.handleModemCommand("disable"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-opCtx.Done():
+	default:
+		t.Fatal("active modem operation was not cancelled")
+	}
+	select {
+	case <-s.modemStateChange:
+	default:
+		t.Fatal("monitor was not notified")
+	}
+}
 
 func TestSMSPresenceTransitions(t *testing.T) {
 	steps := []struct {
@@ -220,7 +245,7 @@ func TestGPSTimerRespectRecoveryFlag(t *testing.T) {
 	service.gpsRecoveryMutex.Unlock()
 
 	// GPS is not enabled, but recovery is in progress
-	gpsEnabled := service.Location.Enabled
+	gpsEnabled := service.Location.IsEnabled()
 	shouldEnableGPS := !gpsEnabled && !recoveryInProgress
 
 	if shouldEnableGPS {

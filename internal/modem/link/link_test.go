@@ -6,21 +6,28 @@ import "testing"
 // reports. Tests override single fields to isolate one layer at a time.
 func healthy() Snapshot {
 	return Snapshot{
-		ModemPresent:    true,
-		PrimaryPortOK:   true,
-		PowerState:      "on",
-		SIMLock:         "",
-		Registration:    "home",
-		PacketService:   "attached",
-		BearerConnected: true,
-		BearerSuspended: false,
-		BearerInterface: "wwan0",
-		BearerIP:        "10.64.13.241",
-		BearerAttempts:  1,
-		BearerDuration:  46290,
-		Carrier:         true,
-		NetdevIP:        "10.64.13.241",
-		HasDefaultRoute: true,
+		ModemPresent:         true,
+		PrimaryPortKnown:     true,
+		PrimaryPortOK:        true,
+		PowerState:           "on",
+		SIMLock:              "",
+		Registration:         "home",
+		PacketService:        "attached",
+		BearerKnown:          true,
+		BearerConnected:      true,
+		BearerConnectedKnown: true,
+		BearerSuspended:      false,
+		BearerSuspendedKnown: true,
+		BearerInterface:      "wwan0",
+		BearerIP:             "10.64.13.241",
+		BearerStatsKnown:     true,
+		BearerAttempts:       1,
+		BearerDuration:       46290,
+		CarrierKnown:         true,
+		Carrier:              true,
+		NetdevIP:             "10.64.13.241",
+		DefaultRouteKnown:    true,
+		HasDefaultRoute:      true,
 	}
 }
 
@@ -109,6 +116,11 @@ func TestUnknownFieldsDoNotFail(t *testing.T) {
 	s.PacketService = ""
 	s.Registration = ""
 	s.PowerState = ""
+	s.PrimaryPortKnown = false
+	s.BearerConnectedKnown = false
+	s.BearerSuspendedKnown = false
+	s.CarrierKnown = false
+	s.DefaultRouteKnown = false
 	if got := New().Assess(s); !got.Healthy {
 		t.Errorf("Assess(unknowns) = %+v, want Healthy", got)
 	}
@@ -250,6 +262,8 @@ func TestSessionFlapped(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.prev.BearerStatsKnown = true
+			tc.cur.BearerStatsKnown = true
 			if got := sessionFlapped(tc.prev, tc.cur); got != tc.want {
 				t.Errorf("sessionFlapped() = %v, want %v", got, tc.want)
 			}
