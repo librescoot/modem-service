@@ -131,7 +131,8 @@ type Service struct {
 	publishUsageFn func(map[string]interface{}) error
 	now            func() time.Time
 
-	lastClockSync time.Time // Last time syncClockFromGPS successfully fed chrony
+	lastClockSync  time.Time // Last time syncClockFromGPS successfully fed chrony
+	gpsFaultActive atomic.Bool
 
 	// Settings (from Redis) — atomic so the Redis watcher goroutine can
 	// update them without racing the monitor goroutine that reads them.
@@ -248,6 +249,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.Redis.Ping(); err != nil {
 		return fmt.Errorf("redis connection failed: %v", err)
 	}
+	s.Redis.ClearFault(redisClient.FaultCodeGPSUnavailable)
 
 	// Start listening for modem enable/disable commands from pm-service
 	if err := s.Redis.StartModemCommandHandler(s.handleModemCommand); err != nil {
@@ -1042,12 +1044,21 @@ func (s *Service) refreshSGsViaRadioCycle(ctx context.Context) {
 
 func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	if s.Modem.IsModemPresent() {
-		s.Logger.Printf("Modem is already present via D-Bus")
-		return nil
+		if err := s.Modem.CheckReadyState(); err == nil {
+			s.Logger.Printf("Modem is already present and ready via D-Bus")
+			return nil
+		} else {
+			s.Logger.Printf("Modem is present via D-Bus but not ready: %v", err)
+		}
 	}
 
-	if modem.IsInterfacePresent(s.Config.Interface) {
-		s.Logger.Printf("Modem interface %s is present, waiting for ModemManager...", s.Config.Interface)
+	interfacePresent := modem.IsInterfacePresent(s.Config.Interface)
+	if interfacePresent || s.Modem.IsModemPresent() {
+		if interfacePresent {
+			s.Logger.Printf("Modem interface %s is present, waiting for ModemManager...", s.Config.Interface)
+		} else {
+			s.Logger.Printf("Modem is present on D-Bus without interface %s, waiting until ready...", s.Config.Interface)
+		}
 		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		if err := s.Modem.WaitForModem(waitCtx, s.Config.Interface); err == nil {
@@ -1100,32 +1111,33 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 	return fmt.Errorf("modem failed to come up after multiple attempts, marked as potentially defective")
 }
 
-// probeHealth checks whether the modem is currently healthy on D-Bus without
-// triggering any recovery machinery. Used inside attemptRecovery to verify a
-// strategy succeeded; going through checkHealth there would re-enter
-// handleModemFailure and collapse the escalation sequence.
-func (s *Service) probeHealth() bool {
+func (s *Service) probeHealthError() error {
 	if _, err := s.Modem.FindModem(); err != nil {
-		return false
+		return fmt.Errorf("modem not found: %w", err)
 	}
 	if err := s.Modem.CheckPrimaryPort(); err != nil {
-		return false
+		return fmt.Errorf("primary port: %w", err)
 	}
 	if err := s.Modem.CheckPowerState(); err != nil {
-		return false
+		return fmt.Errorf("power state: %w", err)
 	}
-	return true
+	if err := s.Modem.CheckReadyState(); err != nil {
+		return fmt.Errorf("modem state: %w", err)
+	}
+	return nil
 }
 
-// recoverySucceeded is the shared post-strategy bookkeeping: mark healthy,
-// reset GPS, clear the fault. Called whenever probeHealth returns true after
-// a recovery strategy.
+func (s *Service) probeHealth() bool {
+	return s.probeHealthError() == nil
+}
+
 func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
 	s.Logger.Printf("Modem recovery successful via %s", strategy)
 	s.Health.MarkNormal()
 	s.GPSRecoveryCount = 0
 	s.resetGPSAfterModemRecovery()
 	s.publishHealthState(ctx)
+	s.Redis.ClearFault(redisClient.FaultCodeModemUnavailable)
 	s.Redis.ClearFault(redisClient.FaultCodeModemRecoveryFailed)
 
 	// The modem's D-Bus path can change across a reset; re-arm the inbound-SMS
@@ -1139,17 +1151,19 @@ func (s *Service) checkHealth(ctx context.Context) error {
 		return fmt.Errorf("modem in terminal state: %s", s.Health.State)
 	}
 
-	if !s.probeHealth() {
-		return s.handleModemFailure(ctx, "probe_failed")
+	if err := s.probeHealthError(); err != nil {
+		return s.handleModemFailure(ctx, fmt.Sprintf("probe_failed: %v", err))
 	}
 
 	s.Health.MarkNormal()
+	s.Redis.ClearFault(redisClient.FaultCodeModemUnavailable)
 	s.Redis.ClearFault(redisClient.FaultCodeModemRecoveryFailed)
 	return nil
 }
 
 func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 	s.Logger.Printf("Modem failure detected: %s", reason)
+	s.Redis.RaiseFault(redisClient.FaultCodeModemUnavailable, "Modem unavailable: "+reason)
 
 	if s.Health.IsRecovering() {
 		return fmt.Errorf("recovery in progress")
@@ -1187,7 +1201,29 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 
 	s.publishHealthState(ctx)
 
-	// Strategy 1: Try software reset first if modem is present
+	// Avoid restarting an external reset already in progress.
+	stabilizationWaited := false
+	_, findErr := s.Modem.FindModem()
+	waitReason := findErr
+	if findErr == nil {
+		waitReason = s.Modem.CheckReadyState()
+	}
+	if waitReason != nil {
+		stabilizationWaited = true
+		s.Logger.Printf("Modem is unavailable (%v); waiting up to %v for it to stabilize", waitReason, health.RecoveryWaitTime)
+		waitCtx, waitCancel := context.WithTimeout(ctx, health.RecoveryWaitTime)
+		waitErr := s.Modem.WaitForModem(waitCtx, s.Config.Interface)
+		waitCancel()
+		if waitErr == nil && s.probeHealth() {
+			s.recoverySucceeded(ctx, "MM stabilization wait")
+			return nil
+		}
+		if waitErr != nil {
+			s.Logger.Printf("Modem did not stabilize on its own: %v", waitErr)
+		}
+	}
+
+	// Strategy 1: D-Bus reset.
 	_, err := s.Modem.FindModem()
 	if err == nil {
 		s.Logger.Printf("Attempting to reset the modem via D-Bus")
@@ -1214,9 +1250,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 	// Strategy 2: Try USB unbind/bind recovery
 	s.Logger.Printf("Attempting USB recovery (unbind/bind)...")
 	if err := s.Modem.RecoverUSB(); err != nil {
-		if errors.Is(err, usb.ErrDeviceNotPresent) {
-			// Modem is transiently off the bus (typical mid-reset). Wait
-			// briefly for it to reappear; if it does, skip USB recovery.
+		if errors.Is(err, usb.ErrDeviceNotPresent) && !stabilizationWaited {
 			s.Logger.Printf("USB device not present, waiting up to %v for modem to reappear on D-Bus", health.RecoveryWaitTime)
 			waitCtx, waitCancel := context.WithTimeout(ctx, health.RecoveryWaitTime)
 			err := s.Modem.WaitForModem(waitCtx, s.Config.Interface)
@@ -1225,7 +1259,7 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 				s.recoverySucceeded(ctx, "MM rebind wait")
 				return nil
 			}
-		} else {
+		} else if !errors.Is(err, usb.ErrDeviceNotPresent) {
 			s.Logger.Printf("USB recovery failed: %v", err)
 		}
 	} else {
@@ -1283,14 +1317,29 @@ func (s *Service) publishHealthState(ctx context.Context) error {
 	return s.Redis.PublishInternetState("modem-health", s.Health.State)
 }
 
-// handleGPSFailure attempts GPS-specific recovery before escalating to modem recovery
-func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
-	s.Logger.Printf("Attempting GPS-specific recovery for: %v", gpsErr)
+func (s *Service) clearGPSFault() {
+	if !s.gpsFaultActive.CompareAndSwap(true, false) {
+		return
+	}
+	if err := s.Redis.ClearFault(redisClient.FaultCodeGPSUnavailable); err != nil {
+		s.gpsFaultActive.Store(true)
+	}
+}
 
-	// Try to restart GPS configuration without restarting the entire modem
+func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
+	// GPS silence can be the first sign of a whole-modem reset.
+	if modemErr := s.probeHealthError(); modemErr != nil {
+		s.Logger.Printf("GPS recovery deferred because modem is unavailable: %v", modemErr)
+		return s.handleModemFailure(ctx, fmt.Sprintf("modem_unavailable_during_gps_failure: %v; gps: %v", modemErr, gpsErr))
+	}
+
+	s.Logger.Printf("Attempting GPS-specific recovery for: %v", gpsErr)
+	if err := s.Redis.RaiseFault(redisClient.FaultCodeGPSUnavailable, "GPS unavailable: "+gpsErr.Error()); err == nil {
+		s.gpsFaultActive.Store(true)
+	}
+
 	if err := s.attemptGPSRecovery(gpsErr); err != nil {
 		s.Logger.Printf("GPS-specific recovery failed: %v", err)
-		// Only escalate to modem recovery for severe GPS issues after GPS recovery fails
 		if recoveryErr := s.handleModemFailure(ctx, fmt.Sprintf("gps_stuck_after_gps_recovery: %v", gpsErr)); recoveryErr != nil {
 			return fmt.Errorf("both GPS and modem recovery failed: %v", recoveryErr)
 		}
@@ -1299,13 +1348,6 @@ func (s *Service) handleGPSFailure(ctx context.Context, gpsErr error) error {
 	return nil
 }
 
-// attemptGPSRecovery tries to recover GPS without restarting the modem.
-// trigger is the underlying failure that caused recovery to be requested
-// (e.g. gps_data_stale, gps_timestamp_stuck, gps_fix_timeout). Logged so
-// we can correlate unexpected GPS restarts with the triggering check.
-//
-// Pacing is handled via s.gpsRecoveryUntil (see the monitor loop) — this
-// function does not sleep while holding any mutex.
 func (s *Service) attemptGPSRecovery(trigger error) error {
 	if !s.modemEnabled.Load() {
 		s.Logger.Printf("GPS recovery skipped, modem is disabled")
@@ -2164,11 +2206,8 @@ func (s *Service) resetGPSAfterModemRecovery() {
 }
 
 const (
-	// gpsNoDataTimeout is how long we tolerate silence from the modem's GPS
-	// before declaring it wedged. The chip emits NMEA at 1 Hz, so anything
-	// past a handful of seconds means it's stopped talking and we should
-	// reinit. Independent of fix state.
-	gpsNoDataTimeout = 5 * time.Second
+	// Allow ModemManager time to expose a whole-modem reset before GPS recovery.
+	gpsNoDataTimeout = 15 * time.Second
 
 	// gpsFixTimeout is how long we wait for a fix once GPS is enabled.
 	// Sized for cold-start: SIM7100E in standalone mode (UE-Based is
@@ -2186,9 +2225,6 @@ func (s *Service) checkGPSHealth() error {
 
 	now := time.Now()
 
-	// "Are we getting any NMEA from the chip?" — fed on every TPV/SKY
-	// callback in location.go regardless of fix mode. If this trips the
-	// chip is wedged; recovery should reinit.
 	lastData := s.Location.LastDataReceived()
 	if !lastData.IsZero() && now.Sub(lastData) > gpsNoDataTimeout {
 		return fmt.Errorf("gps_no_data: no GPS stanzas received for %v", now.Sub(lastData))
@@ -2214,6 +2250,24 @@ func (s *Service) monitorStatus(ctx context.Context) {
 	defer gpsTimer.Stop()
 	defer cellTimer.Stop()
 
+	type modemEvent struct {
+		kind string
+		path dbus.ObjectPath
+	}
+	modemEvents := make(chan modemEvent, 1)
+	notifyModem := func(event modemEvent) {
+		select {
+		case modemEvents <- event:
+		default:
+		}
+	}
+	if err := s.MMClient.WatchModems(ctx,
+		func(path dbus.ObjectPath) { notifyModem(modemEvent{kind: "added", path: path}) },
+		func(path dbus.ObjectPath) { notifyModem(modemEvent{kind: "removed", path: path}) },
+	); err != nil {
+		s.Logger.Printf("Failed to watch ModemManager events: %v", err)
+	}
+
 	if err := s.checkAndPublishModemStatus(ctx); err != nil {
 		s.Logger.Printf("Initial modem status check failed: %v", err)
 	}
@@ -2222,6 +2276,14 @@ func (s *Service) monitorStatus(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case event := <-modemEvents:
+			if !s.modemEnabled.Load() {
+				continue
+			}
+			s.Logger.Printf("ModemManager modem %s: %s", event.kind, event.path)
+			if err := s.checkAndPublishModemStatus(ctx); err != nil {
+				s.Logger.Printf("Event-driven modem status check failed: %v", err)
+			}
 		case <-ticker.C:
 			if !s.modemEnabled.Load() {
 				continue
@@ -2283,6 +2345,9 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.Logger.Printf("GPS recovery failed: %v", recoveryErr)
 					}
 					continue
+				}
+				if !s.Location.LastDataReceived().IsZero() {
+					s.clearGPSFault()
 				}
 
 				// Always publish GPS status, even without valid fix

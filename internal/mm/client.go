@@ -166,7 +166,6 @@ func (c *Client) Reset(modemPath dbus.ObjectPath) error {
 	return call.Err
 }
 
-
 // SendPin sends a PIN to unlock the SIM. The pin string is never logged.
 func (c *Client) SendPin(simPath dbus.ObjectPath, pin string) error {
 	obj := c.conn.Object(ModemManagerService, simPath)
@@ -369,15 +368,27 @@ func (c *Client) WatchModems(ctx context.Context, onAdded func(dbus.ObjectPath),
 			ModemManagerService, DBusObjectManager),
 	}
 
+	addedRules := make([]string, 0, len(matchRules))
 	for _, rule := range matchRules {
 		if err := c.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Err; err != nil {
+			for _, added := range addedRules {
+				c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, added)
+			}
+			c.conn.RemoveSignal(signals)
+			close(signals)
 			return errors.Wrap(err, "failed to add match rule")
 		}
+		addedRules = append(addedRules, rule)
 	}
 
 	go func() {
 		defer close(signals)
 		defer c.conn.RemoveSignal(signals)
+		defer func() {
+			for _, rule := range addedRules {
+				c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -433,12 +444,15 @@ func (c *Client) WatchPropertyChanges(ctx context.Context, modemPath dbus.Object
 		ModemManagerService, modemPath, DBusPropertiesInterface)
 
 	if err := c.conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule).Err; err != nil {
+		c.conn.RemoveSignal(signals)
+		close(signals)
 		return errors.Wrap(err, "failed to add match rule")
 	}
 
 	go func() {
 		defer close(signals)
 		defer c.conn.RemoveSignal(signals)
+		defer c.conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, rule)
 		for {
 			select {
 			case <-ctx.Done():

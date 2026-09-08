@@ -52,9 +52,10 @@ type SMSSendResult struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// Fault codes for modem issues
 const (
 	FaultCodeModemRecoveryFailed = 1
+	FaultCodeModemUnavailable    = 2
+	FaultCodeGPSUnavailable      = 3
 )
 
 // Client wraps the Redis IPC client

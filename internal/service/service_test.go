@@ -393,7 +393,7 @@ func TestGPSHealthCheck(t *testing.T) {
 	}
 
 	// Test 3: No data past gpsNoDataTimeout should fail
-	service.Location.SetLastDataReceived(time.Now().Add(-10 * time.Second))
+	service.Location.SetLastDataReceived(time.Now().Add(-(gpsNoDataTimeout + time.Second)))
 	err = service.checkGPSHealth()
 	if err == nil {
 		t.Error("Expected error for no GPS data, got nil")

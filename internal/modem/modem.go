@@ -10,7 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -48,12 +48,6 @@ const (
 	RegistrationDenied  = "denied"
 	RegistrationFailed  = "failed"
 	RegistrationUnknown = "unknown"
-)
-
-// Timing constants
-const (
-	CheckInterval  = 5 * time.Second
-	MaxStartChecks = 60 // 5 minutes (60 * 5 seconds)
 )
 
 // State represents the current state of the modem
@@ -377,6 +371,35 @@ func (m *Manager) CheckPrimaryPort() error {
 	return nil
 }
 
+func isModemReadyState(state int32) bool {
+	return state == mm.MMModemStateLocked || state >= mm.MMModemStateEnabled
+}
+
+func (m *Manager) checkReadyState(modemPath dbus.ObjectPath) error {
+	stateVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "State")
+	if err != nil {
+		return err
+	}
+
+	state, ok := stateVar.Value().(int32)
+	if !ok {
+		return fmt.Errorf("unexpected modem state type %T", stateVar.Value())
+	}
+	if !isModemReadyState(state) {
+		return fmt.Errorf("modem not ready: %s", mm.ModemStateToString(state))
+	}
+	return nil
+}
+
+// CheckReadyState reports whether ModemManager has finished initialization.
+func (m *Manager) CheckReadyState() error {
+	modemPath, err := m.FindModem()
+	if err != nil {
+		return err
+	}
+	return m.checkReadyState(modemPath)
+}
+
 // CheckPowerState checks if the power state is correct
 func (m *Manager) CheckPowerState() error {
 	modemPath, err := m.FindModem()
@@ -478,38 +501,96 @@ func (m *Manager) IsModemPresent() bool {
 	return err == nil
 }
 
-// WaitForModem waits for the modem to come up. The USB network interface
-// (e.g. wwan0) appears before ModemManager finishes probing the device
-// on D-Bus, so we wait for both: interface present AND D-Bus registration.
+// WaitForModem waits for ModemManager add/remove and state-change events.
 func (m *Manager) WaitForModem(ctx context.Context, interfaceName string) error {
 	m.logger.Printf("Waiting for modem to come up...")
 
-	ticker := time.NewTicker(CheckInterval)
-	defer ticker.Stop()
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	events := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case events <- struct{}{}:
+		default:
+		}
+	}
+
+	var watchMu sync.Mutex
+	watched := make(map[dbus.ObjectPath]bool)
+	watchPath := func(path dbus.ObjectPath) error {
+		watchMu.Lock()
+		defer watchMu.Unlock()
+		if watched[path] {
+			return nil
+		}
+		if err := m.client.WatchPropertyChanges(watchCtx, path, func(iface, property string, _ dbus.Variant) {
+			if iface == mm.ModemInterface && property == "State" {
+				notify()
+			}
+		}); err != nil {
+			return err
+		}
+		watched[path] = true
+		return nil
+	}
+
+	if err := m.client.WatchModems(watchCtx, func(path dbus.ObjectPath) {
+		if err := watchPath(path); err != nil {
+			m.logger.Printf("Failed to watch modem state at %s: %v", path, err)
+		}
+		notify()
+	}, func(dbus.ObjectPath) {
+		notify()
+	}); err != nil {
+		return fmt.Errorf("watch modem events: %w", err)
+	}
 
 	interfaceUp := false
-	count := 0
+	var modemPath dbus.ObjectPath
+	lastReadiness := ""
+	check := func() (bool, error) {
+		if !interfaceUp && IsInterfacePresent(interfaceName) {
+			m.logger.Printf("Modem interface %s is now present, waiting for ModemManager...", interfaceName)
+			interfaceUp = true
+		}
+
+		path, err := m.FindModem()
+		if err != nil {
+			if modemPath != "" {
+				m.logger.Printf("Modem disappeared from D-Bus; waiting for it to return...")
+			}
+			modemPath = ""
+			lastReadiness = ""
+			return false, nil
+		}
+		if err := watchPath(path); err != nil {
+			return false, fmt.Errorf("watch modem state at %s: %w", path, err)
+		}
+		if path != modemPath {
+			m.logger.Printf("Modem registered on D-Bus at %s", path)
+			modemPath = path
+		}
+		if err := m.checkReadyState(path); err != nil {
+			if readiness := err.Error(); readiness != lastReadiness {
+				m.logger.Printf("Modem not ready: %v", err)
+				lastReadiness = readiness
+			}
+			return false, nil
+		}
+		m.logger.Printf("Modem is ready")
+		return true, nil
+	}
+
+	if ready, err := check(); ready || err != nil {
+		return err
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
-			if !interfaceUp && IsInterfacePresent(interfaceName) {
-				m.logger.Printf("Modem interface %s is now present, waiting for ModemManager...", interfaceName)
-				interfaceUp = true
-			}
-
-			if m.IsModemPresent() {
-				m.logger.Printf("Modem registered on D-Bus")
-				return nil
-			}
-
-			count++
-			if count >= MaxStartChecks {
-				if interfaceUp {
-					return fmt.Errorf("modem interface present but ModemManager did not register it after %d checks", MaxStartChecks)
-				}
-				return fmt.Errorf("modem did not come up after %d checks", MaxStartChecks)
+		case <-events:
+			if ready, err := check(); ready || err != nil {
+				return err
 			}
 		}
 	}
