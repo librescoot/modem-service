@@ -1577,10 +1577,7 @@ func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connec
 	s.publishGPSMode()
 }
 
-// publishGPSMode updates the gps.mode Redis field if the current mode has
-// changed since the last publish. Serialized via modePubMu because
-// requestGPSModeForConnectivity can spawn overlapping goroutines when
-// connectivity flickers.
+// publishGPSMode updates the gps.mode Redis field if the current mode changed.
 func (s *Service) publishGPSMode() {
 	mode := s.Location.CurrentGPSMode()
 
