@@ -110,6 +110,26 @@ func TestParseIP4Config(t *testing.T) {
 	}
 }
 
+func TestBearerStatsKnownRequiresCompleteCounterPair(t *testing.T) {
+	tests := []struct {
+		name  string
+		stats map[string]dbus.Variant
+		want  bool
+	}{
+		{"per-attempt", map[string]dbus.Variant{"rx-bytes": dbus.MakeVariant(uint64(0)), "tx-bytes": dbus.MakeVariant(uint64(0))}, true},
+		{"totals", map[string]dbus.Variant{"total-rx-bytes": dbus.MakeVariant(uint64(0)), "total-tx-bytes": dbus.MakeVariant(uint64(0))}, true},
+		{"partial", map[string]dbus.Variant{"rx-bytes": dbus.MakeVariant(uint64(1))}, false},
+		{"wrong-type", map[string]dbus.Variant{"rx-bytes": dbus.MakeVariant("1"), "tx-bytes": dbus.MakeVariant(uint64(1))}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bearerStatsKnown(tc.stats); got != tc.want {
+				t.Fatalf("bearerStatsKnown() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseBearerStats(t *testing.T) {
 	tests := []struct {
 		name string

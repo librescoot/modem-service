@@ -99,9 +99,7 @@ func (c *Client) GetBearerInfo(bearerPath dbus.ObjectPath) (BearerInfo, error) {
 	if v, err := c.GetProperty(bearerPath, BearerInterface, "Stats"); err == nil {
 		if m, ok := v.Value().(map[string]dbus.Variant); ok {
 			info.Stats = parseBearerStats(m)
-			_, rxOK := variantUintOK(m["rx-bytes"])
-			_, txOK := variantUintOK(m["tx-bytes"])
-			info.StatsKnown = rxOK && txOK
+			info.StatsKnown = bearerStatsKnown(m)
 		}
 	}
 	return info, nil
@@ -176,6 +174,14 @@ func parseIP4Config(m map[string]dbus.Variant) IP4Config {
 		}
 	}
 	return cfg
+}
+
+func bearerStatsKnown(m map[string]dbus.Variant) bool {
+	_, rxOK := variantUintOK(m["rx-bytes"])
+	_, txOK := variantUintOK(m["tx-bytes"])
+	_, totalRxOK := variantUintOK(m["total-rx-bytes"])
+	_, totalTxOK := variantUintOK(m["total-tx-bytes"])
+	return (rxOK && txOK) || (totalRxOK && totalTxOK)
 }
 
 func parseBearerStats(m map[string]dbus.Variant) BearerStats {
