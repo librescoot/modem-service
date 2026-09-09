@@ -154,7 +154,9 @@ type Service struct {
 	powerOffModemFn      func(context.Context) error
 	removeInhibitorFn    func() error
 	publishLocationFn    func(map[string]interface{}, bool) error
+	watchSMSAddedFn      func(context.Context, dbus.ObjectPath, func(dbus.ObjectPath, bool)) error
 	handleSMSAddedFn     func(dbus.ObjectPath, dbus.ObjectPath)
+	raiseFaultFn         func(int, string)
 	recoveryBackoffFn    func(context.Context) error
 
 	ctx context.Context
@@ -723,6 +725,20 @@ func (s *Service) installSMSWatchContext(ctx context.Context) (context.Context, 
 }
 
 // Process Added objects directly because transient messages may never reach storage.
+func (s *Service) armSMSAddedWatch(ctx context.Context, modemPath dbus.ObjectPath) error {
+	watchCtx, cancel := s.installSMSWatchContext(s.durableContext(ctx))
+	watch := s.watchSMSAddedFn
+	if watch == nil {
+		watch = s.MMClient.WatchSMSAdded
+	}
+	if err := watch(watchCtx, modemPath, s.smsAddedHandler(modemPath)); err != nil {
+		cancel()
+		s.smsWatchCancel = nil
+		return err
+	}
+	return nil
+}
+
 func (s *Service) smsAddedHandler(modemPath dbus.ObjectPath) func(dbus.ObjectPath, bool) {
 	return func(smsPath dbus.ObjectPath, received bool) {
 		s.Logger.Printf("sms: Added signal path=%s received=%v", smsPath, received)
@@ -773,11 +789,8 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 	// already stored. Draining first would leave a race window where an inbound
 	// SMS lands after the drain but before the watch and goes unnoticed until
 	// the next message or the periodic poll.
-	watchCtx, cancel := s.installSMSWatchContext(ctx)
-	if err := s.MMClient.WatchSMSAdded(watchCtx, modemPath, s.smsAddedHandler(modemPath)); err != nil {
+	if err := s.armSMSAddedWatch(ctx, modemPath); err != nil {
 		s.Logger.Printf("sms: failed to start SMS watch: %v", err)
-		cancel()
-		s.smsWatchCancel = nil
 		// Still drain once so messages already in storage aren't left behind.
 		s.drainSMS(modemPath)
 		return
@@ -1286,9 +1299,17 @@ func (s *Service) checkHealth(ctx context.Context) error {
 	return nil
 }
 
+func (s *Service) raiseFault(code int, description string) {
+	if s.raiseFaultFn != nil {
+		s.raiseFaultFn(code, description)
+		return
+	}
+	s.Redis.RaiseFault(code, description)
+}
+
 func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 	s.Logger.Printf("Modem failure detected: %s", reason)
-	s.Redis.RaiseFault(redisClient.FaultCodeModemUnavailable, "Modem unavailable: "+reason)
+	s.raiseFault(redisClient.FaultCodeModemUnavailable, "Modem unavailable: "+reason)
 
 	if !s.recoveryRunMu.TryLock() {
 		return fmt.Errorf("recovery in progress")
@@ -1308,7 +1329,7 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 	if !s.Health.CanRecover() {
 		s.Health.MarkRecoveryFailed()
 		s.publishHealthState(ctx)
-		s.Redis.RaiseFault(redisClient.FaultCodeModemRecoveryFailed,
+		s.raiseFault(redisClient.FaultCodeModemRecoveryFailed,
 			fmt.Sprintf("Max recovery attempts (%d) exhausted, entering recovery-failed-wait", health.MaxRecoveryAttempts))
 		s.Logger.Printf("Max recovery attempts reached, entering %s state", s.Health.State)
 		err := s.completeRecoveryBackoff(ctx, recoveryCtx)

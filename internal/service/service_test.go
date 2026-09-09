@@ -21,9 +21,13 @@ import (
 )
 
 func TestRecoveryBackoffCancellationReturnsToNormal(t *testing.T) {
-	s := &Service{Health: health.New()}
+	entered := make(chan struct{})
+	s := &Service{
+		Health:       health.New(),
+		Logger:       log.New(io.Discard, "", 0),
+		raiseFaultFn: func(int, string) {},
+	}
 	s.Health.RecoveryAttempts = health.MaxRecoveryAttempts
-	s.Health.MarkRecoveryFailed()
 	var published string
 	s.publishFn = func(key, value string) error {
 		if key == "modem-health" {
@@ -32,12 +36,18 @@ func TestRecoveryBackoffCancellationReturnsToNormal(t *testing.T) {
 		return nil
 	}
 	s.recoveryBackoffFn = func(ctx context.Context) error {
+		close(entered)
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := s.completeRecoveryBackoff(context.Background(), ctx); err != context.Canceled {
+	s.modemEnabled.Store(true)
+	failureDone := make(chan error, 1)
+	go func() {
+		failureDone <- s.handleModemFailure(context.Background(), "test")
+	}()
+	<-entered
+	s.cancelModemOperation()
+	if err := <-failureDone; err != context.Canceled {
 		t.Fatalf("backoff error = %v", err)
 	}
 	if s.Health.State != health.StateNormal || s.Health.RecoveryAttempts != 0 {
@@ -48,12 +58,10 @@ func TestRecoveryBackoffCancellationReturnsToNormal(t *testing.T) {
 	}
 
 	enabled := false
-	s.Logger = log.New(io.Discard, "", 0)
 	s.ensureModemEnabledFn = func(context.Context) error {
 		enabled = true
 		return nil
 	}
-	s.modemEnabled.Store(true)
 	applied := false
 	if !s.reconcileModemTarget(context.Background(), &applied) || !enabled || !applied {
 		t.Fatal("healthy re-enable did not resume after cancelled backoff")
@@ -78,16 +86,23 @@ func TestSMSWatchSurvivesOperationAndStopsExplicitly(t *testing.T) {
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	defer cancelService()
 	delivered := make(chan dbus.ObjectPath, 1)
+	var watchCtx context.Context
+	var handleAdded func(dbus.ObjectPath, bool)
 	s := &Service{
 		ctx:    serviceCtx,
 		Logger: log.New(io.Discard, "", 0),
+		watchSMSAddedFn: func(ctx context.Context, _ dbus.ObjectPath, handler func(dbus.ObjectPath, bool)) error {
+			watchCtx, handleAdded = ctx, handler
+			return nil
+		},
 		handleSMSAddedFn: func(_, smsPath dbus.ObjectPath) {
 			delivered <- smsPath
 		},
 	}
 	opCtx, finish := s.startModemOperation(serviceCtx)
-	watchCtx, _ := s.installSMSWatchContext(s.durableContext(opCtx))
-	handleAdded := s.smsAddedHandler("/Modem/1")
+	if err := s.armSMSAddedWatch(opCtx, "/Modem/1"); err != nil {
+		t.Fatal(err)
+	}
 
 	finish()
 	handleAdded("/SMS/1", true)
@@ -112,7 +127,10 @@ func TestSMSWatchSurvivesOperationAndStopsExplicitly(t *testing.T) {
 		t.Fatal("explicit SMS watch stop did not cancel subscription")
 	}
 
-	shutdownWatch, _ := s.installSMSWatchContext(serviceCtx)
+	if err := s.armSMSAddedWatch(serviceCtx, "/Modem/1"); err != nil {
+		t.Fatal(err)
+	}
+	shutdownWatch := watchCtx
 	cancelService()
 	select {
 	case <-shutdownWatch.Done():
