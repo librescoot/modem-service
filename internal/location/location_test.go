@@ -11,6 +11,19 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+func TestEnsureModemPathResolvesEmptyPath(t *testing.T) {
+	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
+	s.ResolveModemPath = func() (dbus.ObjectPath, error) {
+		return dbus.ObjectPath("/Modem/1"), nil
+	}
+	if err := s.ensureModemPath(); err != nil {
+		t.Fatal(err)
+	}
+	if s.ModemPath != "/Modem/1" {
+		t.Fatalf("modem path = %q", s.ModemPath)
+	}
+}
+
 func TestRapidEnableCloseHandoff(t *testing.T) {
 	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
 

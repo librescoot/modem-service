@@ -513,8 +513,29 @@ func (s *Service) refreshModemPathIfStale(err error) bool {
 	return true
 }
 
+func (s *Service) ensureModemPath() error {
+	if s.ModemPath != "" {
+		return nil
+	}
+	if s.ResolveModemPath == nil {
+		return fmt.Errorf("modem path unavailable")
+	}
+	path, err := s.ResolveModemPath()
+	if err != nil {
+		return fmt.Errorf("resolve modem path: %w", err)
+	}
+	if path == "" {
+		return fmt.Errorf("modem path unavailable")
+	}
+	s.ModemPath = path
+	return nil
+}
+
 // sendATCommand retries once if ModemManager rebound the modem's object path.
 func (s *Service) sendATCommand(ctx context.Context, command string, logResponse bool) (string, error) {
+	if err := s.ensureModemPath(); err != nil {
+		return "", err
+	}
 	send := func() (string, error) {
 		return s.MMClient.SendCommandContext(ctx, s.ModemPath, command, 10*time.Second)
 	}
