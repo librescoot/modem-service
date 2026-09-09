@@ -48,17 +48,18 @@ type BearerStats struct {
 
 // BearerInfo is one bearer's state.
 type BearerInfo struct {
-	Path           dbus.ObjectPath
-	Connected      bool
-	ConnectedKnown bool
-	Suspended      bool
-	SuspendedKnown bool
-	Interface      string
-	InterfaceKnown bool
-	IP4            IP4Config
-	IP4Known       bool
-	Stats          BearerStats
-	StatsKnown     bool
+	Path              dbus.ObjectPath
+	Connected         bool
+	ConnectedKnown    bool
+	Suspended         bool
+	SuspendedKnown    bool
+	Interface         string
+	InterfaceKnown    bool
+	IP4               IP4Config
+	IP4Known          bool
+	Stats             BearerStats
+	StatsKnown        bool
+	SessionStatsKnown bool
 }
 
 // ListBearers returns the modem's bearer object paths.
@@ -100,6 +101,9 @@ func (c *Client) GetBearerInfo(bearerPath dbus.ObjectPath) (BearerInfo, error) {
 		if m, ok := v.Value().(map[string]dbus.Variant); ok {
 			info.Stats = parseBearerStats(m)
 			info.StatsKnown = bearerStatsKnown(m)
+			_, attemptsOK := variantUintOK(m["attempts"])
+			_, durationOK := variantUintOK(m["duration"])
+			info.SessionStatsKnown = attemptsOK && durationOK
 		}
 	}
 	return info, nil

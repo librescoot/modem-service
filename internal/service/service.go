@@ -151,6 +151,10 @@ type Service struct {
 	modemOpGeneration    uint64
 	ensureModemEnabledFn func(context.Context) error
 	disableModemFn       func(context.Context)
+	powerOffModemFn      func(context.Context) error
+	removeInhibitorFn    func() error
+	publishLocationFn    func(map[string]interface{}, bool) error
+	handleSMSAddedFn     func(dbus.ObjectPath, dbus.ObjectPath)
 	recoveryBackoffFn    func(context.Context) error
 
 	ctx context.Context
@@ -438,6 +442,27 @@ func (s *Service) runDisableModem(ctx context.Context) {
 	s.disableModem(ctx)
 }
 
+func (s *Service) powerOffModem(ctx context.Context) error {
+	if s.powerOffModemFn != nil {
+		return s.powerOffModemFn(ctx)
+	}
+	return s.Modem.PowerOffModem(ctx)
+}
+
+func (s *Service) removeModemInhibitor() error {
+	if s.removeInhibitorFn != nil {
+		return s.removeInhibitorFn()
+	}
+	return s.Redis.RemoveModemInhibitor()
+}
+
+func (s *Service) publishLocation(fields map[string]interface{}, snapshot bool) error {
+	if s.publishLocationFn != nil {
+		return s.publishLocationFn(fields, snapshot)
+	}
+	return s.Redis.PublishLocationState(fields, snapshot)
+}
+
 func (s *Service) signalModemStateChange() {
 	select {
 	case s.modemStateChange <- struct{}{}:
@@ -516,7 +541,7 @@ func (s *Service) disableModem(ctx context.Context) {
 	// Close GPS first. Preserve last lat/lng but clear the fix indicators
 	// so consumers don't treat stale coords as a current position.
 	s.withGPSLifecycleLock(s.Location.Close)
-	s.Redis.PublishLocationState(map[string]interface{}{
+	s.publishLocation(map[string]interface{}{
 		"state":              "off",
 		"fix":                "none",
 		"active":             false,
@@ -531,14 +556,22 @@ func (s *Service) disableModem(ctx context.Context) {
 	}, false)
 
 	// Publish off states
-	s.Redis.PublishInternetState("status", "disconnected")
-	s.Redis.PublishInternetState("modem-state", "off")
-	s.Redis.PublishModemState("power-state", "off")
+	publishInternet := s.publishFn
+	if publishInternet == nil {
+		publishInternet = s.Redis.PublishInternetState
+	}
+	publishModem := s.publishModemFn
+	if publishModem == nil {
+		publishModem = s.Redis.PublishModemState
+	}
+	publishInternet("status", "disconnected")
+	publishInternet("modem-state", "off")
+	publishModem("power-state", "off")
 
 	// The monitor loop skips status checks while disabled, so the connectivity
 	// classifier won't run to observe the power-off. Publish "disabled"
 	// explicitly and force the classifier so it reports correctly on resume.
-	s.Redis.PublishInternetState("connectivity", string(connectivity.Disabled))
+	publishInternet("connectivity", string(connectivity.Disabled))
 	s.connClassifier.Force(connectivity.Disabled)
 	s.lastPubConn = connectivity.Disabled
 
@@ -561,7 +594,7 @@ func (s *Service) disableModem(ctx context.Context) {
 	// to a full clockSyncInterval before correcting.
 	s.lastClockSync = time.Time{}
 
-	if err := s.Modem.PowerOffModem(ctx); err != nil {
+	if err := s.powerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
 	}
 
@@ -576,7 +609,7 @@ func (s *Service) disableModem(ctx context.Context) {
 	// Modem is off: drop the power inhibitor so pm-service can proceed to
 	// suspend. Released here (after PowerOffModem) so suspend can't race the
 	// modem still being powered.
-	if err := s.Redis.RemoveModemInhibitor(); err != nil {
+	if err := s.removeModemInhibitor(); err != nil {
 		s.Logger.Printf("Failed to clear modem power inhibitor: %v", err)
 	}
 
@@ -689,6 +722,21 @@ func (s *Service) installSMSWatchContext(ctx context.Context) (context.Context, 
 	return watchCtx, cancel
 }
 
+// Process Added objects directly because transient messages may never reach storage.
+func (s *Service) smsAddedHandler(modemPath dbus.ObjectPath) func(dbus.ObjectPath, bool) {
+	return func(smsPath dbus.ObjectPath, received bool) {
+		s.Logger.Printf("sms: Added signal path=%s received=%v", smsPath, received)
+		if !received {
+			return
+		}
+		if s.handleSMSAddedFn != nil {
+			s.handleSMSAddedFn(modemPath, smsPath)
+			return
+		}
+		s.SMS.HandleAdded(modemPath, smsPath)
+	}
+}
+
 func (s *Service) startSMSWatch(ctx context.Context) {
 	s.smsWatchMu.Lock()
 	defer s.smsWatchMu.Unlock()
@@ -726,16 +774,7 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 	// SMS lands after the drain but before the watch and goes unnoticed until
 	// the next message or the periodic poll.
 	watchCtx, cancel := s.installSMSWatchContext(ctx)
-	if err := s.MMClient.WatchSMSAdded(watchCtx, modemPath, func(smsPath dbus.ObjectPath, received bool) {
-		s.Logger.Printf("sms: Added signal path=%s received=%v", smsPath, received)
-		if !received {
-			return // an outbound object we created; ignore
-		}
-		// Process the signalled object directly. Some modems deliver a received
-		// message as a transient object that never lands in storage, so a
-		// re-list (drainSMS) would miss it.
-		s.SMS.HandleAdded(modemPath, smsPath)
-	}); err != nil {
+	if err := s.MMClient.WatchSMSAdded(watchCtx, modemPath, s.smsAddedHandler(modemPath)); err != nil {
 		s.Logger.Printf("sms: failed to start SMS watch: %v", err)
 		cancel()
 		s.smsWatchCancel = nil

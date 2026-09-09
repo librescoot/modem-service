@@ -21,7 +21,7 @@ func healthy() Snapshot {
 		BearerInterface:      "wwan0",
 		BearerIPKnown:        true,
 		BearerIP:             "10.64.13.241",
-		BearerStatsKnown:     true,
+		BearerSessionKnown:   true,
 		BearerAttempts:       1,
 		BearerDuration:       46290,
 		CarrierKnown:         true,
@@ -122,6 +122,9 @@ func TestUnknownFieldsDoNotFail(t *testing.T) {
 	s.BearerSuspendedKnown = false
 	s.BearerIPKnown = false
 	s.BearerIP = ""
+	s.ATChecked = true
+	s.CGACTActive = true
+	s.CGPADDR = "10.64.13.241"
 	s.CarrierKnown = false
 	s.DefaultRouteKnown = false
 	if got := New().Assess(s); !got.Healthy {
@@ -265,8 +268,8 @@ func TestSessionFlapped(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.prev.BearerStatsKnown = true
-			tc.cur.BearerStatsKnown = true
+			tc.prev.BearerSessionKnown = true
+			tc.cur.BearerSessionKnown = true
 			if got := sessionFlapped(tc.prev, tc.cur); got != tc.want {
 				t.Errorf("sessionFlapped() = %v, want %v", got, tc.want)
 			}

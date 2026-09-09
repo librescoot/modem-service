@@ -339,7 +339,7 @@ func TestPersistentFlapEventuallyRemediates(t *testing.T) {
 		BearerSuspendedKnown: true, BearerInterface: "wwan0", BearerIPKnown: true, BearerIP: "10.64.13.241",
 		CarrierKnown: true, Carrier: true, NetdevIP: "10.64.13.241",
 		DefaultRouteKnown: true, HasDefaultRoute: true,
-		BearerStatsKnown: true, BearerAttempts: 1, BearerDuration: 1200,
+		BearerSessionKnown: true, BearerAttempts: 1, BearerDuration: 1200,
 	}
 	a.Assess(snap)
 

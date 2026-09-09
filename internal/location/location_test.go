@@ -62,6 +62,52 @@ func TestCloseJoinsBlockedMonitor(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsActiveModeChange(t *testing.T) {
+	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
+	monitorEntered := make(chan struct{})
+	releaseMonitor := make(chan struct{})
+	s.beforeConfigure = func() {
+		close(monitorEntered)
+		<-releaseMonitor
+	}
+	gpsStopped := make(chan struct{}, 1)
+	s.sendATCommandFn = func(_ context.Context, command string) (string, error) {
+		if command == "AT+CGPS?" {
+			return "+CGPS: 1,2", nil
+		}
+		if command == "AT+CGPS=0" {
+			gpsStopped <- struct{}{}
+		}
+		return "", nil
+	}
+	if err := s.EnableGPS("/Modem/1"); err != nil {
+		t.Fatal(err)
+	}
+	<-monitorEntered
+	modeDone := make(chan error, 1)
+	go func() { modeDone <- s.SetGPSMode(context.Background(), ModeStandalone) }()
+	<-gpsStopped
+	closeDone := make(chan struct{})
+	go func() {
+		s.Close()
+		close(closeDone)
+	}()
+	select {
+	case err := <-modeDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("mode change error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active mode change was not cancelled by Close")
+	}
+	close(releaseMonitor)
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after mode change and monitor exited")
+	}
+}
+
 func TestConcurrentEnableCloseHandoff(t *testing.T) {
 	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
 	for i := 0; i < 50; i++ {

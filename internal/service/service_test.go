@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -12,9 +13,11 @@ import (
 	"github.com/godbus/dbus/v5"
 
 	"modem-service/internal/config"
+	"modem-service/internal/datausage"
 	"modem-service/internal/health"
 	"modem-service/internal/location"
 	"modem-service/internal/modem"
+	"modem-service/internal/modem/connectivity"
 )
 
 func TestRecoveryBackoffCancellationReturnsToNormal(t *testing.T) {
@@ -43,6 +46,18 @@ func TestRecoveryBackoffCancellationReturnsToNormal(t *testing.T) {
 	if published != health.StateNormal {
 		t.Fatalf("published health = %q", published)
 	}
+
+	enabled := false
+	s.Logger = log.New(io.Discard, "", 0)
+	s.ensureModemEnabledFn = func(context.Context) error {
+		enabled = true
+		return nil
+	}
+	s.modemEnabled.Store(true)
+	applied := false
+	if !s.reconcileModemTarget(context.Background(), &applied) || !enabled || !applied {
+		t.Fatal("healthy re-enable did not resume after cancelled backoff")
+	}
 }
 
 func TestRecoveryBackoffExpiryReturnsToNormal(t *testing.T) {
@@ -62,11 +77,28 @@ func TestRecoveryBackoffExpiryReturnsToNormal(t *testing.T) {
 func TestSMSWatchSurvivesOperationAndStopsExplicitly(t *testing.T) {
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	defer cancelService()
-	s := &Service{ctx: serviceCtx}
+	delivered := make(chan dbus.ObjectPath, 1)
+	s := &Service{
+		ctx:    serviceCtx,
+		Logger: log.New(io.Discard, "", 0),
+		handleSMSAddedFn: func(_, smsPath dbus.ObjectPath) {
+			delivered <- smsPath
+		},
+	}
 	opCtx, finish := s.startModemOperation(serviceCtx)
 	watchCtx, _ := s.installSMSWatchContext(s.durableContext(opCtx))
+	handleAdded := s.smsAddedHandler("/Modem/1")
 
 	finish()
+	handleAdded("/SMS/1", true)
+	select {
+	case got := <-delivered:
+		if got != "/SMS/1" {
+			t.Fatalf("delivered SMS path = %q", got)
+		}
+	default:
+		t.Fatal("SMS Added event was not delivered after operation completion")
+	}
 	select {
 	case <-watchCtx.Done():
 		t.Fatal("SMS watch stopped with completed modem operation")
@@ -110,33 +142,64 @@ func TestDurableContextOutlivesOperation(t *testing.T) {
 	}
 }
 
-func TestRepeatedDisableRunsIdempotentCleanup(t *testing.T) {
-	calls := 0
+func newDisableLifecycleService() (*Service, map[string]string, *int, *int) {
+	published := make(map[string]string)
+	powerOffs, inhibitorRemovals := 0, 0
 	s := &Service{
 		Logger:         log.New(io.Discard, "", 0),
-		disableModemFn: func(context.Context) { calls++ },
+		Health:         health.New(),
+		Location:       location.NewService(log.New(io.Discard, "", 0), "", nil, ""),
+		Usage:          datausage.New("", nil),
+		LastState:      modem.NewState(),
+		connClassifier: connectivity.New(),
+		publishFn: func(key, value string) error {
+			published["internet."+key] = value
+			return nil
+		},
+		publishModemFn: func(key, value string) error {
+			published["modem."+key] = value
+			return nil
+		},
+		publishLocationFn: func(fields map[string]interface{}, _ bool) error {
+			for key, value := range fields {
+				published["gps."+key] = fmt.Sprint(value)
+			}
+			return nil
+		},
+		powerOffModemFn: func(context.Context) error {
+			powerOffs++
+			return nil
+		},
+		removeInhibitorFn: func() error {
+			inhibitorRemovals++
+			return nil
+		},
 	}
+	return s, published, &powerOffs, &inhibitorRemovals
+}
+
+func TestRepeatedDisableRunsIdempotentCleanup(t *testing.T) {
+	s, published, powerOffs, inhibitorRemovals := newDisableLifecycleService()
 	s.modemEnabled.Store(false)
 	applied := false
 	s.reconcileModemTarget(context.Background(), &applied)
 	s.reconcileModemTarget(context.Background(), &applied)
-	if calls != 2 {
-		t.Fatalf("disable cleanup calls = %d, want 2", calls)
+	if *powerOffs != 2 || *inhibitorRemovals != 2 {
+		t.Fatalf("cleanup calls = power %d inhibitor %d, want 2 each", *powerOffs, *inhibitorRemovals)
+	}
+	if published["internet.connectivity"] != "disabled" || published["modem.power-state"] != "off" || published["gps.state"] != "off" {
+		t.Fatalf("off state not published: %v", published)
 	}
 }
 
 func TestCancelledEnableStillRunsDisableCleanup(t *testing.T) {
 	started := make(chan struct{})
-	disabled := make(chan struct{}, 1)
-	s := &Service{
-		Logger:           log.New(io.Discard, "", 0),
-		modemStateChange: make(chan struct{}, 1),
-		ensureModemEnabledFn: func(ctx context.Context) error {
-			close(started)
-			<-ctx.Done()
-			return ctx.Err()
-		},
-		disableModemFn: func(context.Context) { disabled <- struct{}{} },
+	s, published, powerOffs, inhibitorRemovals := newDisableLifecycleService()
+	s.modemStateChange = make(chan struct{}, 1)
+	s.ensureModemEnabledFn = func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
 	}
 	s.modemEnabled.Store(true)
 	applied := false
@@ -153,10 +216,11 @@ func TestCancelledEnableStillRunsDisableCleanup(t *testing.T) {
 	<-done
 	<-s.modemStateChange
 	s.reconcileModemTarget(context.Background(), &applied)
-	select {
-	case <-disabled:
-	default:
-		t.Fatal("cancelled enable suppressed disable cleanup")
+	if *powerOffs != 1 || *inhibitorRemovals != 1 {
+		t.Fatalf("cancelled enable cleanup = power %d inhibitor %d", *powerOffs, *inhibitorRemovals)
+	}
+	if published["internet.connectivity"] != "disabled" || published["modem.power-state"] != "off" {
+		t.Fatalf("cancelled enable did not publish off state: %v", published)
 	}
 	if applied {
 		t.Fatal("cancelled enable remained applied")

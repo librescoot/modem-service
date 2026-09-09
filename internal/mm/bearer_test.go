@@ -28,6 +28,8 @@ func TestGetBearerInfoTracksPropertyValidity(t *testing.T) {
 			"Ip4Config": dbus.MakeVariant("wrong-type"),
 			"Stats": mapVariant(map[string]dbus.Variant{
 				"rx-bytes": dbus.MakeVariant(uint64(10)),
+				"attempts": dbus.MakeVariant(uint32(2)),
+				"duration": dbus.MakeVariant(uint64(30)),
 			}),
 		},
 		failed: map[string]bool{"Connected": true},
@@ -42,7 +44,7 @@ func TestGetBearerInfoTracksPropertyValidity(t *testing.T) {
 	if info.ConnectedKnown || info.IP4Known || info.StatsKnown {
 		t.Fatalf("failed/incomplete observations marked known: %+v", info)
 	}
-	if !info.SuspendedKnown || !info.InterfaceKnown {
+	if !info.SuspendedKnown || !info.InterfaceKnown || !info.SessionStatsKnown {
 		t.Fatalf("successful observations marked unknown: %+v", info)
 	}
 }

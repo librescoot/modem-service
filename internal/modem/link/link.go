@@ -114,7 +114,7 @@ type Snapshot struct {
 	BearerInterface      string
 	BearerIPKnown        bool
 	BearerIP             string
-	BearerStatsKnown     bool
+	BearerSessionKnown   bool
 	BearerAttempts       uint32
 	BearerDuration       uint64
 
@@ -169,7 +169,7 @@ func (a *Assessor) Assess(cur Snapshot) Assessment {
 	if havePrev {
 		if sessionFlapped(prev, cur) {
 			a.flaps++
-		} else if cur.BearerStatsKnown && cur.BearerDuration >= stableSessionSeconds {
+		} else if cur.BearerSessionKnown && cur.BearerDuration >= stableSessionSeconds {
 			// The session has been up long enough to count as stable, so past
 			// flaps are history and the ladder starts over. This must be
 			// evaluated before the threshold below, or a recovered session
@@ -260,7 +260,7 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 			return fail(LayerBearer, RemedyBearerBounce,
 				"modem reports PDP context inactive while the bearer claims connected")
 		}
-		if s.CGPADDR != "" && s.CGPADDR != s.BearerIP {
+		if s.BearerIPKnown && s.CGPADDR != "" && s.CGPADDR != s.BearerIP {
 			return fail(LayerBearer, RemedyBearerBounce,
 				"modem address %s disagrees with bearer address %s", s.CGPADDR, s.BearerIP)
 		}
@@ -294,7 +294,7 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 // duration with it, so a rising attempts count paired with a short duration
 // means the session did not survive.
 func sessionFlapped(prev, cur Snapshot) bool {
-	if !prev.BearerStatsKnown || !cur.BearerStatsKnown {
+	if !prev.BearerSessionKnown || !cur.BearerSessionKnown {
 		return false
 	}
 	if cur.BearerAttempts <= prev.BearerAttempts {

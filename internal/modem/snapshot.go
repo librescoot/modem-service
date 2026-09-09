@@ -113,7 +113,7 @@ func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) (link.Sn
 		snap.BearerInterface = bearer.Interface
 		snap.BearerIPKnown = bearer.IP4Known
 		snap.BearerIP = normalizeAddr(bearer.IP4.Address)
-		snap.BearerStatsKnown = bearer.StatsKnown
+		snap.BearerSessionKnown = bearer.SessionStatsKnown
 		snap.BearerAttempts = bearer.Stats.Attempts
 		snap.BearerDuration = bearer.Stats.Duration
 		usage = bearerUsage(bearer)

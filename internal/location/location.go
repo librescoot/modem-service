@@ -168,6 +168,7 @@ type Service struct {
 	monitorDone      chan struct{}
 	monitoringActive atomic.Bool
 	beforeConfigure  func()
+	sendATCommandFn  func(context.Context, string) (string, error)
 
 	rolloverLogged sync.Once // Logs GPS week-rollover correction at most once per session
 }
@@ -543,6 +544,9 @@ func (s *Service) sendATCommand(ctx context.Context, command string, logResponse
 		return "", err
 	}
 	send := func() (string, error) {
+		if s.sendATCommandFn != nil {
+			return s.sendATCommandFn(ctx, command)
+		}
 		return s.MMClient.SendCommandContext(ctx, s.ModemPath, command, 10*time.Second)
 	}
 
