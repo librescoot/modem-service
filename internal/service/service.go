@@ -658,6 +658,13 @@ func (s *Service) stopSMSWatch() {
 }
 
 // startSMSWatch replaces the active watcher and drains stored messages.
+func (s *Service) durableContext(fallback context.Context) context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return fallback
+}
+
 func (s *Service) startSMSWatch(ctx context.Context) {
 	s.smsWatchMu.Lock()
 	defer s.smsWatchMu.Unlock()
@@ -1044,7 +1051,7 @@ func (s *Service) refreshSGsViaCFUN4(ctx context.Context) bool {
 		s.Logger.Printf("sms: SGs refresh: modem gone after CFUN cycle: %v", err)
 		return false
 	}
-	s.startSMSWatch(ctx)
+	s.startSMSWatch(s.durableContext(ctx))
 	s.Logger.Printf("sms: SGs refresh complete (CFUN=4/1 fly-mode cycle)")
 	return true
 }
@@ -1093,7 +1100,7 @@ func (s *Service) refreshSGsViaRadioCycle(ctx context.Context) {
 	// Re-arm rather than just reconfigure: the Enable cycle can rebind the
 	// modem's D-Bus path, and startSMSWatch also resets the CS idle clock so
 	// the watchdog doesn't immediately fire another refresh.
-	s.startSMSWatch(ctx)
+	s.startSMSWatch(s.durableContext(ctx))
 	s.Logger.Printf("sms: SGs refresh complete (radio cycle)")
 }
 
@@ -1197,7 +1204,7 @@ func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
 
 	// The modem's D-Bus path can change across a reset; re-arm the inbound-SMS
 	// watch on the new path (and drain anything that queued meanwhile).
-	s.startSMSWatch(ctx)
+	s.startSMSWatch(s.durableContext(ctx))
 }
 
 func (s *Service) checkHealth(ctx context.Context) error {
@@ -1243,6 +1250,8 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 		s.Logger.Printf("Max recovery attempts reached, entering %s state", s.Health.State)
 		select {
 		case <-recoveryCtx.Done():
+			s.Health.MarkNormal()
+			s.publishHealthState(ctx)
 			return recoveryCtx.Err()
 		case <-time.After(2 * time.Minute):
 		}
@@ -2361,12 +2370,12 @@ func (s *Service) monitorStatus(ctx context.Context) {
 			close(done)
 		case <-s.modemStateChange:
 			targetEnabled := s.modemEnabled.Load()
-			if targetEnabled == appliedModemEnabled {
-				continue
-			}
 			if !targetEnabled {
 				appliedModemEnabled = false
 				s.disableModem(ctx)
+				continue
+			}
+			if appliedModemEnabled {
 				continue
 			}
 			opCtx, finish := s.startModemOperation(ctx)

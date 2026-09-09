@@ -17,6 +17,27 @@ import (
 	"modem-service/internal/modem"
 )
 
+func TestDurableContextOutlivesOperation(t *testing.T) {
+	serviceCtx, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	opCtx, cancelOp := context.WithCancel(context.Background())
+	s := &Service{ctx: serviceCtx}
+
+	got := s.durableContext(opCtx)
+	cancelOp()
+	select {
+	case <-got.Done():
+		t.Fatal("durable context was cancelled with operation context")
+	default:
+	}
+	cancelService()
+	select {
+	case <-got.Done():
+	default:
+		t.Fatal("durable context ignored service shutdown")
+	}
+}
+
 func TestDisableCommandCancelsModemOperation(t *testing.T) {
 	s := &Service{
 		Logger:           log.New(io.Discard, "", 0),
