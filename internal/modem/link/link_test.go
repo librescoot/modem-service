@@ -19,6 +19,7 @@ func healthy() Snapshot {
 		BearerSuspended:      false,
 		BearerSuspendedKnown: true,
 		BearerInterface:      "wwan0",
+		BearerIPKnown:        true,
 		BearerIP:             "10.64.13.241",
 		BearerStatsKnown:     true,
 		BearerAttempts:       1,
@@ -119,6 +120,8 @@ func TestUnknownFieldsDoNotFail(t *testing.T) {
 	s.PrimaryPortKnown = false
 	s.BearerConnectedKnown = false
 	s.BearerSuspendedKnown = false
+	s.BearerIPKnown = false
+	s.BearerIP = ""
 	s.CarrierKnown = false
 	s.DefaultRouteKnown = false
 	if got := New().Assess(s); !got.Healthy {

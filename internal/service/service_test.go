@@ -17,6 +17,78 @@ import (
 	"modem-service/internal/modem"
 )
 
+func TestRecoveryBackoffCancellationReturnsToNormal(t *testing.T) {
+	s := &Service{Health: health.New()}
+	s.Health.RecoveryAttempts = health.MaxRecoveryAttempts
+	s.Health.MarkRecoveryFailed()
+	var published string
+	s.publishFn = func(key, value string) error {
+		if key == "modem-health" {
+			published = value
+		}
+		return nil
+	}
+	s.recoveryBackoffFn = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.completeRecoveryBackoff(context.Background(), ctx); err != context.Canceled {
+		t.Fatalf("backoff error = %v", err)
+	}
+	if s.Health.State != health.StateNormal || s.Health.RecoveryAttempts != 0 {
+		t.Fatalf("health after cancellation = %+v", s.Health)
+	}
+	if published != health.StateNormal {
+		t.Fatalf("published health = %q", published)
+	}
+}
+
+func TestRecoveryBackoffExpiryReturnsToNormal(t *testing.T) {
+	s := &Service{Health: health.New()}
+	s.Health.RecoveryAttempts = health.MaxRecoveryAttempts
+	s.Health.MarkRecoveryFailed()
+	s.publishFn = func(string, string) error { return nil }
+	s.recoveryBackoffFn = func(context.Context) error { return nil }
+	if err := s.completeRecoveryBackoff(context.Background(), context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.Health.State != health.StateNormal || s.Health.RecoveryAttempts != 0 {
+		t.Fatalf("health after expiry = %+v", s.Health)
+	}
+}
+
+func TestSMSWatchSurvivesOperationAndStopsExplicitly(t *testing.T) {
+	serviceCtx, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	s := &Service{ctx: serviceCtx}
+	opCtx, finish := s.startModemOperation(serviceCtx)
+	watchCtx, _ := s.installSMSWatchContext(s.durableContext(opCtx))
+
+	finish()
+	select {
+	case <-watchCtx.Done():
+		t.Fatal("SMS watch stopped with completed modem operation")
+	default:
+	}
+	s.smsSIMPresent.Store(false)
+	s.stopSMSWatch()
+	select {
+	case <-watchCtx.Done():
+	default:
+		t.Fatal("explicit SMS watch stop did not cancel subscription")
+	}
+
+	shutdownWatch, _ := s.installSMSWatchContext(serviceCtx)
+	cancelService()
+	select {
+	case <-shutdownWatch.Done():
+	default:
+		t.Fatal("service shutdown did not cancel SMS subscription")
+	}
+}
+
 func TestDurableContextOutlivesOperation(t *testing.T) {
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	defer cancelService()
@@ -35,6 +107,59 @@ func TestDurableContextOutlivesOperation(t *testing.T) {
 	case <-got.Done():
 	default:
 		t.Fatal("durable context ignored service shutdown")
+	}
+}
+
+func TestRepeatedDisableRunsIdempotentCleanup(t *testing.T) {
+	calls := 0
+	s := &Service{
+		Logger:         log.New(io.Discard, "", 0),
+		disableModemFn: func(context.Context) { calls++ },
+	}
+	s.modemEnabled.Store(false)
+	applied := false
+	s.reconcileModemTarget(context.Background(), &applied)
+	s.reconcileModemTarget(context.Background(), &applied)
+	if calls != 2 {
+		t.Fatalf("disable cleanup calls = %d, want 2", calls)
+	}
+}
+
+func TestCancelledEnableStillRunsDisableCleanup(t *testing.T) {
+	started := make(chan struct{})
+	disabled := make(chan struct{}, 1)
+	s := &Service{
+		Logger:           log.New(io.Discard, "", 0),
+		modemStateChange: make(chan struct{}, 1),
+		ensureModemEnabledFn: func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		disableModemFn: func(context.Context) { disabled <- struct{}{} },
+	}
+	s.modemEnabled.Store(true)
+	applied := false
+	done := make(chan struct{})
+	go func() {
+		s.reconcileModemTarget(context.Background(), &applied)
+		close(done)
+	}()
+	<-started
+
+	if err := s.handleModemCommand("disable"); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	<-s.modemStateChange
+	s.reconcileModemTarget(context.Background(), &applied)
+	select {
+	case <-disabled:
+	default:
+		t.Fatal("cancelled enable suppressed disable cleanup")
+	}
+	if applied {
+		t.Fatal("cancelled enable remained applied")
 	}
 }
 

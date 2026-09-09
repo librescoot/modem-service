@@ -99,7 +99,9 @@ func (c *Client) GetBearerInfo(bearerPath dbus.ObjectPath) (BearerInfo, error) {
 	if v, err := c.GetProperty(bearerPath, BearerInterface, "Stats"); err == nil {
 		if m, ok := v.Value().(map[string]dbus.Variant); ok {
 			info.Stats = parseBearerStats(m)
-			info.StatsKnown = true
+			_, rxOK := variantUintOK(m["rx-bytes"])
+			_, txOK := variantUintOK(m["tx-bytes"])
+			info.StatsKnown = rxOK && txOK
 		}
 	}
 	return info, nil
@@ -205,21 +207,26 @@ func parseBearerStats(m map[string]dbus.Variant) BearerStats {
 // variantUint reads an unsigned integer out of a variant regardless of the
 // width ModemManager chose for it.
 func variantUint(v dbus.Variant) uint64 {
+	n, _ := variantUintOK(v)
+	return n
+}
+
+func variantUintOK(v dbus.Variant) (uint64, bool) {
 	switch n := v.Value().(type) {
 	case uint64:
-		return n
+		return n, true
 	case uint32:
-		return uint64(n)
+		return uint64(n), true
 	case uint16:
-		return uint64(n)
+		return uint64(n), true
 	case int64:
-		if n > 0 {
-			return uint64(n)
+		if n >= 0 {
+			return uint64(n), true
 		}
 	case int32:
-		if n > 0 {
-			return uint64(n)
+		if n >= 0 {
+			return uint64(n), true
 		}
 	}
-	return 0
+	return 0, false
 }

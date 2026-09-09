@@ -336,7 +336,7 @@ func TestPersistentFlapEventuallyRemediates(t *testing.T) {
 		ModemPresent: true, PrimaryPortKnown: true, PrimaryPortOK: true, PowerState: "on",
 		Registration: "roaming", PacketService: "attached",
 		BearerKnown: true, BearerConnected: true, BearerConnectedKnown: true,
-		BearerSuspendedKnown: true, BearerInterface: "wwan0", BearerIP: "10.64.13.241",
+		BearerSuspendedKnown: true, BearerInterface: "wwan0", BearerIPKnown: true, BearerIP: "10.64.13.241",
 		CarrierKnown: true, Carrier: true, NetdevIP: "10.64.13.241",
 		DefaultRouteKnown: true, HasDefaultRoute: true,
 		BearerStatsKnown: true, BearerAttempts: 1, BearerDuration: 1200,

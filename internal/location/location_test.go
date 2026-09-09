@@ -1,6 +1,7 @@
 package location
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -21,6 +22,68 @@ func TestEnsureModemPathResolvesEmptyPath(t *testing.T) {
 	}
 	if s.ModemPath != "/Modem/1" {
 		t.Fatalf("modem path = %q", s.ModemPath)
+	}
+}
+
+func TestCloseJoinsBlockedMonitor(t *testing.T) {
+	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.beforeConfigure = func() {
+		close(entered)
+		<-release
+	}
+	if err := s.EnableGPS(dbus.ObjectPath("/Modem/1")); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	modeCtx, cancelMode := s.modeContext(context.Background())
+	defer cancelMode()
+	closed := make(chan struct{})
+	go func() {
+		s.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned before blocked monitor could exit")
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case <-modeCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel mode-change context")
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not join monitor after it unblocked")
+	}
+}
+
+func TestConcurrentEnableCloseHandoff(t *testing.T) {
+	s := NewService(log.New(io.Discard, "", 0), "", nil, "")
+	for i := 0; i < 50; i++ {
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		go func() {
+			<-start
+			_ = s.EnableGPS(dbus.ObjectPath("/Modem/1"))
+			done <- struct{}{}
+		}()
+		go func() {
+			<-start
+			s.Close()
+			done <- struct{}{}
+		}()
+		close(start)
+		<-done
+		<-done
+		s.Close()
+		if s.IsEnabled() {
+			t.Fatal("GPS monitor remained active after concurrent handoff")
+		}
 	}
 }
 

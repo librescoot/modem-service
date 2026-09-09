@@ -142,13 +142,16 @@ type Service struct {
 	lastCellTower       *cell.CellTower
 	lastCellLoc         *cell.CellLocation
 
-	modemEnabled      atomic.Bool
-	modemStateChange  chan struct{}
-	smsRefreshRequest chan chan struct{}
-	recoveryRunMu     sync.Mutex
-	modemOpCancelMu   sync.Mutex
-	modemOpCancel     context.CancelFunc
-	modemOpGeneration uint64
+	modemEnabled         atomic.Bool
+	modemStateChange     chan struct{}
+	smsRefreshRequest    chan chan struct{}
+	recoveryRunMu        sync.Mutex
+	modemOpCancelMu      sync.Mutex
+	modemOpCancel        context.CancelFunc
+	modemOpGeneration    uint64
+	ensureModemEnabledFn func(context.Context) error
+	disableModemFn       func(context.Context)
+	recoveryBackoffFn    func(context.Context) error
 
 	ctx context.Context
 
@@ -328,7 +331,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// Try to enable the modem if it's not present.
 	if s.modemEnabled.Load() {
 		opCtx, finish := s.startModemOperation(ctx)
-		err := s.ensureModemEnabled(opCtx)
+		err := s.runEnsureModemEnabled(opCtx)
 		finish()
 		if err != nil && s.modemEnabled.Load() {
 			s.Logger.Printf("SEVERE ERROR: Failed to ensure modem is enabled: %v", err)
@@ -418,6 +421,21 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (s *Service) runEnsureModemEnabled(ctx context.Context) error {
+	if s.ensureModemEnabledFn != nil {
+		return s.ensureModemEnabledFn(ctx)
+	}
+	return s.ensureModemEnabled(ctx)
+}
+
+func (s *Service) runDisableModem(ctx context.Context) {
+	if s.disableModemFn != nil {
+		s.disableModemFn(ctx)
+		return
+	}
+	s.disableModem(ctx)
 }
 
 func (s *Service) signalModemStateChange() {
@@ -665,6 +683,12 @@ func (s *Service) durableContext(fallback context.Context) context.Context {
 	return fallback
 }
 
+func (s *Service) installSMSWatchContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	watchCtx, cancel := context.WithCancel(ctx)
+	s.smsWatchCancel = cancel
+	return watchCtx, cancel
+}
+
 func (s *Service) startSMSWatch(ctx context.Context) {
 	s.smsWatchMu.Lock()
 	defer s.smsWatchMu.Unlock()
@@ -701,7 +725,7 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 	// already stored. Draining first would leave a race window where an inbound
 	// SMS lands after the drain but before the watch and goes unnoticed until
 	// the next message or the periodic poll.
-	watchCtx, cancel := context.WithCancel(ctx)
+	watchCtx, cancel := s.installSMSWatchContext(ctx)
 	if err := s.MMClient.WatchSMSAdded(watchCtx, modemPath, func(smsPath dbus.ObjectPath, received bool) {
 		s.Logger.Printf("sms: Added signal path=%s received=%v", smsPath, received)
 		if !received {
@@ -714,11 +738,11 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 	}); err != nil {
 		s.Logger.Printf("sms: failed to start SMS watch: %v", err)
 		cancel()
+		s.smsWatchCancel = nil
 		// Still drain once so messages already in storage aren't left behind.
 		s.drainSMS(modemPath)
 		return
 	}
-	s.smsWatchCancel = cancel
 	s.Logger.Printf("sms: watching for incoming messages on %s", modemPath)
 
 	// Make sure the modem actually tells MM about inbound SMS, and log its SMS
@@ -1248,20 +1272,30 @@ func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
 		s.Redis.RaiseFault(redisClient.FaultCodeModemRecoveryFailed,
 			fmt.Sprintf("Max recovery attempts (%d) exhausted, entering recovery-failed-wait", health.MaxRecoveryAttempts))
 		s.Logger.Printf("Max recovery attempts reached, entering %s state", s.Health.State)
-		select {
-		case <-recoveryCtx.Done():
-			s.Health.MarkNormal()
-			s.publishHealthState(ctx)
-			return recoveryCtx.Err()
-		case <-time.After(2 * time.Minute):
+		err := s.completeRecoveryBackoff(ctx, recoveryCtx)
+		if err == nil {
+			s.Logger.Printf("Recovery-failed-wait expired, will retry on next failure")
 		}
-		s.Health.MarkNormal() // clears both state and RecoveryAttempts
-		s.publishHealthState(ctx)
-		s.Logger.Printf("Recovery-failed-wait expired, will retry on next failure")
-		return nil
+		return err
 	}
 
 	return s.attemptRecovery(recoveryCtx)
+}
+
+func (s *Service) completeRecoveryBackoff(publishCtx, waitCtx context.Context) error {
+	var err error
+	if s.recoveryBackoffFn != nil {
+		err = s.recoveryBackoffFn(waitCtx)
+	} else {
+		select {
+		case <-waitCtx.Done():
+			err = waitCtx.Err()
+		case <-time.After(2 * time.Minute):
+		}
+	}
+	s.Health.MarkNormal()
+	s.publishHealthState(publishCtx)
+	return err
 }
 
 func (s *Service) attemptRecovery(ctx context.Context) error {
@@ -1390,6 +1424,9 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 }
 
 func (s *Service) publishHealthState(ctx context.Context) error {
+	if s.publishFn != nil {
+		return s.publishFn("modem-health", s.Health.State)
+	}
 	return s.Redis.PublishInternetState("modem-health", s.Health.State)
 }
 
@@ -2318,6 +2355,26 @@ func (s *Service) checkGPSHealth() error {
 	return nil
 }
 
+func (s *Service) reconcileModemTarget(ctx context.Context, applied *bool) bool {
+	if !s.modemEnabled.Load() {
+		*applied = false
+		s.runDisableModem(ctx)
+		return false
+	}
+	if *applied {
+		return false
+	}
+	opCtx, finish := s.startModemOperation(ctx)
+	err := s.runEnsureModemEnabled(opCtx)
+	finish()
+	if err != nil {
+		s.Logger.Printf("Failed to enable modem: %v", err)
+		return false
+	}
+	*applied = true
+	return true
+}
+
 func (s *Service) monitorStatus(ctx context.Context) {
 	defer close(s.monitorDone)
 	ticker := time.NewTicker(s.Config.InternetCheckTime)
@@ -2351,7 +2408,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 			s.Logger.Printf("Initial modem status check failed: %v", err)
 		}
 	} else {
-		s.disableModem(ctx)
+		s.runDisableModem(ctx)
 	}
 
 	for {
@@ -2366,23 +2423,9 @@ func (s *Service) monitorStatus(ctx context.Context) {
 			}
 			close(done)
 		case <-s.modemStateChange:
-			targetEnabled := s.modemEnabled.Load()
-			if !targetEnabled {
-				appliedModemEnabled = false
-				s.disableModem(ctx)
+			if !s.reconcileModemTarget(ctx, &appliedModemEnabled) {
 				continue
 			}
-			if appliedModemEnabled {
-				continue
-			}
-			opCtx, finish := s.startModemOperation(ctx)
-			err := s.ensureModemEnabled(opCtx)
-			finish()
-			if err != nil {
-				s.Logger.Printf("Failed to enable modem: %v", err)
-				continue
-			}
-			appliedModemEnabled = true
 			if err := s.checkAndPublishModemStatus(ctx); err != nil {
 				s.Logger.Printf("Post-enable modem status check failed: %v", err)
 			}

@@ -111,6 +111,7 @@ func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) (link.Sn
 		snap.BearerSuspended = bearer.Suspended
 		snap.BearerSuspendedKnown = bearer.SuspendedKnown
 		snap.BearerInterface = bearer.Interface
+		snap.BearerIPKnown = bearer.IP4Known
 		snap.BearerIP = normalizeAddr(bearer.IP4.Address)
 		snap.BearerStatsKnown = bearer.StatsKnown
 		snap.BearerAttempts = bearer.Stats.Attempts

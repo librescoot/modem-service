@@ -112,6 +112,7 @@ type Snapshot struct {
 	BearerSuspended      bool
 	BearerSuspendedKnown bool
 	BearerInterface      string
+	BearerIPKnown        bool
 	BearerIP             string
 	BearerStatsKnown     bool
 	BearerAttempts       uint32
@@ -251,7 +252,7 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 	if s.BearerKnown && s.BearerSuspendedKnown && s.BearerSuspended {
 		return fail(LayerBearer, RemedyBearerBounce, "bearer suspended")
 	}
-	if s.BearerKnown && s.BearerConnected && s.BearerIP == "" {
+	if s.BearerKnown && s.BearerConnected && s.BearerIPKnown && s.BearerIP == "" {
 		return fail(LayerBearer, RemedyBearerBounce, "bearer has no address")
 	}
 	if s.ATChecked {
@@ -271,7 +272,7 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 	if s.DefaultRouteKnown && !s.HasDefaultRoute {
 		return fail(LayerNetdev, RemedyBearerBounce, "no default route via %s", s.BearerInterface)
 	}
-	if s.NetdevIP != "" && s.NetdevIP != s.BearerIP {
+	if s.BearerIPKnown && s.NetdevIP != "" && s.NetdevIP != s.BearerIP {
 		return fail(LayerNetdev, RemedyBearerBounce,
 			"interface address %s disagrees with bearer address %s", s.NetdevIP, s.BearerIP)
 	}

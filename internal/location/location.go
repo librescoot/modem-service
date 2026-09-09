@@ -163,9 +163,11 @@ type Service struct {
 	currentMode GPSMode
 
 	lifecycleMu      sync.Mutex
+	monitorCtx       context.Context
 	monitorCancel    context.CancelFunc
 	monitorDone      chan struct{}
 	monitoringActive atomic.Bool
+	beforeConfigure  func()
 
 	rolloverLogged sync.Once // Logs GPS week-rollover correction at most once per session
 }
@@ -264,6 +266,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 	s.configMutex.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	s.monitorCtx = ctx
 	s.monitorCancel = cancel
 	s.monitorDone = done
 	s.monitoringActive.Store(true)
@@ -284,6 +287,9 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 			}
 
 			if s.GpsdConn == nil {
+				if s.beforeConfigure != nil {
+					s.beforeConfigure()
+				}
 				s.configMutex.Lock()
 				// Double-check after acquiring lock (another goroutine might have configured it)
 				if s.GpsdConn == nil {
@@ -719,7 +725,24 @@ func (s *Service) ProbeGPSMode(ctx context.Context) {
 	}
 }
 
-func (s *Service) SetGPSMode(ctx context.Context, mode GPSMode) error {
+func (s *Service) modeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	s.lifecycleMu.Lock()
+	monitorCtx := s.monitorCtx
+	s.lifecycleMu.Unlock()
+	ctx, cancel := context.WithCancel(parent)
+	if monitorCtx == nil {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(monitorCtx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (s *Service) SetGPSMode(parent context.Context, mode GPSMode) error {
+	ctx, cancel := s.modeContext(parent)
+	defer cancel()
 	s.configMutex.Lock()
 	defer s.configMutex.Unlock()
 
@@ -1118,6 +1141,7 @@ func (s *Service) Close() {
 	if s.monitorCancel != nil {
 		s.monitorCancel()
 		<-s.monitorDone
+		s.monitorCtx = nil
 		s.monitorCancel = nil
 		s.monitorDone = nil
 	}

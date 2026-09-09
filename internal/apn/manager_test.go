@@ -205,6 +205,59 @@ func TestReconcileAfterICCIDClearAwaitsUserAction(t *testing.T) {
 	}
 }
 
+func TestReconcileRepeatedSIMSwapsRequireFreshConfiguration(t *testing.T) {
+	m, _, _ := newTestManager()
+	input := Input{ICCID: "A", ModemPath: testPath, Desired: Config{APN: "a"}}
+	if got := m.Reconcile(input); got != OutcomeApplied {
+		t.Fatalf("apply A: %s", got)
+	}
+	input.ICCID = "B"
+	if got := m.Reconcile(input); got != OutcomeICCIDChangedClear {
+		t.Fatalf("swap to B: %s", got)
+	}
+	input.Desired.APN = "b"
+	if got := m.Reconcile(input); got != OutcomeApplied {
+		t.Fatalf("configure B: %s", got)
+	}
+	input.ICCID = "A"
+	if got := m.Reconcile(input); got != OutcomeICCIDChangedClear {
+		t.Fatalf("swap back to A: %s", got)
+	}
+	if got := m.Reconcile(input); got != OutcomeUnconfigured {
+		t.Fatalf("stale B config after swap to A: %s", got)
+	}
+}
+
+func TestReconcileRetriesPartialBackendFailure(t *testing.T) {
+	m, mmFake, _ := newTestManager()
+	desired := Config{APN: "internet", Username: "u", Password: "p", Auth: "pap"}
+	mmFake.atErr = io.ErrUnexpectedEOF
+	if got := m.Reconcile(Input{ICCID: "A", ModemPath: testPath, Desired: desired}); got != OutcomeError {
+		t.Fatalf("partial apply: got %s", got)
+	}
+	mmFake.atErr = nil
+	if got := m.Reconcile(Input{ICCID: "A", ModemPath: testPath, Desired: desired}); got != OutcomeApplied {
+		t.Fatalf("retry: got %s", got)
+	}
+	if len(mmFake.atCmds) != 3 {
+		t.Fatalf("AT attempts = %d, want failed command plus full retry", len(mmFake.atCmds))
+	}
+}
+
+func TestReconcileAfterManagerRestartReassertsDesiredConfig(t *testing.T) {
+	m, mmFake, nmFake := newTestManager()
+	desired := Config{APN: "internet", Auth: "pap"}
+	input := Input{ICCID: "A", ModemPath: testPath, Desired: desired}
+	if got := m.Reconcile(input); got != OutcomeApplied {
+		t.Fatalf("initial apply: %s", got)
+	}
+
+	restarted := New(mmFake, nmFake, "wwan", log.New(io.Discard, "", 0))
+	if got := restarted.Reconcile(input); got != OutcomeApplied {
+		t.Fatalf("restart reassertion: got %s want %s", got, OutcomeApplied)
+	}
+}
+
 func TestApplySendsATCommands(t *testing.T) {
 	m, mmFake, _ := newTestManager()
 	desired := Config{APN: "internet.telekom", Username: "congstar", Password: "cs", Auth: "pap"}

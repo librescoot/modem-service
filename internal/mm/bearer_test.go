@@ -6,6 +6,49 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+type testBearerProperties struct {
+	values map[string]dbus.Variant
+	failed map[string]bool
+}
+
+func (p *testBearerProperties) Get(_ string, property string) (dbus.Variant, *dbus.Error) {
+	if p.failed[property] {
+		return dbus.Variant{}, dbus.NewError("org.freedesktop.DBus.Error.Failed", []interface{}{"unavailable"})
+	}
+	return p.values[property], nil
+}
+
+func TestGetBearerInfoTracksPropertyValidity(t *testing.T) {
+	client, server, _ := privateBus(t)
+	const path = dbus.ObjectPath("/Bearer/1")
+	props := &testBearerProperties{
+		values: map[string]dbus.Variant{
+			"Suspended": dbus.MakeVariant(false),
+			"Interface": dbus.MakeVariant("wwan0"),
+			"Ip4Config": dbus.MakeVariant("wrong-type"),
+			"Stats": mapVariant(map[string]dbus.Variant{
+				"rx-bytes": dbus.MakeVariant(uint64(10)),
+			}),
+		},
+		failed: map[string]bool{"Connected": true},
+	}
+	if err := server.Export(props, path, DBusPropertiesInterface); err != nil {
+		t.Fatal(err)
+	}
+	info, err := client.GetBearerInfo(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ConnectedKnown || info.IP4Known || info.StatsKnown {
+		t.Fatalf("failed/incomplete observations marked known: %+v", info)
+	}
+	if !info.SuspendedKnown || !info.InterfaceKnown {
+		t.Fatalf("successful observations marked unknown: %+v", info)
+	}
+}
+
+func mapVariant(m map[string]dbus.Variant) dbus.Variant { return dbus.MakeVariant(m) }
+
 func TestParseIP4Config(t *testing.T) {
 	tests := []struct {
 		name string

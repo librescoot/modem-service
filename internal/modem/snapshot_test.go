@@ -189,7 +189,20 @@ func TestReadCarrier(t *testing.T) {
 }
 
 func TestReadCarrierMissingInterface(t *testing.T) {
-	if readCarrier(t.TempDir(), "nope0") {
+	root := t.TempDir()
+	if readCarrier(root, "nope0") {
 		t.Error("readCarrier() = true for a missing interface, want false")
+	}
+	if _, known := readCarrierObservation(root, "nope0"); known {
+		t.Fatal("missing carrier file marked as a known down link")
+	}
+}
+
+func TestDefaultRouteReadFailureIsUnknown(t *testing.T) {
+	old := procNetRoute
+	procNetRoute = filepath.Join(t.TempDir(), "missing-route")
+	t.Cleanup(func() { procNetRoute = old })
+	if _, known := defaultRouteObservation("wwan0"); known {
+		t.Fatal("missing route table marked as a known absent route")
 	}
 }
