@@ -35,23 +35,15 @@ import (
 // data bearer. Matches what mdb-netconfig provisions.
 const nmWWANConnection = "wwan"
 
-// Vehicle states that should trigger modem enable
 var modemOnlineStates = map[string]bool{
 	"parked":         true,
 	"ready-to-drive": true,
 }
 
-// clockSyncInterval is how often we re-feed the system clock from rollover-corrected
-// GPS time while the scooter is offline. When connectivity is available, chrony's
-// NTP pool takes over and we suppress manual settime samples to avoid competing
-// with the higher-precision source.
+// clockSyncInterval paces GPS clock samples while NTP is unavailable.
 const clockSyncInterval = 60 * time.Second
 
-// Remedy cooldowns. A persistent fault must not loop: each remedy may fire at
-// most once per window. The modem-reset window is deliberately long, since a
-// reset drops the data session and the GPS fix along with it.
-// remedyConfirmations is how many consecutive assessments must report the same
-// failing layer before any action is taken.
+// Require two identical failures so transient bring-up states do not trigger recovery.
 const remedyConfirmations = 2
 
 // Remedy cooldowns. A persistent fault must not loop: each remedy may fire at
@@ -86,19 +78,15 @@ type Service struct {
 	ownMSISDN             atomic.Value // string; own phone number for the voice-call keepalive, resolved via AT+CNUM
 	lastCSActivity        atomic.Int64 // UnixNano of last confirmed CS event (any SMS sent/received)
 	LastState             *modem.State
-	WaitingForGPSLogged   bool       // Tracks if we've already logged the waiting for GPS message
-	GPSEnabledTime        time.Time  // When GPS was first enabled
-	GPSRecoveryCount      int        // Number of GPS recovery attempts
-	LastGPSQualityLog     time.Time  // Last time GPS quality was logged
-	gpsRecoveryMutex      sync.Mutex // Prevents concurrent GPS recovery/configuration attempts
-	gpsRecoveryInProgress bool       // Tracks if GPS recovery is currently running
-	gpsRecoveryUntil      time.Time  // Protected by gpsRecoveryMutex; monitor skips EnableGPS until this passes
-	// Layered connectivity assessment. link answers "is the local stack
-	// healthy" from ModemManager and sysfs alone, and is the only thing
-	// permitted to trigger a modem action. prober answers "did anything
-	// answer", which affects only what we publish: a fleet whose APN routes
-	// through a restrictive tunnel is unreachable by design and permanently
-	// healthy, and must never be power-cycled for it.
+	WaitingForGPSLogged   bool
+	GPSEnabledTime        time.Time
+	GPSRecoveryCount      int
+	LastGPSQualityLog     time.Time
+	gpsRecoveryMutex      sync.Mutex // serializes GPS recovery and configuration
+	gpsRecoveryInProgress bool
+	gpsRecoveryUntil      time.Time // Protected by gpsRecoveryMutex; monitor skips EnableGPS until this passes
+	// Only local link assessments may trigger recovery; remote reachability
+	// can be permanently false on a restricted APN.
 	link           *link.Assessor
 	prober         *health.Prober
 	wantATCheck    bool
@@ -108,31 +96,24 @@ type Service struct {
 	lastProbe      health.Result
 	lastAssessment link.Assessment
 
-	// Change-gating for the additive diagnostic fields.
 	lastReachability string
 	lastLinkLayer    string
 
-	// Cellular byte accounting. The counter owns its own persistence; the
-	// service only decides when to publish and when to ask it to write.
 	Usage        *datausage.Counter
 	lastPubUsage datausage.Totals
 	havePubUsage bool
 
-	// Debounce: how many consecutive assessments have reported this same
-	// failing layer. Layers 0-6 act on a single observation otherwise, and a
-	// snapshot taken mid-bringup would bounce a connection that was already
-	// coming up.
+	// Consecutive matching failures debounce snapshots taken during bring-up.
 	pendingLayer  link.Layer
 	pendingRepeat int
 
-	// Injection seams for tests.
 	applyRemedyFn  func(link.Remedy)
 	publishFn      func(field, value string) error
 	publishModemFn func(field, value string) error
 	publishUsageFn func(map[string]interface{}) error
 	now            func() time.Time
 
-	lastClockSync  time.Time // Last time syncClockFromGPS successfully fed chrony
+	lastClockSync  time.Time
 	gpsFaultActive atomic.Bool
 
 	// Settings (from Redis) — atomic so the Redis watcher goroutine can
@@ -161,28 +142,17 @@ type Service struct {
 
 	ctx context.Context
 
-	// Connectivity classifier derives online/searching/offline/no-sim from
-	// raw modem state with hysteresis to avoid thrashing on coverage flickers.
 	connClassifier *connectivity.Classifier
 	lastPubConn    connectivity.State // last value published to Redis
 
-	// TTFF measurement. ttffStart is the moment we went from "no fix" to
-	// "actively searching". Mode is read at fix time rather than wait-start,
-	// because startup paths sometimes don't know the real modem mode until
-	// ProbeGPSMode has run — capturing at wait-start gave misleading labels.
+	// Mode is sampled at fix time because startup probing may change it.
 	ttffStart time.Time
 
-	// lastPubGPSMode is the last value of gps.mode published to Redis.
-	// Guarded by modePubMu because requestGPSModeForConnectivity can spawn
-	// overlapping goroutines on rapid connectivity changes.
+	// modePubMu protects publication from overlapping mode-change goroutines.
 	modePubMu      sync.Mutex
 	lastPubGPSMode location.GPSMode
 
-	// monitorDone is closed by monitorStatus when it returns, so Run() can
-	// wait for it before closing MMClient/Modem/Redis. Prevents the "D-Bus
-	// call fails mid-shutdown" noise where the monitor goroutine is in the
-	// middle of an AT command when its transport gets closed out from under
-	// it.
+	// monitorDone prevents transports closing during an in-flight monitor call.
 	monitorDone chan struct{}
 }
 
@@ -192,14 +162,13 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		return nil, fmt.Errorf("failed to create Redis client: %v", err)
 	}
 
-	// Create ModemManager D-Bus client
 	mmClient, err := mm.NewClient(cfg.Debug, logger.Printf)
 	if err != nil {
 		redis.Close()
 		return nil, fmt.Errorf("failed to create ModemManager client: %v", err)
 	}
 
-	// Create modem manager, sharing the same D-Bus client.
+	// The service owns the D-Bus client shared with the modem manager.
 	modemMgr, err := modem.NewManager(mmClient, logger)
 	if err != nil {
 		mmClient.Close()
@@ -264,12 +233,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	s.Redis.ClearFault(redisClient.FaultCodeGPSUnavailable)
 
-	// Start listening for modem enable/disable commands from pm-service
 	if err := s.Redis.StartModemCommandHandler(s.handleModemCommand); err != nil {
 		s.Logger.Printf("Failed to start modem command handler: %v", err)
 	}
 
-	// Start listening for outbound SMS requests
 	if err := s.Redis.StartSMSCommandHandler(s.handleSMSCommand); err != nil {
 		s.Logger.Printf("Failed to start SMS command handler: %v", err)
 	}
@@ -277,12 +244,10 @@ func (s *Service) Run(ctx context.Context) error {
 	// crash doesn't persist in Redis indefinitely.
 	s.Redis.PublishSMSState("state", "idle")
 
-	// Start watching vehicle state to auto-enable modem
 	if err := s.Redis.StartVehicleStateWatcher(s.handleVehicleState); err != nil {
 		s.Logger.Printf("Failed to start vehicle state watcher: %v", err)
 	}
 
-	// Watch location settings
 	s.Redis.StartSettingsWatcher("modem.gps", func(value string) error {
 		enabled := value != "false"
 		s.gpsEnabled.Store(enabled)
@@ -334,7 +299,6 @@ func (s *Service) Run(ctx context.Context) error {
 	})
 	s.Redis.StartSettingsWatching()
 
-	// Try to enable the modem if it's not present.
 	if s.modemEnabled.Load() {
 		opCtx, finish := s.startModemOperation(ctx)
 		err := s.runEnsureModemEnabled(opCtx)
@@ -354,11 +318,8 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}
 
-	// Periodically check that the SGs CS registration at the MSC/VLR is still
-	// alive and force a fresh combined attach if it has expired (LAC=0xFFFE).
-	// Opt-in: the keepalive targets operators with a short CS implicit-detach
-	// timer (seen on O2/Lebara DE) and briefly drops to 2G for each self-call,
-	// so it must not run fleet-wide by default.
+	// Opt-in: refresh SGs before an operator's short implicit-detach timeout.
+	// Each self-call briefly drops to 2G, so this must not run fleet-wide.
 	if s.Config.SMSKeepalive {
 		s.startSMSRegistrationWatchdog(ctx)
 	} else {
@@ -380,8 +341,6 @@ func (s *Service) Run(ctx context.Context) error {
 		s.Logger.Printf("Monitor goroutine did not exit within 10s; proceeding with shutdown")
 	}
 
-	// Stop the inbound-SMS watch. It also stops when ctx is cancelled (its
-	// context is derived from ctx), but cancel explicitly for a tidy shutdown.
 	s.smsSIMPresent.Store(false)
 	s.stopSMSWatch()
 
@@ -403,22 +362,17 @@ func (s *Service) Run(ctx context.Context) error {
 		"satellites-visible": int32(0),
 	}, false)
 
-	// Persist the byte totals. The monitor goroutine has stopped by now, so
-	// this writes everything it counted.
+	// The stopped monitor can no longer race this final persistence point.
 	if err := s.Usage.Flush(); err != nil {
 		s.Logger.Printf("Failed to persist data usage: %v", err)
 	}
 
-	// Release service-owned resources. Modem.Close does not close the
-	// shared mm.Client — service owns it and closes it below.
 	if err := s.Modem.Close(); err != nil {
 		s.Logger.Printf("Error closing modem manager: %v", err)
 	}
 	if err := s.MMClient.Close(); err != nil {
 		s.Logger.Printf("Error closing ModemManager D-Bus client: %v", err)
 	}
-	// Drop the power inhibitor so a restart doesn't leave a stale entry in
-	// power:inhibits blocking suspend.
 	if err := s.Redis.RemoveModemInhibitor(); err != nil {
 		s.Logger.Printf("Error clearing modem power inhibitor: %v", err)
 	}
@@ -503,7 +457,6 @@ func (s *Service) handleModemCommand(command string) error {
 	case "enable":
 		s.Logger.Printf("Received modem enable command")
 		s.modemEnabled.Store(true)
-		// Re-arm the power inhibitor for the next suspend cycle. Idempotent.
 		if err := s.Redis.AddModemInhibitor(); err != nil {
 			s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
 		}
@@ -519,12 +472,11 @@ func (s *Service) handleModemCommand(command string) error {
 	return nil
 }
 
-// handleVehicleState handles vehicle state changes to auto-enable modem
+// handleVehicleState enables the modem in online vehicle states.
 func (s *Service) handleVehicleState(state string) error {
 	if modemOnlineStates[state] {
 		if s.modemEnabled.CompareAndSwap(false, true) {
 			s.Logger.Printf("Vehicle state '%s' - enabling modem", state)
-			// Re-arm the power inhibitor for the next suspend cycle. Idempotent.
 			if err := s.Redis.AddModemInhibitor(); err != nil {
 				s.Logger.Printf("Failed to register modem power inhibitor: %v", err)
 			}
@@ -534,7 +486,7 @@ func (s *Service) handleVehicleState(state string) error {
 	return nil
 }
 
-// disableModem turns off the modem and publishes the off state
+// disableModem powers off the modem and publishes the resulting state.
 func (s *Service) disableModem(ctx context.Context) {
 	s.Logger.Printf("Disabling modem...")
 
@@ -557,7 +509,6 @@ func (s *Service) disableModem(ctx context.Context) {
 		"satellites-visible": int32(0),
 	}, false)
 
-	// Publish off states
 	publishInternet := s.publishFn
 	if publishInternet == nil {
 		publishInternet = s.Redis.PublishInternetState
@@ -577,40 +528,24 @@ func (s *Service) disableModem(ctx context.Context) {
 	s.connClassifier.Force(connectivity.Disabled)
 	s.lastPubConn = connectivity.Disabled
 
-	// Keep the in-memory cache in sync with what we just wrote to Redis.
-	// publishModemState() only writes a field when it differs from LastState,
-	// so if we leave LastState holding the pre-disable values (e.g. "connected")
-	// the monitor loop will treat the post-resume reconnection as "no change"
-	// and never re-publish "connected"/the real modem-state — leaving the UI
-	// stuck on the disconnected icon after the modem comes back. Syncing here
-	// ensures the recovery transition is detected and re-published.
+	// Match the publication cache to Redis so resume changes are not suppressed.
 	s.LastState.Status = "disconnected"
 	s.LastState.LastRawModemStatus = "off"
 	s.LastState.PowerState = "off"
 
-	// Clear the clock-sync bookkeeping so the first GPS fix after resume
-	// bootstraps the system clock again. While suspended the system clock can
-	// drift (no NTP, RTC may be imprecise), and without this reset the
-	// IsZero() bootstrap branch in the monitor loop wouldn't re-fire — leaving
-	// an online device to wait for chrony/NTP and an offline device to wait up
-	// to a full clockSyncInterval before correcting.
+	// Force the first post-resume fix to bootstrap the potentially drifted clock.
 	s.lastClockSync = time.Time{}
 
 	if err := s.powerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
 	}
 
-	// The modem is off, so the totals are final for this power cycle. This is
-	// the intended write point: pm-service disables the modem before every
-	// suspend, hibernate and poweroff, and it happens while we still hold the
-	// inhibitor, so the write lands before the system goes down.
+	// Persist before releasing the inhibitor that permits suspend.
 	if err := s.Usage.Flush(); err != nil {
 		s.Logger.Printf("Failed to persist data usage: %v", err)
 	}
 
-	// Modem is off: drop the power inhibitor so pm-service can proceed to
-	// suspend. Released here (after PowerOffModem) so suspend can't race the
-	// modem still being powered.
+	// Release only after power-off so suspend cannot race the modem.
 	if err := s.removeModemInhibitor(); err != nil {
 		s.Logger.Printf("Failed to clear modem power inhibitor: %v", err)
 	}
@@ -710,7 +645,6 @@ func (s *Service) stopSMSWatch() {
 	}
 }
 
-// startSMSWatch replaces the active watcher and drains stored messages.
 func (s *Service) durableContext(fallback context.Context) context.Context {
 	if s.ctx != nil {
 		return s.ctx
@@ -724,7 +658,7 @@ func (s *Service) installSMSWatchContext(ctx context.Context) (context.Context, 
 	return watchCtx, cancel
 }
 
-// Process Added objects directly because transient messages may never reach storage.
+// armSMSAddedWatch processes Added objects directly because some never reach storage.
 func (s *Service) armSMSAddedWatch(ctx context.Context, modemPath dbus.ObjectPath) error {
 	watchCtx, cancel := s.installSMSWatchContext(s.durableContext(ctx))
 	watch := s.watchSMSAddedFn
@@ -776,7 +710,6 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 		return
 	}
 
-	// Resolve own MSISDN once so the voice-call keepalive knows what number to dial.
 	if s.ownNumber() == "" {
 		if msisdn := s.queryOwnMSISDN(modemPath); msisdn != "" {
 			s.ownMSISDN.Store(msisdn)
@@ -791,30 +724,18 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 	// the next message or the periodic poll.
 	if err := s.armSMSAddedWatch(ctx, modemPath); err != nil {
 		s.Logger.Printf("sms: failed to start SMS watch: %v", err)
-		// Still drain once so messages already in storage aren't left behind.
 		s.drainSMS(modemPath)
 		return
 	}
 	s.Logger.Printf("sms: watching for incoming messages on %s", modemPath)
 
-	// Make sure the modem actually tells MM about inbound SMS, and log its SMS
-	// config/storage for diagnosis.
 	s.configureAndDiagnoseSMS(modemPath)
 
-	// Pick up anything already in storage (received while offline, or before
-	// this (re-)arm).
 	s.drainSMS(modemPath)
 }
 
-// configureAndDiagnoseSMS enables new-message indications on the modem and logs
-// its SMS configuration and stored messages. On some modems ModemManager is
-// never told about inbound SMS unless AT+CNMI is set so the modem emits +CMTI on
-// receipt; we set it here (best-effort, via MM's command interface — the same
-// path the APN code uses). The logged AT+CMGL dump shows, from the journal
-// alone, whether inbound messages are landing in the modem's AT-readable store,
-// which tells us how to finish wiring up receive if MM still doesn't surface
-// them. Every command is best-effort: if MM restricts Modem.Command the errors
-// are logged and nothing else is affected.
+// configureAndDiagnoseSMS best-effort enables +CMTI indications required by
+// modems that otherwise do not expose inbound SMS to ModemManager.
 func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
 	if v, err := s.MMClient.GetProperty(modemPath, mm.ModemMessagingInterface, "DefaultStorage"); err == nil {
 		s.Logger.Printf("sms: MM default-storage=%v", v.Value())
@@ -823,14 +744,12 @@ func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
 		s.Logger.Printf("sms: MM supported-storages=%v", v.Value())
 	}
 
-	// Enable new-message indications so the modem notifies MM of inbound SMS.
 	if _, err := s.MMClient.SendCommand(modemPath, "AT+CNMI=2,1,0,0,0", 5*time.Second); err != nil {
 		s.Logger.Printf("sms: enabling new-message indications (CNMI) failed: %v", err)
 	} else {
 		s.Logger.Printf("sms: enabled new-message indications (AT+CNMI=2,1,0,0,0)")
 	}
 
-	// Diagnostics: current indication/storage config.
 	for _, q := range []string{"AT+CPMS?", "AT+CNMI?"} {
 		if resp, err := s.MMClient.SendCommand(modemPath, q, 5*time.Second); err == nil {
 			s.Logger.Printf("sms: %s -> %s", q, strings.TrimSpace(resp))
@@ -853,7 +772,6 @@ func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
 	}
 }
 
-// drainSMS delivers every inbound message currently in modem storage.
 func (s *Service) drainSMS(modemPath dbus.ObjectPath) {
 	if err := s.SMS.DrainReceived(modemPath); err != nil {
 		s.Logger.Printf("sms: drain failed: %v", err)
@@ -975,34 +893,11 @@ func (s *Service) refreshSGsViaVoiceCall(ctx context.Context) bool {
 	return true
 }
 
-// startSMSRegistrationWatchdog keeps the SGs association at the MSC/VLR alive
-// so that SMS delivery works indefinitely on LTE.
-//
-// On LTE with CEMODE=2 the modem does a combined EPS+IMSI Attach at boot,
-// registering with both the LTE core (PS) and the MSC/VLR via SGs (CS). That
-// SGs association is the path through which the MSC pages the UE for incoming
-// SMS. O2/Lebara DE's MSC runs a ~15-minute implicit detach timer and silently
-// drops the SGs record; the modem is never notified.
-//
-// The watchdog polls every minute and sends a keepalive only if no CS event
-// has been observed in the last 13 minutes (2-minute margin before the 15-min
-// timer expires). Any real incoming SMS counts as a CS event and resets the
-// idle clock, so active scooters that receive fleet SMS regularly pay nothing.
-//
-// Primary keepalive — refreshSGsViaVoiceCall: place a brief MO call to own
-// number. The call setup sends Extended Service Request (MO_CS_FB) to the MME
-// via NAS; MME forwards SGsAP-SERVICE-REQUEST to the MSC, resetting the timer.
-// Modem does CSFB to EDGE for ~2 s then returns to LTE. IP unchanged, free.
-//
-// Fallback — refreshSGsViaCFUN4: if both above fail (SGs already expired),
-// AT+CFUN=4/1 forces a fresh Combined Attach (~6 s SMS downtime, ~29 s
-// internet downtime). On this hardware CFUN=4 clears NAS context so CFUN=1
-// always triggers a full Combined Attach rather than a lightweight TAU.
-//
-// Last resort — refreshSGsViaRadioCycle: MM Enable(false→true), same outcome.
+// startSMSRegistrationWatchdog refreshes the SGs association before the
+// operator's silent 15-minute implicit detach. CS activity resets the clock;
+// recovery escalates from a free self-call to CFUN and radio cycles.
 func (s *Service) startSMSRegistrationWatchdog(ctx context.Context) {
-	// SGs was just established by the Combined Attach at boot; start the idle
-	// clock from now so we don't fire a redundant keepalive immediately.
+	// Boot's combined attach established SGs now.
 	s.touchCSActivity()
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
@@ -1207,7 +1102,6 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 
 	s.Logger.Printf("Modem not detected, will attempt to enable via GPIO")
 
-	// Try multiple times with increasing wait times
 	for attempt := range health.MaxRecoveryAttempts {
 		waitTime := min(time.Duration(60*(attempt+1))*time.Second, 300*time.Second)
 
@@ -1232,15 +1126,12 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			// Continue to next attempt
 		}
 	}
 
-	// If we get here, all attempts failed
 	s.Logger.Printf("SEVERE ERROR: Modem failed to come up after %d attempts with up to 5 minute wait times",
 		health.MaxRecoveryAttempts)
 
-	// Mark modem as potentially defective in Redis
 	s.Health.State = health.StatePermanentFailure
 	s.publishHealthState(ctx)
 
@@ -1284,7 +1175,6 @@ func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
 }
 
 func (s *Service) checkHealth(ctx context.Context) error {
-	// Skip health check if we're in a terminal state
 	if s.Health.IsTerminal() {
 		return fmt.Errorf("modem in terminal state: %s", s.Health.State)
 	}
@@ -1393,7 +1283,6 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		}
 	}
 
-	// Strategy 1: D-Bus reset.
 	_, err := s.Modem.FindModem()
 	if err == nil {
 		s.Logger.Printf("Attempting to reset the modem via D-Bus")
@@ -1417,7 +1306,6 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		return err
 	}
 
-	// Strategy 2: Try USB unbind/bind recovery
 	s.Logger.Printf("Attempting USB recovery (unbind/bind)...")
 	if err := s.Modem.RecoverUSB(); err != nil {
 		if errors.Is(err, usb.ErrDeviceNotPresent) && !stabilizationWaited {
@@ -1447,7 +1335,6 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		return err
 	}
 
-	// Strategy 3: Try hardware reset via GPIO
 	s.Logger.Printf("Attempting modem restart (GPIO with D-Bus fallback)...")
 	if err := s.Modem.RestartModem(ctx); err != nil {
 		s.Logger.Printf("GPIO restart failed: %v", err)
@@ -1466,7 +1353,6 @@ func (s *Service) attemptRecovery(ctx context.Context) error {
 		return err
 	}
 
-	// Strategy 4: Just wait longer and hope the modem recovers
 	s.Logger.Printf("Hardware recovery uncertain, waiting additional time for modem to stabilize...")
 	select {
 	case <-ctx.Done():
@@ -1527,9 +1413,7 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 		return nil
 	}
 
-	// Acquire lock to prevent concurrent GPS recovery attempts
 	s.gpsRecoveryMutex.Lock()
-	// Check if recovery is already in progress
 	if s.gpsRecoveryInProgress {
 		s.gpsRecoveryMutex.Unlock()
 		s.Logger.Printf("GPS recovery already in progress, skipping duplicate attempt")
@@ -1552,13 +1436,11 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 		s.Logger.Printf("GPS recovery attempted %d times, performing full reset with longer break", s.GPSRecoveryCount)
 		s.GPSRecoveryCount = 0
 
-		// Stop gpsd and close GPS connection
 		if err := s.Location.StopGPSD(); err != nil {
 			s.Logger.Printf("Warning: Failed to stop gpsd: %v", err)
 		}
 		s.Location.Close()
 
-		// Reset state tracking
 		s.GPSEnabledTime = time.Time{}
 		s.WaitingForGPSLogged = false
 		s.Location.SetLastDataReceived(time.Time{})
@@ -1571,11 +1453,9 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 		return nil
 	}
 
-	// Stop gpsd before performing GPS-related modem reset
 	s.Logger.Printf("Stopping gpsd service before GPS reset...")
 	if err := s.Location.StopGPSD(); err != nil {
 		s.Logger.Printf("Warning: Failed to stop gpsd: %v", err)
-		// Continue with recovery even if gpsd stop fails
 	}
 
 	// Close existing GPS connection; gate the monitor for 2 seconds so
@@ -1585,7 +1465,6 @@ func (s *Service) attemptGPSRecovery(trigger error) error {
 	s.gpsRecoveryUntil = time.Now().Add(2 * time.Second)
 	s.gpsRecoveryMutex.Unlock()
 
-	// Reset GPS state tracking
 	s.GPSEnabledTime = time.Time{}
 	s.WaitingForGPSLogged = false
 	s.Location.SetLastDataReceived(time.Time{})
@@ -1626,34 +1505,13 @@ func (s *Service) withGPSLifecycleLock(fn func()) {
 	fn()
 }
 
-// UE-Based mode is disabled for now. In the field (2026-04-15) we observed a
-// fleet scooter on Telefónica DE hang for 180 s in UE-Based after a switch,
-// with no NMEA timestamp updates, until the stuck-timestamp recovery path
-// fired. The stall overlapped with the user unlocking and starting to ride.
-// Until we can verify UE-Based is reliable across carriers and firmware (and
-// given XTRA is broken on SIM7100E), stay in standalone always. The
-// classifier + plumbing are kept so flipping this back on is one constant.
-//
-// Re-tested 2026-05-13 on deep-blue (O2 DE, MCC-MNC 26203):
-//   - Tried supl.storo.cloud:7276 and (per past testing) supl.google.com:7276.
-//     Both: TCP reachable, modem accepts CGPSURL, enters CGPS=1,2 cleanly,
-//     then produces no NMEA / no fix until the CGPSMSB=1 fallback finally
-//     drops to standalone after ~10 minutes. SUPL is dead on this firmware
-//     regardless of server.
-//   - Tried re-enabling XTRA (AT+CGPSXE=1, AT+CGPSXDAUTO=1). Chip emits
-//     "+CGPSXD: 2" ("Assistant file check error" per SIMCom AT manual
-//     V1.01 §19.20) on every attempt. Verified the host can fetch the
-//     same xtra2.bin from xtrapath1.izatcloud.net via the modem
-//     interface (HTTP 200, 34 KB), and chip clock is correct
-//     (CTZU=1 → NITZ-synced). HTP time
-//     sync (AT+CHTPSERV/CHTPUPDATE) makes no difference; the chip rejects
-//     the file. Most plausible cause: Qualcomm rotated XTRA signing keys
-//     post-2018, SIM7100E firmware has the old root in ROM. Not fixable
-//     from outside the modem firmware.
+// UE-based GPS is disabled because this firmware accepts SUPL configuration
+// but then emits no NMEA data or fix for about ten minutes. XTRA assistance
+// also fails in the receiver, so standalone is the reliable live invariant.
 const enableUEBasedMode = false
 
 func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connectivity.State) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || !s.Location.ReadyForModeSwitch() {
 		return
 	}
 	var desired location.GPSMode
@@ -1674,7 +1532,6 @@ func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connec
 	s.publishGPSMode()
 }
 
-// publishGPSMode updates the gps.mode Redis field if the current mode changed.
 func (s *Service) publishGPSMode() {
 	mode := s.Location.CurrentGPSMode()
 
@@ -1693,8 +1550,7 @@ func (s *Service) publishGPSMode() {
 	s.lastPubGPSMode = mode
 }
 
-// publishModemState publishes the detailed modem and derived internet state to Redis.
-// It now takes the determined internetStatus as an argument.
+// publishModemState publishes modem details and derived internet state.
 func (s *Service) publishModemState(ctx context.Context, currentState *modem.State, internetStatus string) error {
 	publishInternet := s.publishFn
 	if publishInternet == nil {
@@ -1704,10 +1560,8 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 	if publishModem == nil {
 		publishModem = s.Redis.PublishModemState
 	}
-	// Track which fields changed for consolidated logging
 	var internetChanges, modemChanges []string
 
-	// Publish internet state fields
 	if s.LastState.Status != internetStatus {
 		if err := publishInternet("status", internetStatus); err != nil {
 			return err
@@ -1772,7 +1626,6 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		s.LastState.ICCID = currentState.ICCID
 	}
 
-	// Publish modem state fields
 	if s.LastState.PowerState != currentState.PowerState {
 		if err := publishModem("power-state", currentState.PowerState); err != nil {
 			return err
@@ -1877,7 +1730,6 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		s.requestGPSModeForConnectivity(ctx, conn)
 	}
 
-	// Log consolidated changes
 	if len(internetChanges) > 0 {
 		s.Logger.Printf("internet %s", strings.Join(internetChanges, " "))
 	}
@@ -1893,7 +1745,7 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 		"latitude":  fmt.Sprintf("%.6f", loc.Latitude),
 		"longitude": fmt.Sprintf("%.6f", loc.Longitude),
 		"altitude":  fmt.Sprintf("%.6f", loc.Altitude),
-		"speed":     fmt.Sprintf("%.6f", loc.Speed*3.6), // Convert m/s to km/h
+		"speed":     fmt.Sprintf("%.6f", loc.Speed*3.6), // m/s to km/h
 		"course":    fmt.Sprintf("%.6f", loc.Course),
 		"timestamp": loc.Timestamp.Format(time.RFC3339),
 	}
@@ -1938,11 +1790,7 @@ func (s *Service) syncClockFromGPS(t time.Time) bool {
 	return true
 }
 
-// reachabilityField distinguishes the two ways a probe can fail. "unreachable"
-// means nothing answered while the local stack is healthy, which is the
-// correct and permanent steady state for a scooter on a restricted APN.
-// "no-path" means the local stack is broken, which is a real fault. The old
-// code could not tell these apart, and treated both as broken hardware.
+// reachabilityField separates a silent restricted APN from a broken local path.
 func reachabilityField(reachable bool, a link.Assessment) string {
 	if reachable {
 		return "ok"
@@ -1953,7 +1801,6 @@ func reachabilityField(reachable bool, a link.Assessment) string {
 	return "no-path"
 }
 
-// linkLayerField renders the assessment for the Redis diagnostic field.
 func linkLayerField(a link.Assessment) string {
 	if a.Healthy {
 		return "ok"
@@ -2004,26 +1851,15 @@ func remedyCooldownFor(r link.Remedy) time.Duration {
 	return 0
 }
 
-// handleAssessment applies the remedy for a failing layer, subject to that
-// remedy's cooldown. A healthy assessment does nothing.
-//
-// The probe result is deliberately not a parameter. Whether some destination
-// answered is not evidence about the modem, and treating it as such is the
-// defect this whole change exists to remove: one fleet's APN drops everything
-// outside its tunnel, and the old code read that as broken hardware and reset
-// a healthy modem every tick, 184 times and counting on one vehicle.
+// handleAssessment applies a cooldown-limited remedy. Remote probe results
+// are deliberately excluded because a restricted APN is not a modem fault.
 func (s *Service) handleAssessment(a link.Assessment) {
 	if a.Healthy || a.Remedy == link.RemedyNone {
 		s.pendingRepeat = 0
 		return
 	}
 
-	// Debounce. The machinery this replaced tolerated a stalled data session
-	// for 15 minutes precisely so tunnels, underground parking and handoffs
-	// did not trigger action, and acting on a single snapshot would throw that
-	// tolerance away. Requiring the same failing layer twice also covers the
-	// window right after startup and after a recovery, when NetworkManager may
-	// not have finished bringing the connection up yet.
+	// Require repeated evidence through handoffs and NetworkManager bring-up.
 	if a.FailedLayer != s.pendingLayer {
 		s.pendingLayer, s.pendingRepeat = a.FailedLayer, 1
 	} else {
@@ -2099,9 +1935,7 @@ func nextProbeInterval(cur, base, maxInterval time.Duration) time.Duration {
 	return next
 }
 
-// assignedResolvers gathers the resolvers the network handed us. No single
-// source is reliable: on an affected vehicle the ModemManager bearer read came
-// back empty while resolv.conf had them all along, so all three are consulted.
+// assignedResolvers combines all available network resolver sources.
 func (s *Service) assignedResolvers() []string {
 	return health.ResolverSources{Sources: []func() []string{
 		func() []string {
@@ -2123,7 +1957,6 @@ func (s *Service) assignedResolvers() []string {
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	if err := s.checkHealth(ctx); err != nil {
 		s.Logger.Printf("Health check failed: %v", err)
-		// If health check fails, assume disconnected and publish minimal state
 		s.publishModemState(ctx, modem.NewState(), "disconnected")
 		s.publishHealthState(ctx)
 		return err
@@ -2132,7 +1965,7 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	currentState, err := s.Modem.GetModemInfo(s.Config.Interface)
 	if err != nil {
 		s.Logger.Printf("Failed to get modem info: %v", err)
-		// Publish the state we got, even if partial, as it contains the ErrorState
+		// Preserve ErrorState from the partial snapshot.
 		s.publishModemState(ctx, currentState, "disconnected")
 		s.publishHealthState(ctx)
 		return err // Return the original error from GetModemInfo
@@ -2187,11 +2020,7 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		}
 	}
 
-	// Layers 0-7: local signals only, no destination involved. This is the
-	// only input allowed to trigger a modem action.
-	//
-	// currentState was already fetched above; pass it through rather than
-	// making LinkSnapshot repeat those D-Bus reads.
+	// Only these local layers may trigger modem action.
 	snap, usage := s.Modem.LinkSnapshot(currentState, s.Config.Interface, s.wantATCheck)
 	assessment := s.link.Assess(snap)
 	s.wantATCheck = assessment.WantATCheck
@@ -2212,30 +2041,19 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	// This only catches a unit that stays up for days without either.
 	s.Usage.Backstop()
 
-	// Layer 8: reachability. Backed off while healthy, because at a 30s
-	// interval across a fleet this is real query load on the operator's
-	// resolvers. Any change in the local assessment forces an immediate
-	// re-probe, so a genuine fault is still seen within one tick.
+	// Back off remote probes; local assessment changes still force one immediately.
 	now := s.clock()
 	assessmentChanged := assessment != s.lastAssessment
 	// Skipped when the local stack is already known broken: reachabilityField
 	// reports no-path from the assessment alone in that case, so the probe
 	// would buy nothing and can block the tick for many seconds.
 	if !assessment.Healthy {
-		// Do not carry the last good probe result across a local fault. The
-		// stack is known broken, so publishing the previous success would
-		// report status=connected on a modem whose bearer has just died,
-		// which is a worse lie than the one this change set out to remove.
+		// A prior success cannot remain valid across a known local fault.
 		s.lastProbe = health.Result{Detail: "not probed: " + linkLayerField(assessment)}
 	}
 	if assessment.Healthy && (now.After(s.nextProbeAt) || assessmentChanged) {
 		s.lastProbe = s.prober.Probe(ctx, s.assignedResolvers())
-		// Backs off on both outcomes. Resetting on failure would keep a unit
-		// whose destinations are silent probing at full rate forever, which is
-		// the fleet this change exists for, and buys nothing: a probe failure
-		// is never a fault under this design. A change in the local assessment
-		// still forces an immediate re-probe, which is what actually needs to
-		// be responsive.
+		// Failure also backs off because silence is valid on restricted APNs.
 		s.probeInterval = nextProbeInterval(s.probeInterval,
 			s.Config.InternetCheckTime, s.Config.InternetCheckMaxInterval)
 		s.nextProbeAt = now.Add(s.probeInterval)
@@ -2269,12 +2087,7 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		return err
 	}
 
-	// Additive diagnostics. status keeps its existing values so consumers are
-	// unaffected; these two carry the distinction that was previously
-	// impossible to see from Redis.
-	// Change-gated: PublishInternetState pipelines HSET + PUBLISH, so writing
-	// unconditionally would wake every subscriber of the internet channel
-	// twice per tick forever. Every other field here is gated the same way.
+	// Change-gate diagnostics to avoid waking subscribers every tick.
 	s.publishIfChanged("reachability", reachabilityField(s.lastProbe.Reachable, assessment),
 		&s.lastReachability)
 	s.publishIfChanged("link-layer", linkLayerField(assessment), &s.lastLinkLayer)
@@ -2336,7 +2149,6 @@ func (s *Service) queryCellLocation(ctx context.Context, state *modem.State) {
 		return
 	}
 
-	// Skip API call if cell tower hasn't changed and we have a cached result
 	if s.lastCellTower != nil && s.lastCellLoc != nil &&
 		tower.CellId == s.lastCellTower.CellId &&
 		tower.LocationAreaCode == s.lastCellTower.LocationAreaCode &&
@@ -2404,10 +2216,6 @@ func (s *Service) checkGPSHealth() error {
 		return fmt.Errorf("gps_no_data: no GPS stanzas received for %v", now.Sub(lastData))
 	}
 
-	// "Did we ever achieve a fix this session?" — long timeout because
-	// cold-start without SUPL is bounded below by the almanac broadcast
-	// cycle. Disarmed once a fix is established (see GPSEnabledTime
-	// reset in the monitor loop).
 	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix() && now.Sub(s.GPSEnabledTime) > gpsFixTimeout {
 		return fmt.Errorf("gps_fix_timeout: no GPS fix established for %v", now.Sub(s.GPSEnabledTime))
 	}
@@ -2532,8 +2340,6 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					continue
 				}
 
-				// Check if GPS recovery is in progress or the monitor is
-				// gated waiting for recovery to settle.
 				s.gpsRecoveryMutex.Lock()
 				recoveryInProgress := s.gpsRecoveryInProgress
 				gatedUntil := s.gpsRecoveryUntil
@@ -2551,7 +2357,6 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					s.GPSEnabledTime = time.Now()
 				}
 
-				// Check for GPS health issues and try GPS-specific recovery first
 				if err := s.checkGPSHealth(); err != nil {
 					s.Logger.Printf("GPS health check failed: %v", err)
 					if recoveryErr := s.handleGPSFailure(ctx, err); recoveryErr != nil {
@@ -2563,22 +2368,14 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					s.clearGPSFault()
 				}
 
-				// Always publish GPS status, even without valid fix
 				gpsStatus := s.Location.GetGPSStatus()
 				hasValidFix, _ := gpsStatus["active"].(bool)
 
-				// Determine if we should publish GPS recovery notification
-				// Check current internet status from LastState
 				hasInternet := s.LastState.Status == "connected"
 				publishRecovery := false
 
 				if hasValidFix {
-					// Bootstrap the system clock from GPS on the first fix of the
-					// session so it's close to right immediately, even if NTP is
-					// reachable but chrony hasn't synced yet. After bootstrap, only
-					// keep feeding chrony GPS samples while we're offline — when we
-					// have connectivity, the NTP pool is the more accurate source
-					// and we don't want manual settime samples competing with it.
+					// Bootstrap once, then use GPS only while the more accurate NTP is unavailable.
 					needsClockSync := s.lastClockSync.IsZero() ||
 						(!hasInternet && time.Since(s.lastClockSync) >= clockSyncInterval)
 					if needsClockSync {
@@ -2588,21 +2385,16 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						}
 					}
 
-					// GPS is now valid - check if this is a recovery event
 					publishRecovery = s.Location.ShouldPublishRecovery(hasInternet)
 					if publishRecovery {
-						// Clear the fresh init flag after first successful publish
 						s.Location.SetGPSFreshInit(false)
 					}
 
-					// Reset GPS lost time since we have a fix now
 					s.Location.GPSLostTime = time.Time{}
 
-					// If we were waiting (flag is true), log that we got a fix
 					if s.WaitingForGPSLogged {
 						s.Logger.Printf("GPS fix established")
 						s.WaitingForGPSLogged = false
-						// Reset recovery counter since GPS is now working
 						s.GPSRecoveryCount = 0
 						// Disarm the cold-start timeout — it only guards
 						// against "never got a fix"; the data-stale and
@@ -2630,7 +2422,6 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						}, false)
 					}
 
-					// Log GPS diagnostics every 90 seconds
 					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
 						s.Logger.Printf("gps state=%s fix=%s eph=%.1fm hdop=%.1f vdop=%.1f pdop=%.1f snr=%.1fdBHz sats=%d/%d",
 							gpsStatus["state"], gpsStatus["fix"],
@@ -2643,7 +2434,6 @@ func (s *Service) monitorStatus(ctx context.Context) {
 						s.Logger.Printf("Failed to publish location: %v", err)
 					}
 				} else {
-					// GPS fix is lost - mark the time
 					if s.Location.GPSLostTime.IsZero() {
 						s.Location.GPSLostTime = time.Now()
 					}
@@ -2651,12 +2441,10 @@ func (s *Service) monitorStatus(ctx context.Context) {
 					if !s.WaitingForGPSLogged {
 						s.Logger.Printf("Waiting for valid GPS fix...")
 						s.WaitingForGPSLogged = true
-						// Start (or re-start) the TTFF clock. Mode will be
-						// read at fix-establish time rather than here.
+						// Read mode at fix time because startup probing may still change it.
 						s.ttffStart = time.Now()
 					}
 
-					// Log GPS diagnostics every 90 seconds while searching
 					if s.LastGPSQualityLog.IsZero() || time.Since(s.LastGPSQualityLog) >= 90*time.Second {
 						s.Logger.Printf("gps state=%s fix=%s snr=%.1fdBHz sats=%d/%d",
 							gpsStatus["state"], gpsStatus["fix"],

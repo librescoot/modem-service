@@ -6,6 +6,7 @@ import (
 	"log"
 	"modem-service/internal/mm"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,18 +26,21 @@ const (
 	GPSConfigTimeout           = 30 * time.Second
 	MaxConfigRetries           = 3
 
+	requiredAntennaVoltageMillivolts = 3050
+	requiredGPSPowerMode             = 7
+	gpsRestartMinimumInterval        = 2 * time.Second
+	gpsStopConfirmationTimeout       = 10 * time.Second
+	gpsStopPollInterval              = 100 * time.Millisecond
+	startupReuseProbeTimeout         = 5 * time.Second
+	locationSourceRestartDelay       = 3 * time.Second
+
 	// gpsWeekRollover is the GPS week-number rollover period (1024 weeks ≈ 19.6 years).
 	// SIMCom GPS firmwares with a stale rollover epoch report timestamps this much
 	// behind the real time, e.g. April 2026 → April 2006.
 	gpsWeekRollover = 1024 * 7 * 24 * time.Hour
 )
 
-// GPSMode selects how the receiver acquires satellites.
-// Standalone uses satellite signals only. UEBased additionally pulls assistance
-// data from a SUPL server (faster TTFF when cellular is available); it falls
-// back to standalone automatically when the server is unreachable, so it's
-// safe even during brief network loss — but on persistently offline scooters
-// we switch explicitly to standalone to avoid futile SUPL attempts.
+// GPSMode selects standalone or SUPL-assisted satellite acquisition.
 type GPSMode int
 
 const (
@@ -66,15 +70,6 @@ func (m GPSMode) cgpsArg() string {
 // (2019-04-07). Any GPS timestamp earlier than this is definitively wrong and
 // should be corrected by adding multiples of gpsWeekRollover.
 var MinValidGPSDate = time.Date(2019, 4, 7, 0, 0, 0, 0, time.UTC)
-
-// age formats a time.Time as a human-readable age relative to now. Returns
-// "never" for zero values so log output doesn't show absurd durations.
-func age(t time.Time) string {
-	if t.IsZero() {
-		return "never"
-	}
-	return time.Since(t).Round(time.Millisecond).String()
-}
 
 // correctGPSWeekRollover compensates for receivers stuck in an older GPS week
 // rollover epoch by advancing the timestamp by 1024 weeks until it falls inside
@@ -118,9 +113,7 @@ type Location struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// ModemPathResolver re-resolves the current ModemManager modem object path.
-// Wired by service.go to s.Modem.FindModem so location can recover when MM
-// rebinds the modem (e.g. after a soft reset, AT+CFUN=0/1, mmcli --reset).
+// ModemPathResolver finds the current modem after ModemManager rebinds it.
 type ModemPathResolver func() (dbus.ObjectPath, error)
 
 type Service struct {
@@ -149,15 +142,13 @@ type Service struct {
 	gpsdConnected atomic.Bool
 	state         atomic.Value // string: "off", "searching", "fix-established", "error"
 
-	// Protected by stateMutex — compound types that can't use atomics
 	stateMutex       sync.RWMutex
 	currentLoc       Location
 	lastFix          time.Time
-	lastDataReceived time.Time // Last time any GPS data was received (even without fix)
+	lastDataReceived time.Time // includes reports without a fix
 
-	// Accessed only from the main goroutine or under explicit coordination
-	GPSLostTime  time.Time   // Time when GPS fix was lost
-	gpsFreshInit atomic.Bool // True if GPS has just been initialized
+	GPSLostTime  time.Time // owned by the service monitor goroutine
+	gpsFreshInit atomic.Bool
 
 	configMutex sync.Mutex
 	currentMode GPSMode
@@ -167,10 +158,13 @@ type Service struct {
 	monitorCancel    context.CancelFunc
 	monitorDone      chan struct{}
 	monitoringActive atomic.Bool
+	modeSwitchReady  atomic.Bool
 	beforeConfigure  func()
 	sendATCommandFn  func(context.Context, string) (string, error)
+	nowFn            func() time.Time
+	waitFn           func(context.Context, time.Duration) error
 
-	rolloverLogged sync.Once // Logs GPS week-rollover correction at most once per session
+	rolloverLogged sync.Once
 }
 
 func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, suplServer string) *Service {
@@ -203,23 +197,22 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 	return s
 }
 
-// Accessor methods for atomic fields
-
-func (s *Service) HasValidFix() bool   { return s.hasValidFix.Load() }
-func (s *Service) FixMode() string     { return s.fixMode.Load().(string) }
-func (s *Service) SNR() float64        { return s.snr.Load().(float64) }
-func (s *Service) HDOP() float64       { return s.hdop.Load().(float64) }
-func (s *Service) VDOP() float64       { return s.vdop.Load().(float64) }
-func (s *Service) PDOP() float64       { return s.pdop.Load().(float64) }
-func (s *Service) EPH() float64        { return s.eph.Load().(float64) }
-func (s *Service) EPS() float64        { return s.eps.Load().(float64) }
-func (s *Service) EPT() float64        { return s.ept.Load().(float64) }
-func (s *Service) SatsUsed() int32     { return s.satsUsed.Load() }
-func (s *Service) SatsVisible() int32  { return s.satsVisible.Load() }
-func (s *Service) GpsdConnected() bool { return s.gpsdConnected.Load() }
-func (s *Service) State() string       { return s.state.Load().(string) }
-func (s *Service) GPSFreshInit() bool  { return s.gpsFreshInit.Load() }
-func (s *Service) IsEnabled() bool     { return s.monitoringActive.Load() }
+func (s *Service) HasValidFix() bool        { return s.hasValidFix.Load() }
+func (s *Service) FixMode() string          { return s.fixMode.Load().(string) }
+func (s *Service) SNR() float64             { return s.snr.Load().(float64) }
+func (s *Service) HDOP() float64            { return s.hdop.Load().(float64) }
+func (s *Service) VDOP() float64            { return s.vdop.Load().(float64) }
+func (s *Service) PDOP() float64            { return s.pdop.Load().(float64) }
+func (s *Service) EPH() float64             { return s.eph.Load().(float64) }
+func (s *Service) EPS() float64             { return s.eps.Load().(float64) }
+func (s *Service) EPT() float64             { return s.ept.Load().(float64) }
+func (s *Service) SatsUsed() int32          { return s.satsUsed.Load() }
+func (s *Service) SatsVisible() int32       { return s.satsVisible.Load() }
+func (s *Service) GpsdConnected() bool      { return s.gpsdConnected.Load() }
+func (s *Service) State() string            { return s.state.Load().(string) }
+func (s *Service) GPSFreshInit() bool       { return s.gpsFreshInit.Load() }
+func (s *Service) IsEnabled() bool          { return s.monitoringActive.Load() }
+func (s *Service) ReadyForModeSwitch() bool { return s.modeSwitchReady.Load() }
 
 func (s *Service) IsConfiguring() bool {
 	if s.configMutex.TryLock() {
@@ -270,11 +263,13 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 	s.monitorCtx = ctx
 	s.monitorCancel = cancel
 	s.monitorDone = done
+	s.modeSwitchReady.Store(false)
 	s.monitoringActive.Store(true)
 	s.lifecycleMu.Unlock()
 
 	go func() {
 		defer func() {
+			s.modeSwitchReady.Store(false)
 			s.monitoringActive.Store(false)
 			close(done)
 		}()
@@ -292,67 +287,28 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 					s.beforeConfigure()
 				}
 				s.configMutex.Lock()
-				// Double-check after acquiring lock (another goroutine might have configured it)
 				if s.GpsdConn == nil {
-					// On first attempt, try connecting to gpsd without reconfiguring GPS
-					// (GPS might already be running from previous service instance).
-					// We require an actual valid fix — not just any TPV — because
-					// a no-fix TPV (mode=1) can arrive from a half-configured chip
-					// and would wrongly convince us to skip full reconfiguration.
 					if attempt == 0 && s.gpsFreshInit.Load() {
-						s.Logger.Printf("Trying to connect to existing gpsd...")
-						if err := s.connectToGPSD(); err == nil {
-							s.Logger.Printf("Connected to gpsd, probing chip state and waiting for valid fix (up to 5s)...")
+						probeStarted := time.Now()
+						s.Logger.Printf("GPS startup reuse probe started")
+						reuse, reason := s.probeStartupReuse(ctx, probeStarted)
+						elapsed := time.Since(probeStarted).Round(time.Millisecond)
+						if reuse {
+							s.currentMode = ModeStandalone
+							s.gpsFreshInit.Store(false)
+							s.modeSwitchReady.Store(true)
+							s.Logger.Printf("GPS startup reuse accepted after %s: %s", elapsed, reason)
+							attempt = 0
 							s.configMutex.Unlock()
-
-							// Log current chip state so post-hibernation half-configured
-							// cases are visible in the journal.
-							probeCtx, probeCancel := context.WithTimeout(ctx, 3*time.Second)
-							s.probeChipState(probeCtx)
-							probeCancel()
-
-							// Poll every 500ms for up to 5s — exit early once
-							// we see a valid fix instead of always waiting 5s.
-							probeDeadline := time.Now().Add(5 * time.Second)
-							haveFix := false
-							for time.Now().Before(probeDeadline) {
-								if s.hasValidFix.Load() {
-									haveFix = true
-									break
-								}
-								select {
-								case <-ctx.Done():
-									return
-								case <-time.After(500 * time.Millisecond):
-								}
-							}
-
-							s.stateMutex.RLock()
-							lastData := s.lastDataReceived
-							lastFix := s.lastFix
-							s.stateMutex.RUnlock()
-							s.Logger.Printf("reuse probe: haveFix=%v lastData=%s lastFix=%s",
-								haveFix, age(lastData), age(lastFix))
-
-							if haveFix {
-								s.Logger.Printf("GPS already running with valid fix, reusing existing connection")
-								// Probe so currentMode reflects the actual
-								// modem state instead of a zero-value default.
-								s.ProbeGPSMode(ctx)
-								s.gpsFreshInit.Store(false)
-								attempt = 0
-								continue
-							}
-
-							// No valid fix, need to reconfigure
-							s.Logger.Printf("No valid fix from existing gpsd, will reconfigure")
-							s.configMutex.Lock()
-							if s.GpsdConn != nil {
-								s.GpsdConn.Close()
-								s.GpsdConn = nil
-							}
+							continue
+						}
+						if s.GpsdConn != nil {
+							s.GpsdConn.Close()
+							s.GpsdConn = nil
+							s.gpsdConnected.Store(false)
 						}
 						s.gpsFreshInit.Store(false)
+						s.Logger.Printf("GPS startup reconfiguration required after %s: %s", elapsed, reason)
 					}
 
 					s.Logger.Printf("Configuring GPS (attempt %d)", attempt+1)
@@ -383,6 +339,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 					}
 
 					s.SetLastDataReceived(time.Now())
+					s.modeSwitchReady.Store(true)
 					s.Logger.Printf("Successfully connected to gpsd")
 					attempt = 0
 				}
@@ -395,6 +352,7 @@ func (s *Service) EnableGPS(modemPath dbus.ObjectPath) error {
 				return time.Since(s.lastFix) > GPSTimeout
 			}() {
 				s.Logger.Printf("No GPS updates received for %v, reconnecting", GPSTimeout)
+				s.modeSwitchReady.Store(false)
 				s.configMutex.Lock()
 				if s.GpsdConn != nil {
 					s.GpsdConn.Close()
@@ -437,7 +395,6 @@ func (s *Service) configureGPSWithRetries(ctx context.Context) error {
 				case <-ctx.Done():
 					return ctx.Err()
 				case <-time.After(2 * time.Second):
-					// Brief pause before retry
 				}
 			}
 			continue
@@ -449,12 +406,13 @@ func (s *Service) configureGPSWithRetries(ctx context.Context) error {
 }
 
 func (s *Service) doGPSConfiguration(ctx context.Context) error {
-	// Configure GPS via AT commands first
-	if err := s.configureGPSViaATCommands(ctx); err != nil {
-		s.Logger.Printf("Warning: GPS AT config failed: %v", err)
+	started := time.Now()
+	if err := s.configureReceiver(ctx); err != nil {
+		return err
 	}
+	s.Logger.Printf("GPS initialization phase=receiver-running elapsed=%s",
+		time.Since(started).Round(time.Millisecond))
 
-	// Get current ModemManager location status
 	status, err := s.getLocationStatusWithTimeout(ctx)
 	if err != nil {
 		s.Logger.Printf("Warning: Could not get location status: %v", err)
@@ -466,24 +424,16 @@ func (s *Service) doGPSConfiguration(ctx context.Context) error {
 		s.Logger.Printf("Location sources enabled: 0x%x", enabledSources)
 	}
 
-	// Disable conflicting sources first (gps-nmea and gps-raw)
 	if err := s.disableConflictingSources(ctx, enabledSources); err != nil {
 		s.Logger.Printf("Warning: Failed to disable conflicting sources: %v", err)
 	}
 
-	// Enable required location sources
-	if err := s.enableLocationSources(ctx, enabledSources); err != nil {
+	if err := s.enableLocationSources(ctx, enabledSources, started); err != nil {
 		return fmt.Errorf("failed to enable location sources: %v", err)
 	}
 
-	// Set GPS refresh rate
 	if err := s.setGPSRefreshRate(ctx); err != nil {
 		s.Logger.Printf("Warning: Failed to set GPS refresh rate: %v", err)
-	}
-
-	// Configure antenna power (critical - can reset on reboot)
-	if err := s.configureAntennaPower(ctx); err != nil {
-		s.Logger.Printf("Warning: Failed to configure antenna power: %v", err)
 	}
 
 	return nil
@@ -501,12 +451,7 @@ func isStalePathError(err error) bool {
 		strings.Contains(msg, "UnknownObject")
 }
 
-// refreshModemPathIfStale checks whether err is a stale-path error and, if a
-// resolver is wired, asks it for the current path. Updates s.ModemPath in
-// place when the path has actually changed and returns true so the caller
-// can retry. Returns false (no retry) if err isn't a stale-path error, no
-// resolver is configured, the resolver itself fails, or the path is
-// unchanged (the failure is something else).
+// refreshModemPathIfStale updates a rebound modem path and requests one retry.
 func (s *Service) refreshModemPathIfStale(err error) bool {
 	if !isStalePathError(err) || s.ResolveModemPath == nil {
 		return false
@@ -563,52 +508,132 @@ func (s *Service) sendATCommand(ctx context.Context, command string, logResponse
 	return response, nil
 }
 
-// configureGPSViaATCommands configures GPS using AT commands for optimal performance
-// Uses direct modem AT commands for comprehensive GPS setup including antenna power
-// and accuracy thresholds for faster and more reliable GPS fixes
-func (s *Service) configureGPSViaATCommands(ctx context.Context) error {
-	s.Logger.Printf("Configuring GPS via AT commands...")
+func (s *Service) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
+}
 
-	// Stop GPS before configuration (ignore errors if not running)
-	s.sendATCommand(ctx, "AT+CGPS=0", false)
-
-	// Wait a moment for GPS to stop
+func (s *Service) waitUntil(ctx context.Context, notBefore time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	remaining := notBefore.Sub(s.now())
+	if remaining <= 0 {
+		return nil
+	}
+	if s.waitFn != nil {
+		return s.waitFn(ctx, remaining)
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(1 * time.Second):
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *Service) configureReceiver(ctx context.Context) error {
+	restartNotBefore, err := s.configureGPSViaATCommands(ctx)
+	if err != nil {
+		return fmt.Errorf("GPS AT config: %w", err)
+	}
+	if err := s.configureAntennaPower(ctx, restartNotBefore); err != nil {
+		return fmt.Errorf("configure antenna and receiver: %w", err)
+	}
+	return nil
+}
+
+// configureGPSViaATCommands applies settings that require a stopped receiver.
+func (s *Service) configureGPSViaATCommands(ctx context.Context) (time.Time, error) {
+	s.Logger.Printf("Configuring GPS via AT commands...")
+
+	stopIssuedAt := s.now()
+	restartNotBefore := stopIssuedAt.Add(gpsRestartMinimumInterval)
+	stopDeadline := stopIssuedAt.Add(gpsStopConfirmationTimeout)
+	_, stopErr := s.sendATCommand(ctx, "AT+CGPS=0", false)
+
+	if err := s.waitForReceiverStopped(ctx, stopDeadline); err != nil {
+		if stopErr != nil {
+			return restartNotBefore, fmt.Errorf("stop receiver: %v; verify: %w", stopErr, err)
+		}
+		return restartNotBefore, err
+	}
+	if stopErr != nil {
+		s.Logger.Printf("GPS stop command reported %v but CGPS? confirms receiver stopped", stopErr)
+	}
+	if err := s.configureGPSPowerMode(ctx); err != nil {
+		return restartNotBefore, err
 	}
 
 	// Disable GPS auto-start on boot; mode is set explicitly on each start.
 	s.sendATCommand(ctx, "AT+CGPSAUTO=0", false)
 
-	// Set accuracy threshold (50 meters - higher = faster fix)
 	accuracyMeters := int(s.Config.AccuracyThresh)
 	cmd := fmt.Sprintf("AT+CGPSHOR=%d", accuracyMeters)
 	s.sendATCommand(ctx, cmd, false)
 	s.Logger.Printf("GPS accuracy threshold: %dm", accuracyMeters)
 
-	// Set GPS antenna GPIO (GPIO 41 as output, high)
 	s.sendATCommand(ctx, "AT+CGDRT=41,1", false)
 	s.sendATCommand(ctx, "AT+CGSETV=41,1", false)
 
-	// Set GPS clock from system time
 	s.syncGPSClock(ctx)
 
 	// Configure NMEA sentence set.
 	s.sendATCommand(ctx, "AT+CGPSNMEA=511", false)
+	return restartNotBefore, nil
+}
+
+func (s *Service) waitForReceiverStopped(ctx context.Context, deadline time.Time) error {
+	for {
+		response, err := s.sendATCommand(ctx, "AT+CGPS?", false)
+		if err != nil {
+			return fmt.Errorf("verify stopped receiver: %w", err)
+		}
+		running, _, ok := parseCGPSResponse(response)
+		if !ok {
+			return fmt.Errorf("verify stopped receiver: malformed CGPS? response %q", strings.TrimSpace(response))
+		}
+		if !running {
+			return nil
+		}
+		now := s.now()
+		if !now.Before(deadline) {
+			return fmt.Errorf("receiver did not stop before restart deadline (CGPS? = %q)", strings.TrimSpace(response))
+		}
+		nextPoll := now.Add(gpsStopPollInterval)
+		if nextPoll.After(deadline) {
+			nextPoll = deadline
+		}
+		if err := s.waitUntil(ctx, nextPoll); err != nil {
+			return fmt.Errorf("wait for receiver to stop: %w", err)
+		}
+	}
+}
+
+func (s *Service) configureGPSPowerMode(ctx context.Context) error {
+	if _, err := s.sendATCommand(ctx, "AT+CGPSPMD=7", false); err != nil {
+		return fmt.Errorf("set CGPSPMD=7: %w", err)
+	}
+	response, err := s.sendATCommand(ctx, "AT+CGPSPMD?", false)
+	if err != nil {
+		return fmt.Errorf("verify CGPSPMD=7: %w", err)
+	}
+	mode, ok := parseSingleValueResponse(response, "+CGPSPMD:")
+	if !ok || mode != requiredGPSPowerMode {
+		return fmt.Errorf("verify CGPSPMD=7: response %q", strings.TrimSpace(response))
+	}
 	return nil
 }
 
-// configureAntennaPower configures the GPS antenna power supply.
-// CRITICAL: Can reset to 2950mV after reboot, preventing GPS from working.
-// Must be called on every GPS enable, not just initial configuration.
-// Caller must hold s.configMutex — this function reads and writes s.currentMode
-// without locking, relying on that invariant.
-func (s *Service) configureAntennaPower(ctx context.Context) error {
+// configureAntennaPower restores the required 3.05 V after every reboot.
+// The caller must hold configMutex because this also updates currentMode.
+func (s *Service) configureAntennaPower(ctx context.Context, restartNotBefore time.Time) error {
 	voltageMillivolts := int(s.Config.AntennaVoltage * 1000)
 
-	// Check current antenna voltage (extract just the +CVAUXV line from response)
 	if response, err := s.sendATCommand(ctx, "AT+CVAUXV?", false); err == nil {
 		for _, line := range strings.Split(response, "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "+CVAUXV:") {
@@ -618,94 +643,213 @@ func (s *Service) configureAntennaPower(ctx context.Context) error {
 		}
 	}
 
-	// Set antenna voltage (3050 = 3.05V for 3V antenna)
 	cmd := fmt.Sprintf("AT+CVAUXV=%d", voltageMillivolts)
 	if _, err := s.sendATCommand(ctx, cmd, false); err != nil {
 		return fmt.Errorf("failed to set antenna voltage: %v", err)
 	}
 
-	// Enable antenna power supply
 	if _, err := s.sendATCommand(ctx, "AT+CVAUXS=1", false); err != nil {
 		return fmt.Errorf("failed to enable antenna power: %v", err)
 	}
 	s.Logger.Printf("GPS antenna powered: %dmV", voltageMillivolts)
 
-	// Update GPS clock after antenna power up
 	s.syncGPSClock(ctx)
 
-	// Check if GPS is enabled, start it in standalone mode if needed.
-	// Online scooters will be transitioned to UE-Based by SetGPSMode once the
-	// connectivity classifier stabilizes; starting standalone is the safe
-	// default that works even if we never reach SUPL.
-	response, err := s.sendATCommand(ctx, "AT+CGPS?", false)
-	s.Logger.Printf("configureAntennaPower: CGPS?=%q prevMode=%s",
-		strings.TrimSpace(response), s.currentMode)
-	if err == nil && !gpsRunning(response) {
-		s.sendATCommand(ctx, "AT+CGPS=1,1", false)
-		s.currentMode = ModeStandalone
-		s.Logger.Printf("GPS started in standalone mode")
-	} else if err == nil {
-		// GPS already running — record the mode we observe so a no-op
-		// SetGPSMode(same) doesn't tear it down.
-		s.currentMode = parseCGPSMode(response)
+	if err := s.startStandaloneReceiver(ctx, restartNotBefore); err != nil {
+		return err
 	}
 
-	// Set GPS notification mode
 	s.sendATCommand(ctx, "AT+CGPSNOTIFY=0", false)
-
 	return nil
 }
 
-// gpsRunning returns true when the AT+CGPS? response indicates GPS is on
-// in any mode (1,1 standalone / 1,2 UE-based / 1,3 UE-assisted).
-func gpsRunning(resp string) bool {
-	return strings.Contains(resp, "+CGPS: 1,") || strings.Contains(resp, "+CGPS:1,")
-}
-
-// parseCGPSMode extracts the current mode from AT+CGPS? output. Defaults to
-// standalone on any parse failure.
-func parseCGPSMode(resp string) GPSMode {
-	if strings.Contains(resp, "+CGPS: 1,2") || strings.Contains(resp, "+CGPS:1,2") {
-		return ModeUEBased
+func (s *Service) startStandaloneReceiver(ctx context.Context, restartNotBefore time.Time) error {
+	if err := s.waitUntil(ctx, restartNotBefore); err != nil {
+		return fmt.Errorf("wait for receiver restart interval: %w", err)
 	}
-	return ModeStandalone
+	_, startErr := s.sendATCommand(ctx, "AT+CGPS=1,1", false)
+	response, queryErr := s.sendATCommand(ctx, "AT+CGPS?", false)
+	if queryErr != nil {
+		if startErr != nil {
+			return fmt.Errorf("start standalone receiver: %v; verify: %w", startErr, queryErr)
+		}
+		return fmt.Errorf("verify standalone receiver: %w", queryErr)
+	}
+	running, mode, ok := parseCGPSResponse(response)
+	if !ok || !running || mode != ModeStandalone {
+		return fmt.Errorf("start standalone receiver failed (CGPS? = %q; start error: %v)",
+			strings.TrimSpace(response), startErr)
+	}
+	if startErr != nil {
+		s.Logger.Printf("GPS start command reported %v but CGPS? confirms standalone mode", startErr)
+	}
+	s.currentMode = ModeStandalone
+	s.Logger.Printf("GPS started in standalone mode")
+	return nil
 }
 
-// SetGPSMode reconfigures the GPS for the requested mode. If GPS is already
-// running in that mode, it's a no-op. Otherwise GPS is stopped, mode-specific
-// AT commands are issued, and GPS is restarted.
-//
-// Safe to call from a state-change handler; serialized on the same mutex as
-// initial configuration via configMutex.
-// CurrentGPSMode returns the last-known GPS mode without issuing AT commands.
-// This reflects what SetGPSMode set or what configureAntennaPower observed at
-// startup; it may lag reality briefly during a mode transition.
+func parseCGPSResponse(response string) (running bool, mode GPSMode, ok bool) {
+	values, ok := parseIntegerResponse(response, "+CGPS:")
+	if !ok || len(values) == 0 {
+		return false, ModeStandalone, false
+	}
+	if values[0] == 0 {
+		return false, ModeStandalone, true
+	}
+	if values[0] != 1 || len(values) < 2 {
+		return false, ModeStandalone, false
+	}
+	switch values[1] {
+	case 1:
+		return true, ModeStandalone, true
+	case 2:
+		return true, ModeUEBased, true
+	default:
+		return true, ModeStandalone, false
+	}
+}
+
+func parseSingleValueResponse(response, prefix string) (int, bool) {
+	values, ok := parseIntegerResponse(response, prefix)
+	if !ok || len(values) != 1 {
+		return 0, false
+	}
+	return values[0], true
+}
+
+func parseIntegerResponse(response, prefix string) ([]int, bool) {
+	for _, line := range strings.Split(strings.ReplaceAll(response, "\r", ""), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		fields := strings.Split(strings.TrimSpace(strings.TrimPrefix(line, prefix)), ",")
+		values := make([]int, 0, len(fields))
+		for _, field := range fields {
+			value, err := strconv.Atoi(strings.TrimSpace(field))
+			if err != nil {
+				return nil, false
+			}
+			values = append(values, value)
+		}
+		return values, len(values) > 0
+	}
+	return nil, false
+}
+
+func gpsRunning(resp string) bool {
+	running, _, ok := parseCGPSResponse(resp)
+	return ok && running
+}
+
+func parseCGPSMode(resp string) GPSMode {
+	_, mode, _ := parseCGPSResponse(resp)
+	return mode
+}
+
+// CurrentGPSMode returns the last mode set or observed during configuration.
 func (s *Service) CurrentGPSMode() GPSMode {
 	s.configMutex.Lock()
 	defer s.configMutex.Unlock()
 	return s.currentMode
 }
 
-// probeChipState logs the current GPS chip configuration: AT+CGPS? (enabled
-// and mode), AT+CVAUXV? (antenna voltage), AT+CVAUXS? (antenna power enable).
-// Used to make post-hibernation half-configured states visible in the journal
-// when we'd otherwise reuse an existing gpsd connection without reconfiguring.
-// Safe to call even if ModemPath isn't set (returns silently).
-func (s *Service) probeChipState(ctx context.Context) {
-	if s.ModemPath == "" {
-		return
+type gpsChipState struct {
+	running           bool
+	mode              GPSMode
+	antennaMillivolts int
+	powerMode         int
+}
+
+func parseGPSChipState(cgps, cvauxv, cgpspmd string) (gpsChipState, error) {
+	running, mode, ok := parseCGPSResponse(cgps)
+	if !ok {
+		return gpsChipState{}, fmt.Errorf("malformed CGPS response %q", strings.TrimSpace(cgps))
 	}
-	probe := func(label, cmd string) {
-		resp, err := s.sendATCommand(ctx, cmd, false)
+	voltage, ok := parseSingleValueResponse(cvauxv, "+CVAUXV:")
+	if !ok {
+		return gpsChipState{}, fmt.Errorf("malformed CVAUXV response %q", strings.TrimSpace(cvauxv))
+	}
+	powerMode, ok := parseSingleValueResponse(cgpspmd, "+CGPSPMD:")
+	if !ok {
+		return gpsChipState{}, fmt.Errorf("malformed CGPSPMD response %q", strings.TrimSpace(cgpspmd))
+	}
+	return gpsChipState{
+		running:           running,
+		mode:              mode,
+		antennaMillivolts: voltage,
+		powerMode:         powerMode,
+	}, nil
+}
+
+func (state gpsChipState) reuseEligibility() (bool, string) {
+	if !state.running {
+		return false, "receiver is stopped"
+	}
+	if state.mode != ModeStandalone {
+		return false, fmt.Sprintf("receiver mode is %s", state.mode)
+	}
+	if state.antennaMillivolts != requiredAntennaVoltageMillivolts {
+		return false, fmt.Sprintf("antenna voltage is %dmV, want %dmV",
+			state.antennaMillivolts, requiredAntennaVoltageMillivolts)
+	}
+	if state.powerMode != requiredGPSPowerMode {
+		return false, fmt.Sprintf("CGPSPMD is %d, want %d", state.powerMode, requiredGPSPowerMode)
+	}
+	return true, fmt.Sprintf("chip state is standalone, antenna=%dmV, CGPSPMD=%d",
+		state.antennaMillivolts, state.powerMode)
+}
+
+func (s *Service) queryGPSChipState(ctx context.Context) (gpsChipState, error) {
+	responses := make([]string, 3)
+	for i, command := range []string{"AT+CGPS?", "AT+CVAUXV?", "AT+CGPSPMD?"} {
+		response, err := s.sendATCommand(ctx, command, false)
 		if err != nil {
-			s.Logger.Printf("chip probe: %s=%s err=%v", label, cmd, err)
-			return
+			return gpsChipState{}, fmt.Errorf("%s failed: %w", command, err)
 		}
-		s.Logger.Printf("chip probe: %s -> %s", label, strings.TrimSpace(resp))
+		responses[i] = response
 	}
-	probe("cgps", "AT+CGPS?")
-	probe("cvauxv", "AT+CVAUXV?")
-	probe("cvauxs", "AT+CVAUXS?")
+	return parseGPSChipState(responses[0], responses[1], responses[2])
+}
+
+// probeStartupReuse accepts live receiver state without requiring a fix.
+func (s *Service) probeStartupReuse(ctx context.Context, started time.Time) (bool, string) {
+	if err := s.connectToGPSD(); err != nil {
+		return false, fmt.Sprintf("gpsd connection failed: %v", err)
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	state, err := s.queryGPSChipState(probeCtx)
+	cancel()
+	if err != nil {
+		return false, fmt.Sprintf("chip state unavailable: %v", err)
+	}
+	eligible, chipReason := state.reuseEligibility()
+	if !eligible {
+		return false, chipReason
+	}
+	if _, err := s.sendATCommand(ctx, "AT+CVAUXS=1", false); err != nil {
+		return false, fmt.Sprintf("enable antenna supply: %v", err)
+	}
+
+	deadline := started.Add(startupReuseProbeTimeout)
+	for {
+		lastData := s.LastDataReceived()
+		if lastData.After(started) {
+			return true, "gpsd produced fresh data and " + chipReason
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, fmt.Sprintf("gpsd produced no fresh data within %s; %s",
+				startupReuseProbeTimeout, chipReason)
+		}
+		wait := min(100*time.Millisecond, remaining)
+		select {
+		case <-ctx.Done():
+			return false, fmt.Sprintf("reuse probe cancelled: %v", ctx.Err())
+		case <-time.After(wait):
+		}
+	}
 }
 
 // ProbeGPSMode queries the modem with AT+CGPS? and records whatever mode
@@ -744,11 +888,15 @@ func (s *Service) modeContext(parent context.Context) (context.Context, context.
 	}
 }
 
+// SetGPSMode restarts GPS in mode unless the modem already reports that mode.
 func (s *Service) SetGPSMode(parent context.Context, mode GPSMode) error {
 	ctx, cancel := s.modeContext(parent)
 	defer cancel()
 	s.configMutex.Lock()
 	defer s.configMutex.Unlock()
+	if !s.modeSwitchReady.Load() {
+		return nil
+	}
 
 	resp, err := s.sendATCommand(ctx, "AT+CGPS?", false)
 	if err == nil && gpsRunning(resp) && parseCGPSMode(resp) == mode {
@@ -813,7 +961,7 @@ func (s *Service) SetGPSMode(parent context.Context, mode GPSMode) error {
 	return nil
 }
 
-// syncGPSClock sets the modem's GPS clock from system time
+// syncGPSClock sets the modem GPS clock from system time.
 func (s *Service) syncGPSClock(ctx context.Context) {
 	now := time.Now().UTC()
 	clockCmd := fmt.Sprintf(`AT+CCLK="%s"`, now.Format("06/01/02,15:04:05+00"))
@@ -821,9 +969,8 @@ func (s *Service) syncGPSClock(ctx context.Context) {
 	s.Logger.Printf("GPS clock synced: %s", now.Format("2006-01-02 15:04:05 MST"))
 }
 
-// setGPSRefreshRate sets the GPS refresh rate via ModemManager D-Bus
+// setGPSRefreshRate sets the GPS refresh rate via ModemManager.
 func (s *Service) setGPSRefreshRate(ctx context.Context) error {
-	// Set GPS refresh rate to 1 second (matches GPSUpdateInterval)
 	refreshSeconds := uint32(s.Config.RefreshRate.Seconds())
 
 	err := s.MMClient.SetGPSRefreshRate(s.ModemPath, refreshSeconds)
@@ -837,7 +984,7 @@ func (s *Service) setGPSRefreshRate(ctx context.Context) error {
 	return nil
 }
 
-// LocationStatus holds the location configuration status
+// LocationStatus is the enabled ModemManager location-source mask.
 type LocationStatus struct {
 	EnabledSources uint32
 }
@@ -854,11 +1001,9 @@ func (s *Service) getLocationStatusWithTimeout(ctx context.Context) (*LocationSt
 }
 
 func (s *Service) disableConflictingSources(ctx context.Context, enabledSources uint32) error {
-	// Check if conflicting sources (gps-nmea or gps-raw) are enabled
 	conflictingMask := mm.MMModemLocationSourceGpsNmea | mm.MMModemLocationSourceGpsRaw
 
 	if enabledSources&conflictingMask != 0 {
-		// Calculate new sources mask without conflicting sources
 		newSources := enabledSources &^ conflictingMask
 		s.Logger.Printf("Disabling conflicting GPS sources (nmea/raw), new mask: 0x%x", newSources)
 
@@ -904,7 +1049,7 @@ func (s *Service) setupLocationSources(ctx context.Context, sources uint32) erro
 	return setupErr
 }
 
-func (s *Service) enableLocationSources(ctx context.Context, currentSources uint32) error {
+func (s *Service) enableLocationSources(ctx context.Context, currentSources uint32, initializationStarted time.Time) error {
 	gpsSources, allSources := locationSourceMasks(currentSources)
 
 	if currentSources&mm.MMModemLocationSourceGpsUnmanaged == 0 {
@@ -929,19 +1074,22 @@ func (s *Service) enableLocationSources(ctx context.Context, currentSources uint
 		}
 	}
 
-	// Wait 3 seconds after enabling GPS before restarting gpsd
+	s.Logger.Printf("GPS initialization phase=gpsd-restart-delay elapsed=%s delay=%s",
+		time.Since(initializationStarted).Round(time.Millisecond), locationSourceRestartDelay)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(3 * time.Second):
+	case <-time.After(locationSourceRestartDelay):
 	}
 
-	s.Logger.Printf("Restarting gpsd service after GPS configuration")
+	s.Logger.Printf("Restarting gpsd service after GPS configuration elapsed=%s",
+		time.Since(initializationStarted).Round(time.Millisecond))
 	restartCmd := exec.CommandContext(ctx, "systemctl", "restart", "gpsd")
 	if err := restartCmd.Run(); err != nil {
 		s.Logger.Printf("Warning: Failed to restart gpsd: %v", err)
 	} else {
-		s.Logger.Printf("Successfully restarted gpsd service")
+		s.Logger.Printf("Successfully restarted gpsd service elapsed=%s",
+			time.Since(initializationStarted).Round(time.Millisecond))
 	}
 
 	return nil
@@ -974,7 +1122,6 @@ func (s *Service) connectToGPSD() error {
 
 	s.GpsdConn = conn
 
-	// Subscribe to SKY reports for DOP values
 	s.GpsdConn.AddFilter("SKY", func(r interface{}) {
 		report, ok := r.(*gpsd.SKYReport)
 		if !ok {
@@ -1029,24 +1176,16 @@ func (s *Service) connectToGPSD() error {
 			return
 		}
 
-		// Track when we receive any GPS data (even without fix)
 		s.stateMutex.Lock()
 		s.lastDataReceived = time.Now()
 		s.stateMutex.Unlock()
 
-		// gpsd Mode==0 (NoValueSeen) means the report carries no mode/fix
-		// info — typically a cycle-continuation TPV or a partial JSON update
-		// where the mode field wasn't repeated. Treating it as "no fix" (as
-		// we used to) caused spurious fix-loss flicker because every such
-		// TPV would flip hasValidFix=false until the next mode==3 arrived,
-		// taking the no-fix publish branch with it. Preserve state instead:
-		// no field updates, no fix-state change.
+		// Mode 0 is a partial report with no fix update; preserve the prior state.
 		if report.Mode == 0 {
 			return
 		}
 
-		// Update fix status; log mode transitions so silent "stuck at mode=1"
-		// windows are visible even before a valid fix is ever established.
+		// Log transitions so pre-fix mode=1 stalls remain diagnosable.
 		prevMode := s.fixMode.Load().(string)
 		var newMode string
 		switch report.Mode {
@@ -1067,7 +1206,6 @@ func (s *Service) connectToGPSD() error {
 			}
 		}
 
-		// Update error estimates from TPV report
 		s.eph.Store(report.Eph)
 		s.eps.Store(report.Eps)
 		s.ept.Store(report.Ept)
@@ -1115,7 +1253,6 @@ func (s *Service) connectToGPSD() error {
 			rawLocation.Timestamp = time.Now()
 		}
 
-		// Store raw location directly (no filtering)
 		s.stateMutex.Lock()
 		s.currentLoc = rawLocation
 		s.lastFix = time.Now()
@@ -1123,7 +1260,6 @@ func (s *Service) connectToGPSD() error {
 		s.hasValidFix.Store(true)
 	})
 
-	// Track gpsd connection state
 	s.gpsdConnected.Store(true)
 
 	s.Done = s.GpsdConn.Watch()
@@ -1141,6 +1277,7 @@ func (s *Service) StopGPSD() error {
 }
 
 func (s *Service) Close() {
+	s.modeSwitchReady.Store(false)
 	s.lifecycleMu.Lock()
 	if s.monitorCancel != nil {
 		s.monitorCancel()
@@ -1155,15 +1292,9 @@ func (s *Service) Close() {
 	s.gpsdConnected.Store(false)
 	s.state.Store("off")
 
-	// Drop the fix indicators. Without this, hasValidFix and currentLoc
-	// survive a Close() (e.g. the disableModem call on the way into suspend)
-	// and get replayed after resume: the first-fix clock bootstrap reads the
-	// stale HasValidFix()==true and feeds the hours-old currentLoc.Timestamp
-	// to chronyc settime, stepping the wall clock back to park time. A
-	// monotonic staleness guard can't catch this because CLOCK_MONOTONIC is
-	// frozen during suspend, so we clear the state at the teardown boundary
-	// instead. Last lat/lng is preserved for last-known-position consumers;
-	// only the fix flag and the timestamps that gate clock-sync are cleared.
+	// Clear fix timestamps so resume cannot feed stale GPS time to chrony.
+	// Monotonic staleness cannot detect suspend because that clock also stops;
+	// last coordinates remain available only as an explicitly inactive fix.
 	s.hasValidFix.Store(false)
 	s.stateMutex.Lock()
 	s.currentLoc.Timestamp = time.Time{}
@@ -1197,9 +1328,7 @@ func (s *Service) GetGPSStatus() map[string]interface{} {
 	}
 }
 
-// ShouldPublishRecovery determines if GPS recovery notification should be published.
-// This happens when GPS becomes available after being unavailable, and only if the
-// outage was significant (>5 minutes) or it's the first fix after initialization.
+// ShouldPublishRecovery reports a first fix or recovery after a five-minute outage.
 func (s *Service) ShouldPublishRecovery(hasInternetConnection bool) bool {
 	if !hasInternetConnection {
 		return false
