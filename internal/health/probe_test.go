@@ -43,8 +43,8 @@ func echoHeader(rcode byte) func([]byte) []byte {
 		}
 		resp := make([]byte, 12)
 		copy(resp, req[:12])
-		resp[2] = 0x81                  // QR=1, RD=1
-		resp[3] = 0x80 | (rcode & 0x0f) // RA=1 plus rcode
+		resp[2] = 0x81
+		resp[3] = 0x80 | (rcode & 0x0f)
 		return resp
 	}
 }
@@ -57,8 +57,8 @@ func txtResponse(value string) func([]byte) []byte {
 		resp := append([]byte(nil), req...)
 		resp[2] = 0x81
 		resp[3] = 0x80
-		binary.BigEndian.PutUint16(resp[6:8], 1) // ANCOUNT
-		resp = append(resp, 0xc0, 0x0c)          // owner name -> question name
+		binary.BigEndian.PutUint16(resp[6:8], 1)
+		resp = append(resp, 0xc0, 0x0c) // owner name compression pointer
 		resp = binary.BigEndian.AppendUint16(resp, 16)
 		resp = binary.BigEndian.AppendUint16(resp, 1)
 		resp = binary.BigEndian.AppendUint32(resp, 30)

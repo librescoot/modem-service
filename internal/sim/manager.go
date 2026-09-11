@@ -1,9 +1,5 @@
-// Package sim reconciles SIM PIN state with the configured cellular.sim-pin
-// setting. It owns the decision of whether to send the PIN (when the SIM is
-// PIN-locked) or enable PIN-lock (when it's currently disabled). Wrong-PIN
-// attempts are gated by the modem's UnlockRetries counter so the service
-// can never push a SIM into PUK state on its own — see the design doc at
-// docs/superpowers/specs/2026-05-05-sim-pin-support-design.md.
+// Package sim reconciles PIN state without risking an automatic transition
+// to PUK lock.
 package sim
 
 import (
@@ -30,11 +26,7 @@ const (
 	OutcomeError          Outcome = "error"
 )
 
-// minRetriesBeforeAttempt is the SIM-PIN retry count required for the manager
-// to attempt a SendPin or EnablePin. Three is the standard maximum on a fresh
-// SIM, so requiring "== max" means we only ever consume one retry: if our
-// guess is wrong, we stop and let a human recover by sending the correct PIN
-// manually (which restores the counter to 3).
+// Require at least the standard fresh retry count, so one failure blocks retries.
 const minRetriesBeforeAttempt = 3
 
 // SimDBus is the narrow D-Bus surface the manager needs. The mm.Client
@@ -44,9 +36,7 @@ type SimDBus interface {
 	EnablePin(simPath dbus.ObjectPath, pin string, enabled bool) error
 }
 
-// Input is the per-cycle snapshot passed to Reconcile. All fields come from
-// modem.State and the cached settings hash; Reconcile does no I/O of its own
-// beyond the SimDBus calls.
+// Input is the per-cycle SIM and settings snapshot.
 type Input struct {
 	SIMPath           dbus.ObjectPath
 	LockStatus        string // "" if unlocked, otherwise mm.LockReasonToString
@@ -57,9 +47,8 @@ type Input struct {
 	ConfiguredPIN     string
 }
 
-// Manager keeps a single boolean of "did we already try and fail this run?"
-// across cycles. State is process-local; a restart resets it but the
-// retry-count gate still protects the SIM.
+// Manager remembers failed attempts for the process lifetime; the hardware
+// retry count remains authoritative across restarts.
 type Manager struct {
 	dbus   SimDBus
 	logger *log.Logger
@@ -88,9 +77,7 @@ func New(d SimDBus, logger *log.Logger) *Manager {
 	return &Manager{dbus: d, logger: logger}
 }
 
-// Reconcile runs the decision matrix described in the design doc and returns
-// the outcome for publication. It may make at most one D-Bus call per
-// invocation.
+// Reconcile performs at most one D-Bus action and returns its outcome.
 func (m *Manager) Reconcile(in Input) Outcome {
 	observationChanged := m.logObservation(in)
 

@@ -10,15 +10,9 @@ import (
 	ipc "github.com/librescoot/redis-ipc"
 )
 
-// GPSSnapshotChannel is the pub/sub channel that carries full GPS TPV snapshots
-// as JSON. Consumers can subscribe here to receive pushed updates instead of
-// polling the `gps` hash. The hash is still maintained for backward-compatible
-// readers; this channel is purely additive.
+// GPSSnapshotChannel carries complete GPS TPV snapshots as JSON.
 const GPSSnapshotChannel = "gps:tpv"
 
-// SMS event surface. Per-message events are appended to capped streams and
-// announced as JSON on dedicated pub/sub channels; the `sms` hash only carries
-// latest-value convenience state (state, last-*, unread-count).
 const (
 	SMSReceivedStream  = "sms:received"
 	SMSReceivedChannel = "sms:received"
@@ -58,7 +52,7 @@ const (
 	FaultCodeGPSUnavailable      = 3
 )
 
-// Client wraps the Redis IPC client
+// Client wraps the Redis IPC client.
 type Client struct {
 	client        *ipc.Client
 	logger        *log.Logger
@@ -71,17 +65,17 @@ type Client struct {
 	smsSent       *ipc.StreamPublisher
 }
 
-// ModemCommandHandler is called when modem enable/disable commands are received
+// ModemCommandHandler handles modem enable and disable commands.
 type ModemCommandHandler func(command string) error
 
 // SMSCommandHandler is called when an outbound SMS request is received on the
 // scooter:sms queue. The payload is the raw JSON command string.
 type SMSCommandHandler func(payload string) error
 
-// VehicleStateHandler is called when vehicle state changes
+// VehicleStateHandler handles a vehicle state change.
 type VehicleStateHandler func(state string) error
 
-// New creates a new Redis client using redis-ipc
+// New creates a Redis client.
 func New(redisURL string, logger *log.Logger) (*Client, error) {
 	client, err := ipc.New(
 		ipc.WithURL(redisURL),
@@ -103,7 +97,7 @@ func New(redisURL string, logger *log.Logger) (*Client, error) {
 	}, nil
 }
 
-// Ping checks if the Redis server is reachable
+// Ping checks whether Redis is reachable.
 func (c *Client) Ping() error {
 	return c.client.Ping()
 }
@@ -134,17 +128,10 @@ func (c *Client) PublishModemState(field, value string) error {
 	return nil
 }
 
-// PublishLocationState publishes location state to Redis.
-// publishRecovery should be true only when GPS becomes available after significant outage
-// or on first fix after initialization. When true, publishes a "timestamp" notification.
-// When false, updates the hash without publishing (silent update).
+// PublishLocationState updates the GPS hash, publishing only recovery timestamps.
 func (c *Client) PublishLocationState(data map[string]interface{}, publishRecovery bool) error {
-	// Add updated timestamp to track when data was last refreshed
 	data["updated"] = time.Now().Format(time.RFC3339)
 
-	// Handle GPS publishing based on recovery status
-	// When publishRecovery is true: publish "timestamp" notification (GPS recovered)
-	// When publishRecovery is false: silent update (no pub/sub notification)
 	var err error
 	if publishRecovery {
 		err = c.client.Hash("gps").SetManyPublishOne(data, "timestamp")
@@ -177,7 +164,7 @@ func (c *Client) PublishGPSSnapshot(data map[string]interface{}) error {
 	return nil
 }
 
-// PublishCellLocationState publishes cell tower geolocation to Redis.
+// PublishCellLocationState updates cell-tower geolocation without notification.
 func (c *Client) PublishCellLocationState(data map[string]interface{}) error {
 	data["updated"] = time.Now().Format(time.RFC3339)
 	err := c.client.Hash("cell-location").SetMany(data, ipc.NoPublish())
@@ -296,7 +283,7 @@ func (c *Client) PublishSMSSendResult(res SMSSendResult) error {
 	return nil
 }
 
-// StartModemCommandHandler starts listening for modem enable/disable commands on scooter:modem list
+// StartModemCommandHandler consumes modem commands from scooter:modem.
 func (c *Client) StartModemCommandHandler(handler ModemCommandHandler) error {
 	c.modemHandler = ipc.HandleRequests(c.client, "scooter:modem", func(cmd string) error {
 		c.logger.Printf("Received modem command: %s", cmd)
@@ -376,7 +363,7 @@ func (c *Client) RemoveModemInhibitor() error {
 	return nil
 }
 
-// StartVehicleStateWatcher starts watching vehicle state changes
+// StartVehicleStateWatcher watches the vehicle state.
 func (c *Client) StartVehicleStateWatcher(handler VehicleStateHandler) error {
 	c.vehicleWatch = c.client.NewHashWatcher("vehicle")
 	c.vehicleWatch.OnField("state", func(value string) error {
@@ -387,10 +374,10 @@ func (c *Client) StartVehicleStateWatcher(handler VehicleStateHandler) error {
 	return nil
 }
 
-// SettingHandler is called when a setting changes
+// SettingHandler handles a setting change.
 type SettingHandler func(value string) error
 
-// StartSettingsWatcher starts watching settings hash for specific fields
+// StartSettingsWatcher registers a settings-field handler.
 func (c *Client) StartSettingsWatcher(field string, handler SettingHandler) {
 	if c.settingsWatch == nil {
 		c.settingsWatch = c.client.NewHashWatcher("settings")
@@ -403,7 +390,7 @@ func (c *Client) StartSettingsWatcher(field string, handler SettingHandler) {
 	})
 }
 
-// StartSettingsWatching begins watching after all fields are registered
+// StartSettingsWatching starts the registered settings watchers.
 func (c *Client) StartSettingsWatching() {
 	if c.settingsWatch != nil {
 		c.settingsWatch.StartWithSync()

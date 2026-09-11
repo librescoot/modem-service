@@ -20,25 +20,22 @@ func waitCtx(ctx context.Context, d time.Duration) error {
 }
 
 const (
-	// GPIO pin configuration (GPIO4.14 = pin 110)
-	GPIOChip = "gpiochip3" // GPIO chip 3
-	GPIOLine = 14          // GPIO line 14
+	GPIOChip = "gpiochip3" // GPIO4.14, physical pin 110
+	GPIOLine = 14
 
-	// Pulse timing from SIM7100E hardware spec
-	ModemOnPulseMS  = 500  // 500ms to turn ON (per SIM7100_Hardware_Design v1.11)
-	ModemOffPulseMS = 3500 // 3500ms to turn OFF (increased from 2.5s minimum for safety)
-
-	// Wait time after power off
-	ModemOffWaitMS = 12000 // 12 seconds wait after power off
+	// Pulses satisfy the SIM7100E hardware specification; shutdown uses margin.
+	ModemOnPulseMS  = 500
+	ModemOffPulseMS = 3500
+	ModemOffWaitMS  = 12000
 )
 
-// PowerController manages modem power via GPIO
+// PowerController manages modem power via GPIO.
 type PowerController struct {
 	line   *gpiocdev.Line
 	logger func(string, ...interface{})
 }
 
-// NewPowerController creates a new GPIO power controller
+// NewPowerController creates a GPIO power controller.
 func NewPowerController(logger func(string, ...interface{})) (*PowerController, error) {
 	if logger == nil {
 		logger = func(string, ...interface{}) {}
@@ -51,9 +48,8 @@ func NewPowerController(logger func(string, ...interface{})) (*PowerController, 
 	return pc, nil
 }
 
-// Init initializes the GPIO line
+// Init requests the GPIO line as output, initially low.
 func (pc *PowerController) Init() error {
-	// Request the GPIO line as output, initially low
 	line, err := gpiocdev.RequestLine(GPIOChip, GPIOLine,
 		gpiocdev.AsOutput(0),
 		gpiocdev.WithConsumer("modem-power"),
@@ -67,7 +63,7 @@ func (pc *PowerController) Init() error {
 	return nil
 }
 
-// Close releases the GPIO line
+// Close releases the GPIO line.
 func (pc *PowerController) Close() error {
 	if pc.line == nil {
 		return nil
@@ -79,7 +75,7 @@ func (pc *PowerController) Close() error {
 	return err
 }
 
-// PowerOn sends a power-on pulse to the modem
+// PowerOn sends the modem's power-on pulse.
 func (pc *PowerController) PowerOn() error {
 	if pc.line == nil {
 		return errors.New("GPIO not initialized")
@@ -87,15 +83,12 @@ func (pc *PowerController) PowerOn() error {
 
 	pc.log("Sending power ON pulse (%dms)...", ModemOnPulseMS)
 
-	// Set high
 	if err := pc.line.SetValue(1); err != nil {
 		return errors.Wrap(err, "failed to set GPIO high")
 	}
 
-	// Hold pulse
 	time.Sleep(time.Duration(ModemOnPulseMS) * time.Millisecond)
 
-	// Set low
 	if err := pc.line.SetValue(0); err != nil {
 		return errors.Wrap(err, "failed to set GPIO low")
 	}
@@ -113,24 +106,19 @@ func (pc *PowerController) PowerOff(ctx context.Context) error {
 
 	pc.log("Sending power OFF pulse (%dms)...", ModemOffPulseMS)
 
-	// Set high
 	if err := pc.line.SetValue(1); err != nil {
 		return errors.Wrap(err, "failed to set GPIO high")
 	}
 
-	// Hold pulse (longer for power off). The pulse itself must complete
-	// regardless of ctx — interrupting it mid-pulse could leave the modem
-	// in an indeterminate state.
+	// Never interrupt the pulse itself; partial timing leaves hardware state unknown.
 	time.Sleep(time.Duration(ModemOffPulseMS) * time.Millisecond)
 
-	// Set low
 	if err := pc.line.SetValue(0); err != nil {
 		return errors.Wrap(err, "failed to set GPIO low")
 	}
 
 	pc.log("Power OFF pulse complete, waiting %dms...", ModemOffWaitMS)
 
-	// Wait for modem to fully power down — interruptible.
 	if err := waitCtx(ctx, time.Duration(ModemOffWaitMS)*time.Millisecond); err != nil {
 		pc.log("Power OFF wait interrupted: %v", err)
 		return err

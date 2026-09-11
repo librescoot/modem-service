@@ -24,18 +24,9 @@ type IP4Config struct {
 	MTU     uint32
 }
 
-// BearerStats mirrors Bearer.Stats. Note that ModemManager refreshes these on
-// roughly a 30 second cadence, so byte deltas are useless for sub-30s liveness
-// checks. Attempts and Duration are the useful fields for health: Attempts
-// increments on each bearer reconnect and Duration resets with it, which
-// together identify a session that is flapping.
-//
-// RxBytes/TxBytes cover the current connection attempt and zero on every
-// reconnect. TotalRxBytes/TotalTxBytes cover the bearer object's whole life and
-// do not, which makes them the better input for byte accounting: a reconnect
-// between two polls otherwise loses whatever moved in the tail of the old
-// session. They arrived in ModemManager 1.20, hence HaveTotals — MM omits the
-// keys entirely on older versions rather than reporting zero.
+// BearerStats mirrors Bearer.Stats. Attempts and Duration identify reconnects;
+// byte counters refresh too slowly for liveness. Total* spans reconnects but is
+// omitted before ModemManager 1.20, as indicated by HaveTotals.
 type BearerStats struct {
 	RxBytes      uint64
 	TxBytes      uint64
@@ -75,10 +66,7 @@ func (c *Client) ListBearers(modemPath dbus.ObjectPath) ([]dbus.ObjectPath, erro
 	return paths, nil
 }
 
-// GetBearerInfo reads one bearer's properties. All property failures degrade
-// to zero values rather than failing the whole read: a bearer that is
-// mid-teardown can drop properties independently. This allows robust bearer
-// discovery even when individual properties are transiently unreadable.
+// GetBearerInfo reads available properties while tolerating a bearer mid-teardown.
 func (c *Client) GetBearerInfo(bearerPath dbus.ObjectPath) (BearerInfo, error) {
 	info := BearerInfo{Path: bearerPath}
 

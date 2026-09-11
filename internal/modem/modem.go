@@ -15,20 +15,17 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-// Constants for modem state
 const (
 	StateDefault         = "UNKNOWN"
 	AccessTechDefault    = "UNKNOWN"
 	SignalQualityDefault = 255
 )
 
-// Modem power states
 const (
 	PowerStateOn  = "on"
 	PowerStateOff = "off"
 )
 
-// SIM states
 const (
 	// SIMStateUnknown is the default before/when the modem can't be read.
 	// "missing" must mean the modem actually reported no SIM, not that the
@@ -41,7 +38,6 @@ const (
 	SIMStateInactive = "inactive"
 )
 
-// Registration states
 const (
 	RegistrationHome    = "home"
 	RegistrationRoaming = "roaming"
@@ -50,7 +46,7 @@ const (
 	RegistrationUnknown = "unknown"
 )
 
-// State represents the current state of the modem
+// State is the current modem snapshot.
 type State struct {
 	Status             string // Raw status from modem: "off", "connected", "disconnected", "no-modem", "UNKNOWN"
 	LastRawModemStatus string // Used by service layer to cache last published raw modem status
@@ -79,7 +75,7 @@ type State struct {
 	ApnAction          string // outcome of last APN reconcile (see internal/apn)
 }
 
-// Manager manages modem operations via D-Bus
+// Manager controls modem operations through D-Bus and hardware recovery.
 type Manager struct {
 	client *mm.Client
 	gpio   *gpio.PowerController
@@ -118,7 +114,7 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-// NewState creates a new modem state with default values
+// NewState returns a modem state with unknown/off defaults.
 func NewState() *State {
 	return &State{
 		Status:             StateDefault,
@@ -145,12 +141,11 @@ func (m *Manager) FindModem() (dbus.ObjectPath, error) {
 	return m.client.FindModem()
 }
 
-// GetModemInfo gets comprehensive modem information
+// GetModemInfo reads the current modem information.
 func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 	state := NewState()
 	state.ErrorState = "ok"
 
-	// Find modem
 	modemPath, err := m.FindModem()
 	if err != nil {
 		state.Status = "no-modem"
@@ -168,7 +163,6 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		state.PowerState = mm.PowerStateToString(int32(powerState))
 	}
 
-	// Get modem state
 	stateVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "State")
 	if err == nil {
 		if modemState, ok := stateVar.Value().(int32); ok {
@@ -183,21 +177,18 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Get SIM information
 	simVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "Sim")
 	if err == nil {
 		if simPath, ok := simVar.Value().(dbus.ObjectPath); ok && string(simPath) != "/" {
 			state.SIMState = SIMStatePresent
 			state.SIMPath = simPath
 
-			// Get IMSI
 			if imsiVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "Imsi"); err == nil {
 				if imsi, ok := imsiVar.Value().(string); ok {
 					state.IMSI = imsi
 				}
 			}
 
-			// Get ICCID (also try via AT command)
 			if iccid, err := m.client.GetICCID(modemPath); err == nil && iccid != "" {
 				state.ICCID = iccid
 			} else if iccidVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "SimIdentifier"); err == nil {
@@ -206,7 +197,6 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 				}
 			}
 
-			// Get operator info
 			if opVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "OperatorName"); err == nil {
 				if op, ok := opVar.Value().(string); ok {
 					state.OperatorName = op
@@ -222,7 +212,6 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Get SIM lock status
 	if lockVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "UnlockRequired"); err == nil {
 		if lock, ok := lockVar.Value().(uint32); ok {
 			lockStr := mm.LockReasonToString(lock)
@@ -247,9 +236,8 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		state.UnlockRetriesPin = retries[mm.MMLockSimPin]
 	}
 
-	// Get signal quality - returns (ub) struct: quality percentage and "recent" flag
+	// SignalQuality is a D-Bus (ub) struct; only the percentage is needed.
 	if qualVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "SignalQuality"); err == nil {
-		// Try as []interface{} first (D-Bus struct becomes slice)
 		if qualSlice, ok := qualVar.Value().([]interface{}); ok && len(qualSlice) > 0 {
 			if qual, ok := qualSlice[0].(uint32); ok {
 				state.SignalQuality = uint8(qual)
@@ -257,7 +245,6 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Get IMEI (try AT command first, fallback to property)
 	if imei, err := m.client.GetIMEI(modemPath); err == nil && imei != "" {
 		state.IMEI = imei
 	} else if imeiVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "EquipmentIdentifier"); err == nil {
@@ -266,14 +253,12 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Get access technology
 	if techVar, err := m.client.GetProperty(modemPath, mm.ModemInterface, "AccessTechnologies"); err == nil {
 		if tech, ok := techVar.Value().(uint32); ok {
 			state.AccessTech = mm.AccessTechnologyToString(tech)
 		}
 	}
 
-	// Get 3GPP registration state
 	if regVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "RegistrationState"); err == nil {
 		if reg, ok := regVar.Value().(uint32); ok {
 			state.Registration = mm.RegistrationStateToString(reg)
@@ -281,7 +266,6 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Get operator name from 3GPP if not from SIM
 	if state.OperatorName == "" {
 		if opVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "OperatorName"); err == nil {
 			if op, ok := opVar.Value().(string); ok {
@@ -297,7 +281,6 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Get interface IP if connected
 	if state.Status == "connected" {
 		if ifIP, err := GetInterfaceIP(interfaceName); err == nil {
 			state.IfIPAddr = ifIP
@@ -307,7 +290,6 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	// Determine consolidated error state
 	if state.ErrorState == "ok" {
 		if state.PowerState != PowerStateOn {
 			state.ErrorState = "powered-off"
@@ -329,7 +311,7 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 	return state, nil
 }
 
-// GetInterfaceIP gets the IP address of the interface
+// GetInterfaceIP returns the interface's global unicast IPv4 address.
 func GetInterfaceIP(interfaceName string) (string, error) {
 	iface, err := net.InterfaceByName(interfaceName)
 	if err != nil {
@@ -350,7 +332,7 @@ func GetInterfaceIP(interfaceName string) (string, error) {
 	return "", fmt.Errorf("no global unicast IPv4 address found for interface %s", interfaceName)
 }
 
-// CheckPrimaryPort checks if the primary port is correct
+// CheckPrimaryPort verifies that ModemManager selected cdc-wdm0.
 func (m *Manager) CheckPrimaryPort() error {
 	modemPath, err := m.FindModem()
 	if err != nil {
@@ -400,7 +382,7 @@ func (m *Manager) CheckReadyState() error {
 	return m.checkReadyState(modemPath)
 }
 
-// CheckPowerState checks if the power state is correct
+// CheckPowerState verifies that the modem is powered on.
 func (m *Manager) CheckPowerState() error {
 	modemPath, err := m.FindModem()
 	if err != nil {
@@ -421,7 +403,7 @@ func (m *Manager) CheckPowerState() error {
 	return nil
 }
 
-// StartModem starts the modem via GPIO
+// StartModem powers on the modem via GPIO.
 func (m *Manager) StartModem() error {
 	if m.gpio == nil {
 		return fmt.Errorf("GPIO controller not initialized")
@@ -450,7 +432,7 @@ func (m *Manager) PowerOffModem(ctx context.Context) error {
 	return m.gpio.PowerOff(ctx)
 }
 
-// RestartModem restarts the modem (power cycle)
+// RestartModem power-cycles the modem, falling back to D-Bus reset.
 func (m *Manager) RestartModem(ctx context.Context) error {
 	if m.gpio == nil {
 		return fmt.Errorf("GPIO controller not initialized")
@@ -461,9 +443,7 @@ func (m *Manager) RestartModem(ctx context.Context) error {
 	}
 	defer m.gpio.Close()
 
-	// Full power cycle
 	if err := m.gpio.Cycle(ctx); err != nil {
-		// Fallback to D-Bus reset
 		m.logger.Printf("GPIO power cycle failed, attempting D-Bus reset...")
 		modemPath, err := m.FindModem()
 		if err != nil {
@@ -475,7 +455,7 @@ func (m *Manager) RestartModem(ctx context.Context) error {
 	return nil
 }
 
-// ResetModem resets the modem via D-Bus
+// ResetModem resets the modem via D-Bus.
 func (m *Manager) ResetModem() error {
 	modemPath, err := m.FindModem()
 	if err != nil {
@@ -484,18 +464,18 @@ func (m *Manager) ResetModem() error {
 	return m.client.Reset(modemPath)
 }
 
-// RecoverUSB performs USB recovery
+// RecoverUSB re-enumerates the modem on USB.
 func (m *Manager) RecoverUSB() error {
 	return m.usb.Recover()
 }
 
-// IsInterfacePresent checks if the interface is present
+// IsInterfacePresent reports whether a network interface exists.
 func IsInterfacePresent(interfaceName string) bool {
 	_, err := net.InterfaceByName(interfaceName)
 	return err == nil
 }
 
-// IsModemPresent checks if modem is present via D-Bus
+// IsModemPresent reports whether ModemManager exposes a modem.
 func (m *Manager) IsModemPresent() bool {
 	_, err := m.FindModem()
 	return err == nil
@@ -596,7 +576,7 @@ func (m *Manager) WaitForModem(ctx context.Context, interfaceName string) error 
 	}
 }
 
-// IsUSBDevicePresent checks if the USB device is present
+// IsUSBDevicePresent reports whether the modem USB node exists.
 func IsUSBDevicePresent() bool {
 	if _, err := os.Stat("/sys/bus/usb/devices/1-1"); err == nil {
 		return true
@@ -604,15 +584,12 @@ func IsUSBDevicePresent() bool {
 	return false
 }
 
-// Convenience functions for backward compatibility
-
-// FindModemID finds the modem and returns a string ID (for compatibility)
+// FindModemID returns the final component of the modem object path.
 func FindModemID(m *Manager) (string, error) {
 	path, err := m.FindModem()
 	if err != nil {
 		return "", err
 	}
-	// Extract last component of path as ID
 	pathStr := string(path)
 	parts := strings.Split(pathStr, "/")
 	if len(parts) > 0 {

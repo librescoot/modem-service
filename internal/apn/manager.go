@@ -1,21 +1,5 @@
-// Package apn reconciles the LTE attach APN and data-bearer credentials
-// (cellular.apn, cellular.username, cellular.password, cellular.auth) with
-// two backends:
-//
-//   - ModemManager initial-EPS-bearer settings, which persist in the modem
-//     and govern the LTE attach context (AT+CGDCONT in firmware terms). A
-//     wrong attach APN can prevent registration entirely on some networks,
-//     even if NetworkManager's data APN is correct.
-//   - The NetworkManager "wwan" GSM connection profile, which sets the data
-//     bearer APN/user/password used after attach.
-//
-// Both must be reconciled — NM-only doesn't fix attach problems, MM-only
-// doesn't authenticate the data session.
-//
-// SIM swap handling: the manager tracks the ICCID we last applied settings
-// for. If the modem reports a different ICCID, NM and MM are cleared to
-// defaults (the new SIM's operator decides) and the user has to set new
-// values in cellular.* settings to re-arm reconciliation.
+// Package apn reconciles both the modem's LTE attach context and
+// NetworkManager's data bearer. A SIM swap clears both until reconfigured.
 package apn
 
 import (
@@ -147,11 +131,7 @@ func (m *Manager) Reconcile(in Input) Outcome {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// SIM swap detection. If the ICCID changed since we last applied (and
-	// we ever did), clear both backends to defaults. We don't try to
-	// re-apply settings to the new SIM — those may have been right for the
-	// old SIM. User must explicitly set values for the new SIM, which
-	// triggers reapply via the settings watcher → next Reconcile path.
+	// Never apply the previous SIM's credentials automatically to a new ICCID.
 	if m.lastAppliedICCID != "" && m.lastAppliedICCID != in.ICCID {
 		m.logger.Printf("apn: ICCID changed (%s -> %s), clearing NM + MM APN config",
 			m.lastAppliedICCID, in.ICCID)
@@ -174,8 +154,7 @@ func (m *Manager) Reconcile(in Input) Outcome {
 	}
 
 	if in.Desired.IsEmpty() {
-		// No user config. Make sure NM/MM are also empty so the SIM's
-		// operator defaults are used. Skip work if already empty.
+		// Clear stale values so operator defaults apply when unconfigured.
 		nmCur, mmCur, err := m.readCurrent(in.ModemPath)
 		if err != nil {
 			m.logger.Printf("apn: read current failed: %v", err)
@@ -326,11 +305,8 @@ func (m *Manager) Reattach(modemPath dbus.ObjectPath) error {
 	return nil
 }
 
-// validateATValue rejects values that would break the AT quoting. SIMCom AT
-// has no escape mechanism inside string literals; a literal double-quote
-// would terminate the argument and let the rest of the value be parsed as
-// command syntax. APNs and usernames don't contain quotes in practice;
-// passwords can but won't from settings-service. Defense-in-depth.
+// validateATValue rejects command separators because SIMCom string literals
+// provide no escaping.
 func validateATValue(s string) error {
 	if strings.ContainsAny(s, "\"\r\n") {
 		return fmt.Errorf("contains quote or newline")

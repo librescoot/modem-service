@@ -1,14 +1,5 @@
-// Package sms sends and receives SMS messages through ModemManager. It owns
-// the create/send/delete dance for outbound messages and the read/delete dance
-// for inbound ones, deleting every message from the modem as soon as it has
-// been handled so the modem's small message store (typically a few dozen slots
-// on SIMCom hardware) never fills up.
-//
-// The manager is deliberately I/O-narrow: it talks to ModemManager only through
-// the MessagingDBus interface (satisfied by mm.Client), so it can be unit
-// tested with a recorder. Service-level concerns — Redis publishing, resolving
-// the modem path, arming the Added-signal watch — live in internal/service,
-// mirroring how internal/sim splits its decision logic from the wiring.
+// Package sms sends and receives messages through ModemManager while keeping
+// the modem's small message store drained.
 package sms
 
 import (
@@ -189,23 +180,10 @@ func (m *Manager) DrainReceived(modemPath dbus.ObjectPath) error {
 	return nil
 }
 
-// processOne classifies a single SMS object and acts on it. It assumes m.mu is
-// held. Classification is by elimination so that received messages a modem
-// reports oddly (state "stored", no PduType) are still treated as inbound:
-//
-//   - assembling (state=receiving)        → left for a later drain
-//   - status report                       → deleted (delivery report, nothing to publish)
-//   - outbound (SUBMIT / sending / sent)  → deleted as a stale leftover (mu means
-//     no send is in flight, so it can't be a live one)
-//   - everything else                     → treated as inbound: delivered, then deleted
-//
-// Delivery comes before the delete so modem storage doubles as the retry
-// buffer: if the deliver callback fails (Redis down), the object stays put and
-// the periodic drain tries again. The reverse case — delivery succeeded but
-// the delete fails — is also handled: some modems report a delete error but
-// drop the object anyway (e.g. when the QMI WMS and AT steps disagree), so
-// delivered-but-undeleted objects are remembered and later drains only retry
-// the delete, never publish a duplicate.
+// processOne classifies one SMS while mu is held. Unknown PDU types default to
+// inbound because some modems omit PduType. Delivery precedes deletion so the
+// modem store retries failed delivery; successful deliveries are remembered
+// across delete failures to prevent duplicates.
 func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) {
 	props, err := m.dbus.GetSMSProperties(smsPath)
 	if err != nil {
@@ -258,10 +236,7 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) {
 		m.logger.Printf("sms: received from %s (%d chars, pdu=%s state=%s)",
 			msg.Number, len(msg.Text), mm.SmsPduTypeToString(props.PduType), mm.SmsStateToString(props.State))
 		if err := m.deliver(msg); err != nil {
-			// Not recorded anywhere durable yet: keep the object in modem
-			// storage so the periodic drain retries. (A transient Added-signal
-			// object that never lands in storage is lost here — acceptable
-			// until messages get persisted off-Redis.)
+			// Keep the modem copy as the retry buffer until delivery commits.
 			m.logger.Printf("sms: delivery of %s failed, leaving in modem storage: %v", smsPath, err)
 			return
 		}

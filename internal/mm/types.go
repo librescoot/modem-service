@@ -1,8 +1,5 @@
 package mm
 
-// ModemManager constants and enums
-
-// Modem State
 const (
 	MMModemStateFailed        int32 = -1
 	MMModemStateUnknown       int32 = 0
@@ -19,7 +16,6 @@ const (
 	MMModemStateConnected     int32 = 11
 )
 
-// Power State
 const (
 	MMModemPowerStateUnknown int32 = 0
 	MMModemPowerStateOff     int32 = 1
@@ -27,7 +23,6 @@ const (
 	MMModemPowerStateOn      int32 = 3
 )
 
-// Registration State
 const (
 	MMModem3gppRegistrationStateIdle      uint32 = 0
 	MMModem3gppRegistrationStateHome      uint32 = 1
@@ -37,7 +32,6 @@ const (
 	MMModem3gppRegistrationStateRoaming   uint32 = 5
 )
 
-// Access Technology
 const (
 	MMModemAccessTechnologyUnknown    uint32 = 0
 	MMModemAccessTechnologyPots       uint32 = 1 << 0
@@ -58,7 +52,6 @@ const (
 	MMModemAccessTechnology5gnr       uint32 = 1 << 15
 )
 
-// Location Source
 const (
 	MMModemLocationSource3gppLacCi    uint32 = 1 << 0
 	MMModemLocationSourceGpsRaw       uint32 = 1 << 1
@@ -71,15 +64,15 @@ const (
 
 // 3GPP Facility Locks (bitmask in EnabledFacilityLocks)
 const (
-	MMModem3gppFacilityNone           uint32 = 0
-	MMModem3gppFacilitySim            uint32 = 1 << 0
-	MMModem3gppFacilityFixedDialing   uint32 = 1 << 1
-	MMModem3gppFacilityPhSim          uint32 = 1 << 2
-	MMModem3gppFacilityPhFSim         uint32 = 1 << 3
-	MMModem3gppFacilityNetPers        uint32 = 1 << 4
-	MMModem3gppFacilityNetSubPers     uint32 = 1 << 5
-	MMModem3gppFacilityProviderPers   uint32 = 1 << 6
-	MMModem3gppFacilityCorpPers       uint32 = 1 << 7
+	MMModem3gppFacilityNone         uint32 = 0
+	MMModem3gppFacilitySim          uint32 = 1 << 0
+	MMModem3gppFacilityFixedDialing uint32 = 1 << 1
+	MMModem3gppFacilityPhSim        uint32 = 1 << 2
+	MMModem3gppFacilityPhFSim       uint32 = 1 << 3
+	MMModem3gppFacilityNetPers      uint32 = 1 << 4
+	MMModem3gppFacilityNetSubPers   uint32 = 1 << 5
+	MMModem3gppFacilityProviderPers uint32 = 1 << 6
+	MMModem3gppFacilityCorpPers     uint32 = 1 << 7
 )
 
 // SIM Lock Reason
@@ -100,8 +93,6 @@ const (
 	MMLockPhCorpPin uint32 = 13
 	MMLockPhCorpPuk uint32 = 14
 )
-
-// Helper functions
 
 func ModemStateToString(state int32) string {
 	switch state {
@@ -173,7 +164,6 @@ func AccessTechnologyToString(tech uint32) string {
 		return "UNKNOWN"
 	}
 
-	// Check in order of preference (newer tech first)
 	if tech&MMModemAccessTechnology5gnr != 0 {
 		return "5G"
 	}

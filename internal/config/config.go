@@ -10,8 +10,7 @@ type Config struct {
 	RedisURL          string
 	InternetCheckTime time.Duration
 
-	// InternetCheckMaxInterval bounds the probe's exponential backoff while
-	// healthy. Local layer checks are unaffected and still run every tick.
+	// Only the remote probe backs off; local checks retain InternetCheckTime.
 	InternetCheckMaxInterval time.Duration
 
 	connectivityTargetsRaw string
@@ -38,8 +37,6 @@ func New() *Config {
 
 	flag.StringVar(&cfg.RedisURL, "redis-url", "redis://127.0.0.1:6379", "Redis URL")
 	flag.DurationVar(&cfg.InternetCheckTime, "internet-check-time", 30*time.Second, "Internet check interval")
-	// Only the network probe backs off; the local layer checks still run every
-	// InternetCheckTime, so a real fault is still caught within one tick.
 	flag.DurationVar(&cfg.InternetCheckMaxInterval, "internet-check-max-interval",
 		5*time.Minute, "Upper bound for connectivity probe backoff")
 	// Fallback probe targets, used only when no network-assigned resolver
@@ -62,11 +59,7 @@ func New() *Config {
 	// SIM's mailbox doesn't pick up busy calls. Enable per fleet/SIM setup.
 	flag.BoolVar(&cfg.SMSKeepalive, "sms-keepalive", false, "Keep the CS (SGs) registration alive for SMS delivery via periodic self-calls")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
-	// Written at power transitions and shutdown, not on a timer: see
-	// internal/datausage. /data is the only writable partition that survives
-	// an OTA, and it is flat by convention (/data/trips.db, /data/profiles.db).
-	// A /data/modem-service/ directory would also collide with the staged
-	// binary of the same name that the deploy instructions leave lying around.
+	// /data survives OTA; persistence occurs at power transitions and shutdown.
 	flag.StringVar(&cfg.DataUsageFile, "data-usage-file", "/data/internet-usage.json",
 		"Where to persist cellular byte totals; empty keeps them in memory only")
 

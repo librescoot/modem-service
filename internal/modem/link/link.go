@@ -1,11 +1,6 @@
-// Package link assesses the modem's local connectivity layers and picks a
-// proportionate remedy. It has no hardware or D-Bus dependencies so it can be
-// unit-tested on any platform, following internal/modem/connectivity.
-//
-// The invariant this package exists to enforce: only local signals may trigger
-// a modem action. Whether some destination is reachable is a separate question
-// with its own answer, and it is never grounds for touching the hardware. A
-// fleet on a restricted APN is unreachable by design and permanently healthy.
+// Package link assesses local connectivity layers and selects remedies.
+// Remote reachability never justifies modem action because restricted APNs may
+// intentionally reject every probe target.
 package link
 
 import "fmt"
@@ -81,14 +76,8 @@ const stableSessionSeconds = 120
 // flapping data session rather than one unlucky reconnect.
 const flapsBeforeFailing = 3
 
-// livenessLadder is walked in cost order as liveness keeps failing.
-//
-// RemedyModemReset is deliberately absent. The design called for a soak on
-// affected hardware before layer 7 is allowed to power-cycle a modem, and that
-// soak has not happened: the only on-device run was six minutes on an
-// unrestricted SIM with no remedy fired. A genuinely dead modem still reaches
-// the reset ladder through layer 0 via the health check, which is where it
-// shows up anyway. Add the rung here once there is evidence it is needed.
+// livenessLadder excludes modem reset until layer-7 detection is validated on
+// affected hardware; dead modems still reach reset through layer 0.
 var livenessLadder = []Remedy{RemedyBearerBounce, RemedyReattach}
 
 // Snapshot is one observation of layers 0 through 7. Empty string fields mean
@@ -129,10 +118,7 @@ type Snapshot struct {
 	DefaultRouteKnown bool
 	HasDefaultRoute   bool
 
-	// Byte counters are deliberately absent. Layer 7 used to compare tx
-	// against rx, which cannot distinguish a wedged link from a network that
-	// drops traffic by design, and which the connectivity probe's own traffic
-	// feeds directly. See sessionFlapped.
+	// Byte counters are excluded because remote silence can mimic a wedge.
 }
 
 // Assessment is the verdict for one snapshot.
@@ -280,19 +266,8 @@ func checkLocal(s Snapshot) (Assessment, bool) {
 	return Assessment{}, false
 }
 
-// sessionFlapped reports whether the data session was torn down and brought
-// back inside this window, having lived only briefly.
-//
-// This is what layer 7 measures instead of byte counters. "Did my traffic get
-// answered" is inherently destination-dependent: on a network that drops
-// everything by design, the honest answer is indistinguishable from a broken
-// modem, and acting on it is the exact bug this package exists to remove.
-// A bearer that keeps collapsing and re-establishing, by contrast, is a local
-// fact that no amount of silence from the far end can fabricate.
-//
-// ModemManager increments Bearer.Stats attempts on each reconnect and resets
-// duration with it, so a rising attempts count paired with a short duration
-// means the session did not survive.
+// sessionFlapped detects a reconnect into a short-lived session from
+// ModemManager's rising attempt count and reset duration.
 func sessionFlapped(prev, cur Snapshot) bool {
 	if !prev.BearerSessionKnown || !cur.BearerSessionKnown {
 		return false

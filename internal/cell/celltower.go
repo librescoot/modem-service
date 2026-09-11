@@ -24,7 +24,6 @@ func ParseModemManagerLocation(locationData map[uint32]dbus.Variant, radioType s
 		return nil, fmt.Errorf("unexpected 3GPP location data type: %T", lacCiVariant.Value())
 	}
 
-	// Format: "MCC,MNC,LAC,CID,TAC"
 	parts := strings.Split(raw, ",")
 	if len(parts) < 4 {
 		return nil, fmt.Errorf("unexpected 3GPP string format: %q", raw)
@@ -51,7 +50,7 @@ func ParseModemManagerLocation(locationData map[uint32]dbus.Variant, radioType s
 		return nil, fmt.Errorf("cell ID is zero (not registered)")
 	}
 
-	// Use TAC if present (LTE/5G), fall back to LAC (2G/3G)
+	// LTE/5G reports TAC; older networks use LAC.
 	areaCode := int(lac)
 	if len(parts) >= 5 {
 		if tac, err := strconv.ParseInt(parts[4], 16, 64); err == nil && tac != 0 {

@@ -1,21 +1,9 @@
-// Package connectivity classifies the modem's high-level state into a
-// connectivity value with hysteresis. Kept as a separate package so it has no
-// hardware dependencies and can be unit-tested on any platform.
-//
-// The committed value answers one question for downstream consumers: is this
-// scooter provisioned for connectivity, and if not, why? The dashboard uses it
-// to decide whether the internet icon is worth showing at all; the GPS
-// subsystem uses it (via IsConnected) to pick a positioning mode.
+// Package connectivity classifies modem state with transition hysteresis.
 package connectivity
 
 import "time"
 
-// State is the committed connectivity state.
-//
-// Values split into three groups by what the dashboard does with them:
-//   - Connected / Disconnected: provisioned and in use (or trying) -> show.
-//   - Failed: modem broken/absent -> show (it's an actionable fault).
-//   - Disabled / NoSIM / Denied: offline by design or unprovisioned -> hide.
+// State is the committed connectivity state consumed by the dashboard.
 type State string
 
 const (
@@ -49,9 +37,7 @@ const (
 	RegistrationFailed = "failed"
 )
 
-// Debounce thresholds. We stay quick to SHOW the icon and slow to flip it into
-// a teardown/hidden state: connecting is low-cost, but flapping the icon away
-// (or tearing down GPS mode) on a brief coverage gap is not.
+// Transition delays prevent coverage flicker from thrashing UI and GPS mode.
 const (
 	OnlineDebounce  = 60 * time.Second
 	OfflineDebounce = 3 * time.Minute
@@ -94,8 +80,7 @@ func (c *Classifier) Classify(in Inputs) State {
 	raw := rawState(in)
 	now := c.now()
 
-	// First observation after startup: commit immediately so downstream
-	// consumers aren't stuck at unknown.
+	// Startup must not leave consumers at unknown for a full debounce window.
 	if c.committed == Unknown {
 		c.committed = raw
 		c.pending = raw
@@ -141,31 +126,23 @@ func (c *Classifier) Force(s State) {
 	c.pendingSince = c.now()
 }
 
-// rawState maps a raw snapshot to a connectivity state, before hysteresis.
-// Order matters: the most decisive / least-flickery reasons win first.
+// rawState maps inputs before hysteresis; decisive states take precedence.
 func rawState(in Inputs) State {
-	// Intentional disable wins: the rider (via pm-service) turned the modem off.
 	if !in.Enabled {
 		return Disabled
 	}
-	// Broken hardware: the health machine exhausted recovery.
 	if in.HardFailed {
 		return Failed
 	}
-	// SIM physically absent or unusable. Keyed on the modem actually reporting
-	// missing/inactive — not on the modem being off or unreachable.
 	if in.SIMState == SIMMissing || in.SIMState == SIMInactive {
 		return NoSIM
 	}
-	// SIM present but the network refuses it (e.g. carrier-deactivated SIM).
 	if in.Registration == RegistrationDenied || in.Registration == RegistrationFailed {
 		return Denied
 	}
 	if in.ModemStatus == StatusConnected {
 		return Connected
 	}
-	// Everything else (disconnected / off / no-modem / unknown) is a provisioned
-	// modem that simply isn't connected right now.
 	return Disconnected
 }
 

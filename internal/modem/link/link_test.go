@@ -191,13 +191,6 @@ func TestATCrossCheckClearsSuspicion(t *testing.T) {
 	}
 }
 
-// TestProbeSizedTxDoesNotFailLiveness is the regression test for the way this
-// change could have reintroduced the bug it exists to fix.
-//
-
-// TestLivenessLadderNeverReachesModemReset pins the decision that layer 7 may
-// not power-cycle a modem until the behaviour has been soaked on affected
-
 // stableSession returns a healthy snapshot whose data session has been up long
 // enough to count as stable.
 func stableSession() Snapshot {
@@ -207,20 +200,11 @@ func stableSession() Snapshot {
 	return s
 }
 
-// TestSilentNetworkNeverFailsLiveness is the regression test for the way this
-// package could have reintroduced the bug it exists to fix.
-//
-// Layer 7 used to compare transmitted bytes against received bytes. The
-// connectivity probe transmits on the same interface, so on a destination that
-// never answers the service would read its own probe traffic as tx-with-no-rx,
-// call it a wedge, and escalate to remedies on a perfectly healthy modem.
-// Liveness must depend on nothing that a silent far end can influence.
+// Liveness must not depend on any signal that a silent far end can influence.
 func TestSilentNetworkNeverFailsLiveness(t *testing.T) {
 	a := New()
 	s := stableSession()
 	for range 50 {
-		// Session stays up and stable; nothing answers on the network, which
-		// this layer cannot and must not observe.
 		s.BearerDuration += 30
 		if got := a.Assess(s); !got.Healthy {
 			t.Fatalf("Assess() = %+v, want Healthy: a silent network is not a wedge", got)
@@ -310,7 +294,6 @@ func TestStableSessionClearsFlapsAndLadder(t *testing.T) {
 	}
 	a.NoteRemedyApplied(LayerLiveness, livenessLadder[0])
 
-	// The session comes back and stays up.
 	s.BearerDuration = stableSessionSeconds * 5
 	if got := a.Assess(s); !got.Healthy {
 		t.Fatalf("Assess() = %+v, want Healthy once the session is stable", got)
@@ -405,13 +388,7 @@ func TestLivenessNeverReachesModemReset(t *testing.T) {
 	}
 }
 
-// TestPersistentFlapReportsEveryTick is the regression test for a critical
-// self-inflicted defect: Assess used to clear the flap count the moment it
-// reported a failure, so the next tick read healthy. The caller debounces by
-// requiring the same failing layer on consecutive assessments, so that reset
-// meant a permanently flapping session could never be confirmed twice in a row
-// and no liveness remedy could ever be applied. Measured before the fix: 100
-// failures reported, 0 remedies applied, across 300 ticks.
+// Sustained failure must remain visible long enough for caller-side debounce.
 func TestPersistentFlapReportsEveryTick(t *testing.T) {
 	a := New()
 	s := stableSession()

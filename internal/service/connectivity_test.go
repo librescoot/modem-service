@@ -8,16 +8,7 @@ import (
 	"modem-service/internal/modem/link"
 )
 
-// TestUnreachableProbeNeverTriggersRemedy is the regression test for the bug
-// this whole change exists to fix. A modem healthy at every local layer, with
-// a probe that never succeeds, must never produce a remedy no matter how long
-// it runs.
-//
-// The old code did the opposite: three failed probes escalated into the
-// recovery ladder, and because the failure counter was only cleared by a
-// success, every subsequent tick escalated again. One vehicle on a restrictive
-// APN logged 184 consecutive failures, resetting a modem that was attached,
-// addressed and passing traffic the entire time.
+// Remote silence must never trigger recovery when every local layer is healthy.
 func TestUnreachableProbeNeverTriggersRemedy(t *testing.T) {
 	healthy := link.Assessment{Healthy: true}
 	s := &Service{remedyCooldown: map[link.Remedy]time.Time{}}
@@ -175,11 +166,7 @@ func TestProbeBackoffDoublesOnSuccess(t *testing.T) {
 	}
 }
 
-// TestProbeBackoffDoesNotResetOnFailure pins a deliberate choice. A probe
-// failure is never a fault under this design, so snapping back to the base
-// interval would keep a unit whose destinations are silent probing at full
-// rate forever, which is exactly the fleet this change exists for. Prompt
-// re-probing is driven by a change in the local assessment instead.
+// Probe failure also backs off because remote silence is not a local fault.
 func TestProbeBackoffDoesNotResetOnFailure(t *testing.T) {
 	const base = 30 * time.Second
 	const maxInterval = 5 * time.Minute
@@ -263,15 +250,6 @@ func TestLinkLayerField(t *testing.T) {
 	}
 }
 
-// TestSingleObservationDoesNotAct pins the debounce. The machinery this
-// replaced tolerated a stalled data session for 15 minutes so that tunnels,
-// underground parking and handoffs did not trigger action. Acting on one
-// snapshot would discard that tolerance, and the window right after startup or
-
-// TestPublishIfChangedOnlyWritesOnChange exercises the real method. The
-// previous version of this test declared a local closure that reimplemented
-// the change gate and asserted on the closure, so deleting publishIfChanged
-// entirely would have left it green.
 func TestPublishIfChangedOnlyWritesOnChange(t *testing.T) {
 	var writes []string
 	s := &Service{publishFn: func(field, value string) error {
@@ -318,9 +296,7 @@ func TestPublishIfChangedRetriesAfterFailure(t *testing.T) {
 	}
 }
 
-// Drives the real Assessor through the real service debounce, the way the
-// monitor loop does, and asserts a permanently flapping session eventually
-// produces a remedy. Before the fix this yielded zero over 300 ticks.
+// Exercise the real assessor and service debounce together.
 func TestPersistentFlapEventuallyRemediates(t *testing.T) {
 	now := time.Unix(0, 0)
 	a := link.New()

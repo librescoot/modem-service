@@ -25,16 +25,8 @@ var procNetRoute = "/proc/net/route"
 // assessor asks for them.
 const atCommandTimeout = 5 * time.Second
 
-// BearerUsage is the byte accounting half of the bearer read, returned
-// alongside the assessment snapshot rather than inside it. link.Snapshot
-// documents byte counters as deliberately absent, because layer 7 used to
-// compare tx against rx and that could not distinguish a wedged link from a
-// network that drops traffic by design. Keeping the counters out of the
-// assessor's input struct keeps them out of reach of that mistake.
-//
-// Valid reports whether a bearer was actually read. A failed read must not be
-// passed on as zeroes: datausage would take that for a counter reset and
-// double-count the session so far on the next successful poll.
+// BearerUsage separates accounting from link assessment so remote silence
+// cannot influence recovery. Valid prevents failed reads looking like resets.
 type BearerUsage struct {
 	Valid   bool
 	Path    string
@@ -57,25 +49,15 @@ func bearerUsage(b mm.BearerInfo) BearerUsage {
 	return u
 }
 
-// LinkSnapshot gathers connectivity layers 0 through 7, plus the bearer's byte
-// counters for accounting. Every read degrades to a zero value rather than
-// failing: link.Assess treats unknown as passing, so a flaky D-Bus read can
-// never manufacture a modem reset.
-//
-// state is the modem state the caller already read on this tick; passing it in
-// avoids a redundant round of D-Bus reads. A nil state leaves those fields
-// empty, which link.Assess treats as passing.
-//
-// withAT controls the AT cross-check, which the previous assessment requests
-// via Assessment.WantATCheck. In steady state it is false and no AT commands
-// are issued.
+// LinkSnapshot gathers local connectivity and usage observations. Failed reads
+// remain unknown, which link.Assess treats as passing. withAT enables the
+// expensive modem cross-check requested by the previous assessment.
 func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) (link.Snapshot, BearerUsage) {
 	snap := link.Snapshot{}
 	usage := BearerUsage{}
 
 	modemPath, err := m.FindModem()
 	if err != nil {
-		// ModemPresent stays false: a layer 0 failure, which is the truth.
 		return snap, usage
 	}
 	snap.ModemPresent = true
@@ -132,13 +114,8 @@ func (m *Manager) LinkSnapshot(state *State, iface string, withAT bool) (link.Sn
 	return snap, usage
 }
 
-// readATCrossCheck asks the modem directly what it thinks its PDP context and
-// address are, so they can be compared against what ModemManager reports.
-// Disagreement is a wedge that no reachability probe could distinguish from a
-// filtered destination.
-//
-// ATChecked is left false if either command fails: an unanswered AT port must
-// not read as "context inactive", which would request a remedy on no evidence.
+// readATCrossCheck compares modem PDP state with ModemManager. ATChecked stays
+// false unless both commands succeed, preventing a busy port from causing recovery.
 func (m *Manager) readATCrossCheck(modemPath dbus.ObjectPath, snap *link.Snapshot) {
 	out, err := m.client.SendCommand(modemPath, "AT+CGACT?", atCommandTimeout)
 	if err != nil {
@@ -162,15 +139,8 @@ func (m *Manager) readATCrossCheck(modemPath dbus.ObjectPath, snap *link.Snapsho
 	snap.CGPADDR = ParseCGPADDR(addrOut)
 }
 
-// ParseCGACT reports whether any PDP context is active in an AT+CGACT? reply,
-// and whether the reply could be parsed at all.
-//
-// The second return value matters: SendCommand returns a nil error for any
-// successful D-Bus round trip, including a modem that answers "ERROR", an
-// empty string, or a truncated line. Collapsing those into "no context is
-// active" would fail layer 5 and request a bearer bounce because the AT port
-// was momentarily busy, which is exactly what the treat-unknown-as-passing
-// rule exists to prevent.
+// ParseCGACT reports activity separately from parse success so an ERROR reply
+// cannot be mistaken for an inactive context.
 func ParseCGACT(out string) (active, parsed bool) {
 	for _, line := range strings.Split(out, "\n") {
 		_, rest, ok := strings.Cut(line, "+CGACT:")

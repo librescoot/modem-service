@@ -1,14 +1,4 @@
-// Package datausage turns ModemManager's per-bearer byte counters into
-// monotonic lifetime totals that survive a bearer teardown and a reboot.
-//
-// MM's rx/tx belong to one bearer object and one connection attempt: they zero
-// on every reconnect, and the modem reconnects often. Publishing them raw would
-// give consumers a number that walks backwards several times a day, which is
-// useless for a data allowance. This package folds each reading into a total
-// instead, and persists it.
-//
-// It has no D-Bus or Redis dependency so it unit-tests on any platform,
-// following internal/modem/link and internal/modem/connectivity.
+// Package datausage persists monotonic totals from per-bearer byte counters.
 package datausage
 
 import (
@@ -21,16 +11,8 @@ import (
 	"time"
 )
 
-// backstopInterval is the longest the totals may sit in memory unwritten. It is
-// only a backstop for a unit that stays up for days without a power transition:
-// the real persistence points are explicit Flush calls, on modem disable (which
-// pm-service issues before every suspend, hibernate and poweroff) and on
-// service shutdown.
-//
-// Nothing here writes on a byte threshold. The counters move on every poll, and
-// a data allowance display is not worth spending eMMC write cycles on at that
-// rate. The cost of the policy is that a hard power cut loses up to this much
-// counted traffic, which is acceptable for a device-reported meter.
+// backstopInterval limits loss on a hard power cut without writing eMMC on
+// every poll; normal persistence happens at power transitions and shutdown.
 const backstopInterval = 6 * time.Hour
 
 // Totals is the persisted state: bytes since Since, never decreasing.
@@ -50,15 +32,8 @@ type Totals struct {
 	Since string `json:"since"`
 }
 
-// persisted is what actually goes in the file: the totals plus the reading they
-// were last brought up to date from.
-//
-// The last reading has to survive a restart. ModemManager keeps running when
-// modem-service does not, so a restart typically finds the same bearer still
-// connected and still counting. Without a baseline, that bearer's running total
-// looks like brand new traffic and gets added on top of a stored total that
-// already contains it, inflating usage on every restart and every OTA. The two
-// are written together so they can never disagree.
+// persisted includes the live baseline so restarting against the same bearer
+// does not count its running total twice. Totals and baseline are atomic.
 type persisted struct {
 	Totals
 	LastBearer string `json:"last-bearer"`
@@ -137,10 +112,7 @@ func (c *Counter) load() {
 		p.Since = c.now().UTC().Format(time.RFC3339)
 	}
 	c.totals = p.Totals
-	// A stored bearer means the totals already account for that reading, so
-	// pick the delta up from there. Nothing stored (a file from before this
-	// field, or a first run) leaves haveLast false and the next reading counts
-	// in full, which is the right answer when there is no baseline to trust.
+	// Without a stored baseline, the next reading must be counted in full.
 	if p.LastBearer != "" {
 		c.haveLast, c.lastPath, c.lastRx, c.lastTx = true, p.LastBearer, p.LastRx, p.LastTx
 	}
@@ -192,9 +164,7 @@ func (c *Counter) Totals() Totals {
 	return c.totals
 }
 
-// Backstop persists only if the totals have gone unwritten for
-// backstopInterval. Cheap to call on every poll, and on a vehicle that suspends
-// daily it never writes anything: the power-transition Flush gets there first.
+// Backstop persists dirty totals after backstopInterval.
 func (c *Counter) Backstop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

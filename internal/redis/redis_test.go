@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// getTestRedisURL returns the Redis URL for testing
 func getTestRedisURL() string {
 	url := os.Getenv("REDIS_URL")
 	if url == "" {
@@ -17,7 +16,6 @@ func getTestRedisURL() string {
 	return url
 }
 
-// setupTestClient creates a test client and cleans up test data
 func setupTestClient(t *testing.T) (*Client, func()) {
 	t.Helper()
 
@@ -27,13 +25,11 @@ func setupTestClient(t *testing.T) (*Client, func()) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	// Check if Redis is available
 	if err := client.Ping(); err != nil {
 		t.Skipf("Redis not available: %v", err)
 	}
 
 	cleanup := func() {
-		// Clean up test data
 		client.client.Hash("internet").Clear()
 		client.client.Hash("modem").Clear()
 		client.client.Hash("gps").Clear()
@@ -125,7 +121,6 @@ func TestNewWithVariousURLFormats(t *testing.T) {
 
 			client, err := New(tt.url, logger)
 			if (err != nil) != tt.wantErr {
-				// Connection errors are acceptable if Redis isn't running
 				if err != nil && !tt.wantErr {
 					t.Logf("New() error = %v (Redis may not be available)", err)
 					return
@@ -177,7 +172,6 @@ func TestPublishInternetState(t *testing.T) {
 				t.Errorf("PublishInternetState() error = %v, wantErr %v", err, tt.wantErr)
 			}
 
-			// Verify the value was set
 			if !tt.wantErr {
 				val, err := client.client.Hash("internet").Get(tt.field)
 				if err != nil {
@@ -195,26 +189,21 @@ func TestPublishInternetStateChangeDetection(t *testing.T) {
 	client, cleanup := setupTestClient(t)
 	defer cleanup()
 
-	// First publish should succeed
 	err := client.PublishInternetState("status", "connected")
 	if err != nil {
 		t.Fatalf("First publish failed: %v", err)
 	}
 
-	// Second publish with same value should not trigger a change
-	// (SetIfChanged will still return success, but won't publish)
 	err = client.PublishInternetState("status", "connected")
 	if err != nil {
 		t.Fatalf("Second publish failed: %v", err)
 	}
 
-	// Third publish with different value should trigger a change
 	err = client.PublishInternetState("status", "disconnected")
 	if err != nil {
 		t.Fatalf("Third publish failed: %v", err)
 	}
 
-	// Verify final value
 	val, err := client.client.Hash("internet").Get("status")
 	if err != nil {
 		t.Fatalf("Failed to get status: %v", err)
@@ -261,7 +250,6 @@ func TestPublishModemState(t *testing.T) {
 				t.Errorf("PublishModemState() error = %v, wantErr %v", err, tt.wantErr)
 			}
 
-			// Verify the value was set
 			if !tt.wantErr {
 				val, err := client.client.Hash("modem").Get(tt.field)
 				if err != nil {
@@ -333,8 +321,6 @@ func TestPublishLocationState(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PublishLocationState() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			// Note: We don't verify Redis state here - writes are async by default
-			// and redis-ipc tests already cover that writes work correctly.
 		})
 	}
 }
@@ -376,7 +362,6 @@ func TestPublishSMSState(t *testing.T) {
 				t.Errorf("PublishSMSState() error = %v, wantErr %v", err, tt.wantErr)
 			}
 
-			// Verify the value was set
 			if !tt.wantErr {
 				val, err := client.client.Hash("sms").Get(tt.field)
 				if err != nil {
@@ -509,14 +494,12 @@ func TestClose(t *testing.T) {
 	}
 }
 
-// TestConcurrentPublishing tests that concurrent publishes don't cause issues
 func TestConcurrentPublishing(t *testing.T) {
 	client, cleanup := setupTestClient(t)
 	defer cleanup()
 
 	done := make(chan bool)
 
-	// Publish internet state concurrently
 	go func() {
 		for i := 0; i < 10; i++ {
 			client.PublishInternetState("test-field", fmt.Sprintf("value-%d", i))
@@ -525,7 +508,6 @@ func TestConcurrentPublishing(t *testing.T) {
 		done <- true
 	}()
 
-	// Publish modem state concurrently
 	go func() {
 		for i := 0; i < 10; i++ {
 			client.PublishModemState("test-field", fmt.Sprintf("modem-%d", i))
@@ -534,7 +516,6 @@ func TestConcurrentPublishing(t *testing.T) {
 		done <- true
 	}()
 
-	// Publish GPS state concurrently
 	go func() {
 		for i := 0; i < 10; i++ {
 			data := map[string]interface{}{
@@ -547,12 +528,10 @@ func TestConcurrentPublishing(t *testing.T) {
 		done <- true
 	}()
 
-	// Wait for all goroutines
 	<-done
 	<-done
 	<-done
 
-	// Verify we can still read data
 	val, err := client.client.Hash("internet").Get("test-field")
 	if err != nil {
 		t.Logf("Internet test-field not found (expected after concurrent updates): %v", err)

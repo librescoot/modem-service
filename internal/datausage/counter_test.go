@@ -35,7 +35,6 @@ func TestObserveTreatsDecreaseAsReset(t *testing.T) {
 	c := newTestCounter(t, "", &clock)
 
 	c.Observe(Sample{BearerPath: "/b/1", RxBytes: 1000, TxBytes: 500})
-	// Same bearer object, counters restarted: everything read now is new.
 	c.Observe(Sample{BearerPath: "/b/1", RxBytes: 30, TxBytes: 10})
 	c.Observe(Sample{BearerPath: "/b/1", RxBytes: 80, TxBytes: 15})
 
@@ -113,7 +112,6 @@ func TestFlushRoundTrip(t *testing.T) {
 		t.Fatalf("Since = %q, want it carried over as %q", got.Since, c.Totals().Since)
 	}
 
-	// A reload continues from the stored total rather than restarting.
 	reloaded.Observe(Sample{BearerPath: "/b/9", RxBytes: 500, TxBytes: 100})
 	if rx := reloaded.Totals().RxBytes; rx != 4596 {
 		t.Fatalf("rx after reload = %d, want 4596", rx)
@@ -133,7 +131,6 @@ func TestRestartContinuesFromStoredReading(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	// Restart. Same bearer, ten more MiB moved in the meantime.
 	restarted := newTestCounter(t, path, &clock)
 	restarted.Observe(Sample{BearerPath: "/b/1", RxBytes: 60 << 20, TxBytes: 12 << 20})
 
@@ -254,7 +251,6 @@ func TestBackstopOnlyWritesAfterInterval(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data-usage.json")
 
 	c := newTestCounter(t, path, &clock)
-	// Well past any byte threshold a previous policy might have used.
 	c.Observe(Sample{BearerPath: "/b/1", RxBytes: 1 << 30, TxBytes: 1 << 30})
 
 	clock = clock.Add(backstopInterval - time.Minute)

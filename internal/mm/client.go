@@ -49,14 +49,14 @@ const (
 	DBusObjectManager       = "org.freedesktop.DBus.ObjectManager"
 )
 
-// Client is a D-Bus client for ModemManager
+// Client is a ModemManager D-Bus client.
 type Client struct {
 	conn   *dbus.Conn
 	debug  bool
 	logger func(string, ...interface{})
 }
 
-// NewClient creates a new ModemManager D-Bus client
+// NewClient creates a ModemManager D-Bus client.
 func NewClient(debug bool, logger func(string, ...interface{})) (*Client, error) {
 	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
@@ -74,12 +74,12 @@ func NewClient(debug bool, logger func(string, ...interface{})) (*Client, error)
 	}, nil
 }
 
-// Close closes the D-Bus connection
+// Close closes the D-Bus connection.
 func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// FindModem finds the first available modem
+// FindModem returns the first available modem.
 func (c *Client) FindModem() (dbus.ObjectPath, error) {
 	obj := c.conn.Object(ModemManagerService, ModemManagerPath)
 
@@ -98,7 +98,7 @@ func (c *Client) FindModem() (dbus.ObjectPath, error) {
 	return "", errors.New("no modem found")
 }
 
-// GetProperty gets a property from the modem
+// GetProperty reads a D-Bus property.
 func (c *Client) GetProperty(modemPath dbus.ObjectPath, iface, property string) (dbus.Variant, error) {
 	return c.GetPropertyContext(context.Background(), modemPath, iface, property)
 }
@@ -116,7 +116,7 @@ func (c *Client) GetPropertyContext(ctx context.Context, modemPath dbus.ObjectPa
 	return value, nil
 }
 
-// SetProperty sets a property on the modem
+// SetProperty writes a D-Bus property.
 func (c *Client) SetProperty(modemPath dbus.ObjectPath, iface, property string, value interface{}) error {
 	obj := c.conn.Object(ModemManagerService, modemPath)
 
@@ -129,7 +129,7 @@ func (c *Client) SetProperty(modemPath dbus.ObjectPath, iface, property string, 
 	return nil
 }
 
-// SendCommand sends an AT command to the modem
+// SendCommand sends an AT command.
 func (c *Client) SendCommand(modemPath dbus.ObjectPath, command string, timeout time.Duration) (string, error) {
 	return c.SendCommandContext(context.Background(), modemPath, command, timeout)
 }
@@ -170,7 +170,7 @@ func (c *Client) SendCommandContext(ctx context.Context, modemPath dbus.ObjectPa
 	return response, nil
 }
 
-// CallMethod calls a method on the modem
+// CallMethod calls a modem D-Bus method.
 func (c *Client) CallMethod(modemPath dbus.ObjectPath, iface, method string, args ...interface{}) *dbus.Call {
 	obj := c.conn.Object(ModemManagerService, modemPath)
 	fullMethod := iface + "." + method
@@ -178,13 +178,13 @@ func (c *Client) CallMethod(modemPath dbus.ObjectPath, iface, method string, arg
 	return obj.Call(fullMethod, 0, args...)
 }
 
-// Enable enables the modem
+// Enable changes the modem enabled state.
 func (c *Client) Enable(modemPath dbus.ObjectPath, enable bool) error {
 	call := c.CallMethod(modemPath, ModemInterface, "Enable", enable)
 	return call.Err
 }
 
-// Reset resets the modem
+// Reset resets the modem.
 func (c *Client) Reset(modemPath dbus.ObjectPath) error {
 	call := c.CallMethod(modemPath, ModemInterface, "Reset")
 	return call.Err
@@ -280,19 +280,19 @@ func (c *Client) SetInitialEpsBearerSettings(modemPath dbus.ObjectPath, settings
 	return obj.Call(Modem3gppInterface+".SetInitialEpsBearerSettings", 0, settings).Err
 }
 
-// SetupLocation configures location services
+// SetupLocation configures location sources.
 func (c *Client) SetupLocation(modemPath dbus.ObjectPath, sources uint32, signalLocation bool) error {
 	call := c.CallMethod(modemPath, ModemLocationInterface, "Setup", sources, signalLocation)
 	return call.Err
 }
 
-// SetSuplServer sets the SUPL server for A-GPS
+// SetSuplServer sets the A-GPS SUPL server.
 func (c *Client) SetSuplServer(modemPath dbus.ObjectPath, server string) error {
 	call := c.CallMethod(modemPath, ModemLocationInterface, "SetSuplServer", server)
 	return call.Err
 }
 
-// GetLocation gets the current location
+// GetLocation returns the current location.
 func (c *Client) GetLocation(modemPath dbus.ObjectPath) (map[uint32]dbus.Variant, error) {
 	call := c.CallMethod(modemPath, ModemLocationInterface, "GetLocation")
 	if call.Err != nil {
@@ -304,13 +304,13 @@ func (c *Client) GetLocation(modemPath dbus.ObjectPath) (map[uint32]dbus.Variant
 	return location, err
 }
 
-// SetGPSRefreshRate sets the GPS refresh rate in seconds
+// SetGPSRefreshRate sets the GPS refresh rate in seconds.
 func (c *Client) SetGPSRefreshRate(modemPath dbus.ObjectPath, seconds uint32) error {
 	call := c.CallMethod(modemPath, ModemLocationInterface, "SetGpsRefreshRate", seconds)
 	return call.Err
 }
 
-// GetLocationCapabilities returns the available location sources
+// GetLocationCapabilities returns available location sources.
 func (c *Client) GetLocationCapabilities(modemPath dbus.ObjectPath) (uint32, error) {
 	variant, err := c.GetProperty(modemPath, ModemLocationInterface, "Capabilities")
 	if err != nil {
@@ -322,7 +322,7 @@ func (c *Client) GetLocationCapabilities(modemPath dbus.ObjectPath) (uint32, err
 	return 0, errors.New("invalid capabilities type")
 }
 
-// GetEnabledLocationSources returns the currently enabled location sources
+// GetEnabledLocationSources returns enabled location sources.
 func (c *Client) GetEnabledLocationSources(modemPath dbus.ObjectPath) (uint32, error) {
 	return c.GetEnabledLocationSourcesContext(context.Background(), modemPath)
 }
@@ -338,7 +338,7 @@ func (c *Client) GetEnabledLocationSourcesContext(ctx context.Context, modemPath
 	return 0, errors.New("invalid enabled type")
 }
 
-// GetSuplServer returns the current SUPL server
+// GetSuplServer returns the current SUPL server.
 func (c *Client) GetSuplServer(modemPath dbus.ObjectPath) (string, error) {
 	variant, err := c.GetProperty(modemPath, ModemLocationInterface, "SuplServer")
 	if err != nil {

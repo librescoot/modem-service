@@ -159,9 +159,6 @@ func TestParseBearerStats(t *testing.T) {
 			want: BearerStats{RxBytes: 100, TxBytes: 200},
 		},
 		{
-			// MM 1.24 on the SIM7100E, verbatim key names. The totals are the
-			// across-reconnect figures and must not be confused with the
-			// per-attempt ones.
 			name: "with-totals",
 			in: map[string]dbus.Variant{
 				"rx-bytes":       dbus.MakeVariant(uint64(13434742)),
@@ -200,10 +197,7 @@ func TestParseBearerStats(t *testing.T) {
 }
 
 func TestSelectDataBearer(t *testing.T) {
-	// Mirrors deep-blue: bearer 0 is the default-attach bearer and carries no
-	// interface; bearer 1 is the real data bearer. Index is never a valid
-	// discriminator because the reset loop pushes the live bearer to a high
-	// object path.
+	// Reset-generated object paths make list index unusable as identity.
 	attach := BearerInfo{Path: "/org/freedesktop/ModemManager1/Bearer/0", Connected: true}
 	data := BearerInfo{
 		Path: "/org/freedesktop/ModemManager1/Bearer/312", Connected: true,

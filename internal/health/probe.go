@@ -24,9 +24,7 @@ var DefaultConnectivityTargets = []string{
 // configure a TXT record and expected value to prove end-to-end reachability.
 const probeName = "connectivity-probe.invalid"
 
-// Result is the layer-8 verdict. It deliberately has no notion of path
-// liveness: that belongs to internal/modem/link, and duplicating it here would
-// give two sources of truth for one fact.
+// Result is the remote-reachability verdict; local liveness belongs to link.
 type Result struct {
 	Reachable bool
 	Detail    string
@@ -125,10 +123,7 @@ func (p *Prober) probeVerifiedTXT(ctx context.Context, assignedDNS []string) Res
 	return Result{Detail: "no verified target answered: " + strings.Join(tried, "; ")}
 }
 
-// dialer builds a dialer bound to the modem interface, so probe traffic cannot
-// escape via the wifi or wired path the MDB might also have. bindToDevice
-// (Task 1b) returns nil for a blank interface, which keeps the prober testable
-// off-target.
+// dialer binds probes to the modem so another network cannot produce success.
 func (p *Prober) dialer(timeout time.Duration) *net.Dialer {
 	return &net.Dialer{Timeout: timeout, Control: bindToDevice(p.Interface)}
 }

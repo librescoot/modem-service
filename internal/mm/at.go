@@ -7,9 +7,7 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-// AT command helpers for SIM7100E modem via ModemManager D-Bus
-
-// GetIMEI gets the modem IMEI
+// GetIMEI returns the modem IMEI.
 func (c *Client) GetIMEI(modemPath dbus.ObjectPath) (string, error) {
 	resp, err := c.SendCommand(modemPath, "AT+GSN", 5*time.Second)
 	if err != nil {
@@ -18,7 +16,7 @@ func (c *Client) GetIMEI(modemPath dbus.ObjectPath) (string, error) {
 	return extractValue(resp), nil
 }
 
-// GetICCID gets the SIM ICCID
+// GetICCID returns the SIM ICCID.
 func (c *Client) GetICCID(modemPath dbus.ObjectPath) (string, error) {
 	resp, err := c.SendCommand(modemPath, "AT+ICCID", 5*time.Second)
 	if err != nil {
@@ -26,8 +24,6 @@ func (c *Client) GetICCID(modemPath dbus.ObjectPath) (string, error) {
 	}
 	return extractPrefixedValue(resp, "+ICCID:"), nil
 }
-
-// Utility functions
 
 func extractValue(resp string) string {
 	lines := strings.Split(resp, "\n")

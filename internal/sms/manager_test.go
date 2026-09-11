@@ -16,21 +16,17 @@ const testModemPath dbus.ObjectPath = "/org/freedesktop/ModemManager1/Modem/0"
 
 // fakeDBus records calls and returns canned data/errors.
 type fakeDBus struct {
-	// Send side
 	createPath dbus.ObjectPath
 	createErr  error
 	sendErr    error
 
-	// Receive side
 	listPaths []dbus.ObjectPath
 	listErr   error
 	props     map[dbus.ObjectPath]mm.SMSProperties
 	propsErr  map[dbus.ObjectPath]error
 
-	// Per-path delete errors (absent entry == success)
 	deleteErr map[dbus.ObjectPath]error
 
-	// Recorded calls
 	createCalls      int
 	sendCalls        int
 	deleted          []dbus.ObjectPath
@@ -93,8 +89,6 @@ func newManager(d *fakeDBus) (*Manager, *deliveryRecorder) {
 	r := &deliveryRecorder{}
 	return New(d, log.New(io.Discard, "", 0), r.deliver), r
 }
-
-// --- Send -------------------------------------------------------------------
 
 func TestSend_HappyPath(t *testing.T) {
 	d := &fakeDBus{createPath: "/sms/1"}
@@ -176,8 +170,6 @@ func TestSend_SendFailsStillDeletes(t *testing.T) {
 	}
 }
 
-// --- DrainReceived ----------------------------------------------------------
-
 func TestDrain_IncomingReceived(t *testing.T) {
 	d := &fakeDBus{
 		listPaths: []dbus.ObjectPath{"/sms/1"},
@@ -223,7 +215,6 @@ func TestDrain_DeliveryFailureLeavesInStorage(t *testing.T) {
 		t.Fatalf("undelivered message must stay in modem storage, got deletes %v", d.deleted)
 	}
 
-	// Redis comes back: the next drain delivers and deletes.
 	rec.err = nil
 	if err := m.DrainReceived(testModemPath); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -293,7 +284,6 @@ func TestDrain_DeleteFailureDeliversExactlyOnce(t *testing.T) {
 		t.Fatalf("message must be delivered despite failed delete, got %+v", rec.msgs)
 	}
 
-	// Object still listed on the next drain: no duplicate, one more delete try.
 	_ = m.DrainReceived(testModemPath)
 	if len(rec.msgs) != 1 {
 		t.Fatalf("lingering object must not be re-delivered, got %d", len(rec.msgs))
@@ -302,14 +292,12 @@ func TestDrain_DeleteFailureDeliversExactlyOnce(t *testing.T) {
 		t.Fatalf("expected two delete attempts, got %v", d.deleted)
 	}
 
-	// Delete starts working: the drain cleans it up without delivering.
 	d.deleteErr = nil
 	_ = m.DrainReceived(testModemPath)
 	if len(rec.msgs) != 1 {
 		t.Fatalf("cleanup drain must not deliver, got %d", len(rec.msgs))
 	}
 
-	// A NEW message under the reused path must be delivered normally.
 	d.listPaths = []dbus.ObjectPath{"/sms/1"}
 	d.props["/sms/1"] = mm.SMSProperties{Number: "+4931", Text: "new msg", State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeDeliver}
 	_ = m.DrainReceived(testModemPath)
@@ -453,7 +441,6 @@ func TestParseTimestamp(t *testing.T) {
 		t.Fatalf("parseTimestamp got %v, want %v", got, want)
 	}
 
-	// Empty and unparseable values fall back to ~now.
 	if got := parseTimestamp(""); time.Since(got) > time.Minute {
 		t.Fatalf("empty timestamp should fall back to now, got %v", got)
 	}
@@ -461,8 +448,6 @@ func TestParseTimestamp(t *testing.T) {
 		t.Fatalf("garbage timestamp should fall back to now, got %v", got)
 	}
 }
-
-// --- HandleAdded (signal path) ---------------------------------------------
 
 func TestHandleAdded_DeliversInbound(t *testing.T) {
 	d := &fakeDBus{

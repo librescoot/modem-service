@@ -50,8 +50,6 @@ func pukErr() error {
 	return dbus.Error{Name: mm.ErrSimPuk}
 }
 
-// --- Configured PIN empty ----------------------------------------------------
-
 func TestReconcile_LogsObservationOnlyOnChange(t *testing.T) {
 	d := &fakeDBus{}
 	var logs bytes.Buffer
@@ -90,8 +88,6 @@ func TestReconcile_NoPinConfigured(t *testing.T) {
 			d.sendPinCalls, d.enablePinCalls)
 	}
 }
-
-// --- Locked → SendPin --------------------------------------------------------
 
 func TestReconcile_LockedSendsPinWhenRetriesFull(t *testing.T) {
 	d := &fakeDBus{}
@@ -209,8 +205,6 @@ func TestReconcile_LockedDBusErrorReturnsError(t *testing.T) {
 	_ = out
 }
 
-// --- PIN2 / PUK / unknown locks ---------------------------------------------
-
 func TestReconcile_LockedPin2IsHarmless(t *testing.T) {
 	d := &fakeDBus{}
 	m := newManager(d)
@@ -250,8 +244,6 @@ func TestReconcile_LockedPukRequired(t *testing.T) {
 		t.Fatalf("PUK lock must not trigger any D-Bus call")
 	}
 }
-
-// --- Unlocked: enable lock ---------------------------------------------------
 
 func TestReconcile_UnlockedEnablesLockWhenDisabled(t *testing.T) {
 	d := &fakeDBus{}
@@ -349,8 +341,6 @@ func TestReconcile_UnlockedRefusesEnableWhenRetriesLow(t *testing.T) {
 		t.Fatalf("must not call EnablePin when retries < 3")
 	}
 }
-
-// --- Cross-state safety -----------------------------------------------------
 
 func TestReconcile_UnlockedRefusesUnknownLockStatus(t *testing.T) {
 	d := &fakeDBus{}
