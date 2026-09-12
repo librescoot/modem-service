@@ -327,26 +327,15 @@ func TestIsConfiguringTracksConfigurationLock(t *testing.T) {
 	}
 }
 
-func TestLocationSourceMasksKeepGPSIndependentFromCellFallback(t *testing.T) {
+func TestLocationSourceMaskLeavesGPSWithGPSD(t *testing.T) {
 	current := mm.MMModemLocationSourceGpsNmea |
-		mm.MMModemLocationSourceAgpsMsb |
-		mm.MMModemLocationSource3gppLacCi
-	gpsSources, allSources := locationSourceMasks(current)
-
-	if gpsSources&mm.MMModemLocationSourceGpsUnmanaged == 0 {
-		t.Error("GPS-only mask does not enable gps-unmanaged")
-	}
-	if gpsSources&mm.MMModemLocationSource3gppLacCi != 0 {
-		t.Error("GPS-only mask unexpectedly requires 3gpp-lac-ci")
-	}
-	if gpsSources&mm.MMModemLocationSourceGpsNmea != 0 {
-		t.Error("GPS-only mask preserves conflicting gps-nmea")
-	}
-	if gpsSources&mm.MMModemLocationSourceAgpsMsb == 0 {
-		t.Error("GPS-only mask does not preserve unrelated sources")
-	}
-	if allSources != gpsSources|mm.MMModemLocationSource3gppLacCi {
-		t.Errorf("all-sources mask = 0x%x, want GPS mask plus 3gpp-lac-ci", allSources)
+		mm.MMModemLocationSourceGpsRaw |
+		mm.MMModemLocationSourceGpsUnmanaged |
+		mm.MMModemLocationSourceAgpsMsb
+	got := locationSourceMask(current)
+	want := mm.MMModemLocationSourceAgpsMsb | mm.MMModemLocationSource3gppLacCi
+	if got != want {
+		t.Errorf("location source mask = 0x%x, want 0x%x", got, want)
 	}
 }
 

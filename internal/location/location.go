@@ -1001,11 +1001,15 @@ func (s *Service) getLocationStatusWithTimeout(ctx context.Context) (*LocationSt
 }
 
 func (s *Service) disableConflictingSources(ctx context.Context, enabledSources uint32) error {
-	conflictingMask := mm.MMModemLocationSourceGpsNmea | mm.MMModemLocationSourceGpsRaw
+	// The service starts the receiver with AT commands and lets gpsd own the
+	// GPS TTY. Do not ask ModemManager to manage any GPS source as well.
+	conflictingMask := mm.MMModemLocationSourceGpsNmea |
+		mm.MMModemLocationSourceGpsRaw |
+		mm.MMModemLocationSourceGpsUnmanaged
 
 	if enabledSources&conflictingMask != 0 {
 		newSources := enabledSources &^ conflictingMask
-		s.Logger.Printf("Disabling conflicting GPS sources (nmea/raw), new mask: 0x%x", newSources)
+		s.Logger.Printf("Disabling ModemManager GPS sources (nmea/raw/unmanaged), new mask: 0x%x", newSources)
 
 		err := s.MMClient.SetupLocation(s.ModemPath, newSources, false)
 		if err != nil && s.refreshModemPathIfStale(err) {
@@ -1018,13 +1022,11 @@ func (s *Service) disableConflictingSources(ctx context.Context, enabledSources 
 	return nil
 }
 
-func locationSourceMasks(currentSources uint32) (gpsSources, allSources uint32) {
-	excludedMask := mm.MMModemLocationSourceGpsNmea |
+func locationSourceMask(currentSources uint32) uint32 {
+	return (currentSources &^ (mm.MMModemLocationSourceGpsNmea |
 		mm.MMModemLocationSourceGpsRaw |
+		mm.MMModemLocationSourceGpsUnmanaged)) |
 		mm.MMModemLocationSource3gppLacCi
-	gpsSources = (currentSources | mm.MMModemLocationSourceGpsUnmanaged) &^ excludedMask
-	allSources = gpsSources | mm.MMModemLocationSource3gppLacCi
-	return gpsSources, allSources
 }
 
 func (s *Service) setupLocationSources(ctx context.Context, sources uint32) error {
@@ -1050,33 +1052,12 @@ func (s *Service) setupLocationSources(ctx context.Context, sources uint32) erro
 }
 
 func (s *Service) enableLocationSources(ctx context.Context, currentSources uint32, initializationStarted time.Time) error {
-	gpsSources, allSources := locationSourceMasks(currentSources)
-
-	gpsSourceAvailable := currentSources&mm.MMModemLocationSourceGpsUnmanaged != 0
-	if !gpsSourceAvailable {
-		s.Logger.Printf("Enabling GPS location source: gps-unmanaged")
-		if err := s.setupLocationSources(ctx, gpsSources); err != nil {
-			// GPS is configured directly through AT commands and consumed by gpsd.
-			// Some supported ModemManager/modem combinations reject this advisory
-			// source request even while the receiver is running. Do not strand a
-			// working receiver by making that rejection fatal.
-			s.Logger.Printf("Warning: GPS location source unavailable; continuing with gpsd: %v", err)
-		} else {
-			currentSources = gpsSources
-			gpsSourceAvailable = true
-			s.Logger.Printf("GPS location source enabled successfully")
-		}
-	} else {
-		s.Logger.Printf("Required GPS location source already configured")
-	}
-
-	// Cell-tower location is optional. Do not retry the rejected GPS source as
-	// part of this request: doing so cannot enable cell location and delays gpsd.
-	if !gpsSourceAvailable {
-		s.Logger.Printf("Skipping optional cell location because gps-unmanaged is unavailable")
-	} else if currentSources&mm.MMModemLocationSource3gppLacCi == 0 {
+	// gpsd reads the modem's dedicated GPS TTY, while configureReceiver owns
+	// AT+CGPS. Enabling gps-unmanaged would make ModemManager issue a second
+	// AT+CGPS=1,1, which SIM7100E rejects while already running.
+	if currentSources&mm.MMModemLocationSource3gppLacCi == 0 {
 		s.Logger.Printf("Enabling optional location source: 3gpp-lac-ci")
-		if err := s.setupLocationSources(ctx, allSources); err != nil {
+		if err := s.setupLocationSources(ctx, locationSourceMask(currentSources)); err != nil {
 			s.Logger.Printf("Warning: Cell location source unavailable; continuing with GPS only: %v", err)
 		} else {
 			s.Logger.Printf("Cell location source enabled successfully")
