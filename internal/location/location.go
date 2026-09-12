@@ -1052,20 +1052,29 @@ func (s *Service) setupLocationSources(ctx context.Context, sources uint32) erro
 func (s *Service) enableLocationSources(ctx context.Context, currentSources uint32, initializationStarted time.Time) error {
 	gpsSources, allSources := locationSourceMasks(currentSources)
 
-	if currentSources&mm.MMModemLocationSourceGpsUnmanaged == 0 {
-		s.Logger.Printf("Enabling required location source: gps-unmanaged")
+	gpsSourceAvailable := currentSources&mm.MMModemLocationSourceGpsUnmanaged != 0
+	if !gpsSourceAvailable {
+		s.Logger.Printf("Enabling GPS location source: gps-unmanaged")
 		if err := s.setupLocationSources(ctx, gpsSources); err != nil {
-			return fmt.Errorf("failed to enable gps-unmanaged after 3 attempts: %v", err)
+			// GPS is configured directly through AT commands and consumed by gpsd.
+			// Some supported ModemManager/modem combinations reject this advisory
+			// source request even while the receiver is running. Do not strand a
+			// working receiver by making that rejection fatal.
+			s.Logger.Printf("Warning: GPS location source unavailable; continuing with gpsd: %v", err)
+		} else {
+			currentSources = gpsSources
+			gpsSourceAvailable = true
+			s.Logger.Printf("GPS location source enabled successfully")
 		}
-		currentSources = gpsSources
-		s.Logger.Printf("Required GPS location source enabled successfully")
 	} else {
 		s.Logger.Printf("Required GPS location source already configured")
 	}
 
-	// Cell-tower location is an optional fallback. ModemManager refuses it
-	// while the modem is in sim-missing, but gps-unmanaged remains usable.
-	if currentSources&mm.MMModemLocationSource3gppLacCi == 0 {
+	// Cell-tower location is optional. Do not retry the rejected GPS source as
+	// part of this request: doing so cannot enable cell location and delays gpsd.
+	if !gpsSourceAvailable {
+		s.Logger.Printf("Skipping optional cell location because gps-unmanaged is unavailable")
+	} else if currentSources&mm.MMModemLocationSource3gppLacCi == 0 {
 		s.Logger.Printf("Enabling optional location source: 3gpp-lac-ci")
 		if err := s.setupLocationSources(ctx, allSources); err != nil {
 			s.Logger.Printf("Warning: Cell location source unavailable; continuing with GPS only: %v", err)
