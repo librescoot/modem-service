@@ -20,6 +20,64 @@ import (
 	"modem-service/internal/modem/connectivity"
 )
 
+func TestCheckHealthDoesNotRecoverForMissingSIM(t *testing.T) {
+	s := &Service{
+		Config: &config.Config{Interface: "wwan0"},
+		Health: health.New(),
+		getModemInfoFn: func(string) (*modem.State, error) {
+			return &modem.State{SIMState: modem.SIMStateMissing}, nil
+		},
+	}
+	s.Health.State = health.StatePermanentFailure
+	s.Health.RecoveryAttempts = health.MaxRecoveryAttempts
+
+	if err := s.checkHealth(context.Background()); err != nil {
+		t.Fatalf("checkHealth() error = %v", err)
+	}
+	if s.Health.State != health.StateNormal || s.Health.RecoveryAttempts != 0 {
+		t.Fatalf("missing SIM health = %+v, want normal with no recovery attempts", s.Health)
+	}
+}
+
+func TestMissingSIMPersistsAcrossModemReenumeration(t *testing.T) {
+	calls := 0
+	s := &Service{
+		Config: &config.Config{Interface: "wwan0"},
+		getModemInfoFn: func(string) (*modem.State, error) {
+			calls++
+			if calls == 1 {
+				return &modem.State{SIMState: modem.SIMStateMissing}, nil
+			}
+			return nil, fmt.Errorf("modem not found")
+		},
+	}
+
+	if !s.hasMissingSIM() {
+		t.Fatal("initial missing SIM was not detected")
+	}
+	if !s.hasMissingSIM() {
+		t.Fatal("missing SIM was lost during modem re-enumeration")
+	}
+}
+
+func TestHandleModemFailureDoesNotRecoverAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := &Service{
+		Health:       health.New(),
+		Logger:       log.New(io.Discard, "", 0),
+		raiseFaultFn: func(int, string) { t.Fatal("raised fault after cancellation") },
+	}
+	s.modemEnabled.Store(true)
+
+	if err := s.handleModemFailure(ctx, "test"); err != context.Canceled {
+		t.Fatalf("handleModemFailure() error = %v, want context.Canceled", err)
+	}
+	if s.Health.RecoveryAttempts != 0 || s.Health.State != health.StateNormal {
+		t.Fatalf("cancelled recovery modified health: %+v", s.Health)
+	}
+}
+
 func TestRecoveryBackoffCancellationReturnsToNormal(t *testing.T) {
 	entered := make(chan struct{})
 	s := &Service{

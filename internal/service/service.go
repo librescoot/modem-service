@@ -124,6 +124,7 @@ type Service struct {
 	lastCellLoc         *cell.CellLocation
 
 	modemEnabled         atomic.Bool
+	simMissing           atomic.Bool
 	modemStateChange     chan struct{}
 	smsRefreshRequest    chan chan struct{}
 	recoveryRunMu        sync.Mutex
@@ -131,6 +132,7 @@ type Service struct {
 	modemOpCancel        context.CancelFunc
 	modemOpGeneration    uint64
 	ensureModemEnabledFn func(context.Context) error
+	getModemInfoFn       func(string) (*modem.State, error)
 	disableModemFn       func(context.Context)
 	powerOffModemFn      func(context.Context) error
 	removeInhibitorFn    func() error
@@ -388,6 +390,28 @@ func (s *Service) runEnsureModemEnabled(ctx context.Context) error {
 		return s.ensureModemEnabledFn(ctx)
 	}
 	return s.ensureModemEnabled(ctx)
+}
+
+func (s *Service) getModemInfo() (*modem.State, error) {
+	if s.getModemInfoFn != nil {
+		return s.getModemInfoFn(s.Config.Interface)
+	}
+	return s.Modem.GetModemInfo(s.Config.Interface)
+}
+
+// hasMissingSIM distinguishes a detected modem with no SIM from a modem
+// failure. A missing SIM cannot be repaired by GPIO, USB, or D-Bus reset. Once
+// observed, retain that state while the modem re-enumerates so a transiently
+// absent D-Bus object cannot start a recovery cycle.
+func (s *Service) hasMissingSIM() bool {
+	state, err := s.getModemInfo()
+	if err != nil || state == nil {
+		return s.simMissing.Load()
+	}
+
+	missing := state.SIMState == modem.SIMStateMissing
+	s.simMissing.Store(missing)
+	return missing
 }
 
 func (s *Service) runDisableModem(ctx context.Context) {
@@ -1082,6 +1106,10 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 			return nil
 		} else {
 			s.Logger.Printf("Modem is present via D-Bus but not ready: %v", err)
+			if s.hasMissingSIM() {
+				s.Logger.Printf("Modem has no SIM; leaving it powered on without recovery")
+				return nil
+			}
 		}
 	}
 
@@ -1175,6 +1203,17 @@ func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
 }
 
 func (s *Service) checkHealth(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if s.hasMissingSIM() {
+		// The modem is present and powered, but no SIM is installed or readable.
+		// Do not spend recovery attempts or classify the hardware as defective.
+		s.Health.MarkNormal()
+		return nil
+	}
+
 	if s.Health.IsTerminal() {
 		return fmt.Errorf("modem in terminal state: %s", s.Health.State)
 	}
@@ -1198,6 +1237,10 @@ func (s *Service) raiseFault(code int, description string) {
 }
 
 func (s *Service) handleModemFailure(ctx context.Context, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	s.Logger.Printf("Modem failure detected: %s", reason)
 	s.raiseFault(redisClient.FaultCodeModemUnavailable, "Modem unavailable: "+reason)
 
@@ -1249,6 +1292,10 @@ func (s *Service) completeRecoveryBackoff(publishCtx, waitCtx context.Context) e
 }
 
 func (s *Service) attemptRecovery(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	s.Health.StartRecovery()
 	defer func() {
 		if s.Health.FinishRecoveryAttempt() {
@@ -1965,7 +2012,7 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 		return err
 	}
 
-	currentState, err := s.Modem.GetModemInfo(s.Config.Interface)
+	currentState, err := s.getModemInfo()
 	if err != nil {
 		s.Logger.Printf("Failed to get modem info: %v", err)
 		// Preserve ErrorState from the partial snapshot.
