@@ -146,6 +146,23 @@ func (c *Client) PublishLocationState(data map[string]interface{}, publishRecove
 	return nil
 }
 
+// PublishClockSync records that the system clock was set from an authoritative
+// source. Consumers (pm-service) gate low-power decisions on a confirmed clock
+// step rather than inferring one from a GPS fix, which can exist while
+// `chronyc settime` fails. No publish: consumers poll the hash.
+func (c *Client) PublishClockSync(source string, at time.Time) error {
+	data := map[string]interface{}{
+		"source":    source,
+		"synced-at": at.UTC().Format(time.RFC3339),
+		"updated":   time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := c.client.Hash("clock").SetMany(data, ipc.NoPublish()); err != nil {
+		c.logger.Printf("Unable to set clock sync state in redis: %v", err)
+		return fmt.Errorf("cannot write clock sync state: %v", err)
+	}
+	return nil
+}
+
 // PublishGPSSnapshot publishes a full TPV snapshot to the gps:tpv pub/sub
 // channel as JSON. Subscribers get the complete current GPS state in one
 // message — no HGETALL roundtrip needed. Async (fire-and-forget); send loss

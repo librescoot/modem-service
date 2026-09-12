@@ -33,6 +33,7 @@ func setupTestClient(t *testing.T) (*Client, func()) {
 		client.client.Hash("internet").Clear()
 		client.client.Hash("modem").Clear()
 		client.client.Hash("gps").Clear()
+		client.client.Hash("clock").Clear()
 		client.client.Hash("sms").Clear()
 		client.client.Del(SMSReceivedStream, SMSSentStream)
 		client.Close()
@@ -322,6 +323,37 @@ func TestPublishLocationState(t *testing.T) {
 				t.Errorf("PublishLocationState() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestPublishClockSync(t *testing.T) {
+	client, cleanup := setupTestClient(t)
+	defer cleanup()
+
+	syncedAt := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	if err := client.PublishClockSync("gps", syncedAt); err != nil {
+		t.Fatalf("PublishClockSync() error = %v", err)
+	}
+
+	// SetMany is async by default; poll for the pipeline to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		source, err := client.client.Hash("clock").Get("source")
+		if err == nil && source == "gps" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("clock.source never landed (last err=%v, value=%q)", err, source)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	got, err := client.client.Hash("clock").Get("synced-at")
+	if err != nil {
+		t.Fatalf("read synced-at: %v", err)
+	}
+	if got != syncedAt.Format(time.RFC3339) {
+		t.Errorf("clock.synced-at = %q, want %q", got, syncedAt.Format(time.RFC3339))
 	}
 }
 

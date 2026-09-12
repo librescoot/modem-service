@@ -1787,6 +1787,9 @@ func (s *Service) syncClockFromGPS(t time.Time) bool {
 		return false
 	}
 	s.Logger.Printf("System time set from GPS: %s", timeStr)
+	if err := s.Redis.PublishClockSync("gps", t); err != nil {
+		s.Logger.Printf("Failed to publish clock sync state: %v", err)
+	}
 	return true
 }
 
