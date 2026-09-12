@@ -2207,6 +2207,21 @@ const (
 	gpsFixTimeout = 15 * time.Minute
 )
 
+func formatHumanDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	hours := d / time.Hour
+	minutes := d % time.Hour / time.Minute
+	seconds := d % time.Minute / time.Second
+
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
 func (s *Service) checkGPSHealth() error {
 	if s.Location.IsConfiguring() {
 		return nil
@@ -2220,7 +2235,7 @@ func (s *Service) checkGPSHealth() error {
 	}
 
 	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix() && now.Sub(s.GPSEnabledTime) > gpsFixTimeout {
-		return fmt.Errorf("gps_fix_timeout: no GPS fix established for %v", now.Sub(s.GPSEnabledTime))
+		return fmt.Errorf("gps_fix_timeout: no GPS fix established for %s", formatHumanDuration(now.Sub(s.GPSEnabledTime)))
 	}
 
 	return nil

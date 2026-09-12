@@ -582,6 +582,29 @@ func TestServiceInitialization(t *testing.T) {
 	}
 }
 
+func TestFormatHumanDuration(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want string
+	}{
+		{name: "sub-minute rounds down", in: 7*time.Second + 400*time.Millisecond, want: "7s"},
+		{name: "sub-minute rounds up", in: 7*time.Second + 500*time.Millisecond, want: "8s"},
+		{name: "exact minute", in: time.Minute, want: "1m 0s"},
+		{name: "rounds across minute boundary", in: 59*time.Second + 500*time.Millisecond, want: "1m 0s"},
+		{name: "GPS timeout age", in: 15*time.Minute + 6*time.Second + 945*time.Millisecond, want: "15m 7s"},
+		{name: "hour scale", in: time.Hour + 2*time.Minute + 3*time.Second, want: "1h 2m 3s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatHumanDuration(tt.in); got != tt.want {
+				t.Fatalf("formatHumanDuration(%v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGPSHealthCheck(t *testing.T) {
 	cfg := &config.Config{
 		Interface:         "wwan0",
