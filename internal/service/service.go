@@ -133,6 +133,7 @@ type Service struct {
 	modemOpGeneration    uint64
 	ensureModemEnabledFn func(context.Context) error
 	getModemInfoFn       func(string) (*modem.State, error)
+	isInterfacePresentFn func(string) bool
 	disableModemFn       func(context.Context)
 	powerOffModemFn      func(context.Context) error
 	removeInhibitorFn    func() error
@@ -400,12 +401,20 @@ func (s *Service) getModemInfo() (*modem.State, error) {
 }
 
 // hasMissingSIM distinguishes a detected modem with no SIM from a modem
-// failure. A missing SIM cannot be repaired by GPIO, USB, or D-Bus reset. Once
-// observed, retain that state while the modem re-enumerates so a transiently
-// absent D-Bus object cannot start a recovery cycle.
+// failure. Preserve a missing-SIM result across a transient D-Bus gap only
+// while the USB network interface still exists. Once it disappears, the modem
+// itself is unavailable and must use the normal recovery path.
 func (s *Service) hasMissingSIM() bool {
 	state, err := s.getModemInfo()
 	if err != nil || state == nil {
+		interfacePresent := modem.IsInterfacePresent
+		if s.isInterfacePresentFn != nil {
+			interfacePresent = s.isInterfacePresentFn
+		}
+		if !interfacePresent(s.Config.Interface) {
+			s.simMissing.Store(false)
+			return false
+		}
 		return s.simMissing.Load()
 	}
 
@@ -1147,6 +1156,10 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 
 		if err == nil {
 			s.Logger.Printf("Modem successfully enabled on attempt %d", attempt+1)
+			return nil
+		}
+		if s.hasMissingSIM() {
+			s.Logger.Printf("Modem has no SIM; leaving it powered on without further recovery")
 			return nil
 		}
 

@@ -39,7 +39,7 @@ func TestCheckHealthDoesNotRecoverForMissingSIM(t *testing.T) {
 	}
 }
 
-func TestMissingSIMPersistsAcrossModemReenumeration(t *testing.T) {
+func TestMissingSIMPersistsAcrossDBusGapWhileInterfacePresent(t *testing.T) {
 	calls := 0
 	s := &Service{
 		Config: &config.Config{Interface: "wwan0"},
@@ -50,13 +50,36 @@ func TestMissingSIMPersistsAcrossModemReenumeration(t *testing.T) {
 			}
 			return nil, fmt.Errorf("modem not found")
 		},
+		isInterfacePresentFn: func(string) bool { return true },
 	}
 
 	if !s.hasMissingSIM() {
 		t.Fatal("initial missing SIM was not detected")
 	}
 	if !s.hasMissingSIM() {
-		t.Fatal("missing SIM was lost during modem re-enumeration")
+		t.Fatal("missing SIM was lost during a D-Bus gap")
+	}
+}
+
+func TestMissingSIMDoesNotMaskMissingInterface(t *testing.T) {
+	calls := 0
+	s := &Service{
+		Config: &config.Config{Interface: "wwan0"},
+		getModemInfoFn: func(string) (*modem.State, error) {
+			calls++
+			if calls == 1 {
+				return &modem.State{SIMState: modem.SIMStateMissing}, nil
+			}
+			return nil, fmt.Errorf("modem not found")
+		},
+		isInterfacePresentFn: func(string) bool { return false },
+	}
+
+	if !s.hasMissingSIM() {
+		t.Fatal("initial missing SIM was not detected")
+	}
+	if s.hasMissingSIM() {
+		t.Fatal("missing SIM masked a missing modem interface")
 	}
 }
 
