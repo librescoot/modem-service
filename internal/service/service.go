@@ -134,6 +134,7 @@ type Service struct {
 	ensureModemEnabledFn func(context.Context) error
 	getModemInfoFn       func(string) (*modem.State, error)
 	isInterfacePresentFn func(string) bool
+	probeHealthErrorFn   func() error
 	disableModemFn       func(context.Context)
 	powerOffModemFn      func(context.Context) error
 	removeInhibitorFn    func() error
@@ -1182,6 +1183,9 @@ func (s *Service) ensureModemEnabled(ctx context.Context) error {
 }
 
 func (s *Service) probeHealthError() error {
+	if s.probeHealthErrorFn != nil {
+		return s.probeHealthErrorFn()
+	}
 	if _, err := s.Modem.FindModem(); err != nil {
 		return fmt.Errorf("modem not found: %w", err)
 	}
@@ -1192,9 +1196,16 @@ func (s *Service) probeHealthError() error {
 		return fmt.Errorf("power state: %w", err)
 	}
 	if err := s.Modem.CheckReadyState(); err != nil {
-		return fmt.Errorf("modem state: %w", err)
+		return s.modemReadinessHealthError(err)
 	}
 	return nil
+}
+
+func (s *Service) modemReadinessHealthError(err error) error {
+	if err == nil || s.hasMissingSIM() {
+		return nil
+	}
+	return fmt.Errorf("modem state: %w", err)
 }
 
 func (s *Service) probeHealth() bool {
@@ -1220,22 +1231,18 @@ func (s *Service) checkHealth(ctx context.Context) error {
 		return err
 	}
 
-	if s.hasMissingSIM() {
-		// The modem is present and powered, but no SIM is installed or readable.
-		// Do not spend recovery attempts or classify the hardware as defective.
-		s.Health.MarkNormal()
-		return nil
-	}
-
-	if s.Health.IsTerminal() {
-		return fmt.Errorf("modem in terminal state: %s", s.Health.State)
-	}
-
-	if err := s.probeHealthError(); err != nil {
-		return s.handleModemFailure(ctx, fmt.Sprintf("probe_failed: %v", err))
+	probeErr := s.probeHealthError()
+	if probeErr != nil {
+		if s.Health.IsTerminal() {
+			return fmt.Errorf("modem in terminal state: %s", s.Health.State)
+		}
+		return s.handleModemFailure(ctx, fmt.Sprintf("probe_failed: %v", probeErr))
 	}
 
 	s.Health.MarkNormal()
+	if s.hasMissingSIM() {
+		return nil
+	}
 	s.Redis.ClearFault(redisClient.FaultCodeModemUnavailable)
 	s.Redis.ClearFault(redisClient.FaultCodeModemRecoveryFailed)
 	return nil
@@ -2257,14 +2264,6 @@ func (s *Service) resetGPSAfterModemRecovery() {
 const (
 	// Allow ModemManager time to expose a whole-modem reset before GPS recovery.
 	gpsNoDataTimeout = 15 * time.Second
-
-	// gpsFixTimeout is how long we wait for a fix once GPS is enabled.
-	// Sized for cold-start: SIM7100E in standalone mode (UE-Based is
-	// disabled for this hardware) needs the full GPS almanac broadcast,
-	// which is 12.5 minutes minimum. Aggressive recovery during this
-	// window discards partial almanac/ephemeris pages and resets the
-	// download — counter-productive.
-	gpsFixTimeout = 15 * time.Minute
 )
 
 func formatHumanDuration(d time.Duration) string {
@@ -2293,11 +2292,12 @@ func (s *Service) checkGPSHealth() error {
 	if !lastData.IsZero() && now.Sub(lastData) > gpsNoDataTimeout {
 		return fmt.Errorf("gps_no_data: no GPS stanzas received for %v", now.Sub(lastData))
 	}
-
-	if !s.GPSEnabledTime.IsZero() && !s.Location.HasValidFix() && now.Sub(s.GPSEnabledTime) > gpsFixTimeout {
-		return fmt.Errorf("gps_fix_timeout: no GPS fix established for %s", formatHumanDuration(now.Sub(s.GPSEnabledTime)))
+	if lastData.IsZero() && !s.GPSEnabledTime.IsZero() && now.Sub(s.GPSEnabledTime) > gpsNoDataTimeout {
+		return fmt.Errorf("gps_no_data: no GPS stanzas received since GPS was enabled")
 	}
 
+	// A receiver can search indefinitely indoors. Fresh TPV/SKY reports mean
+	// the GPS pipeline is alive even when RF conditions cannot produce a fix.
 	return nil
 }
 

@@ -27,6 +27,7 @@ func TestCheckHealthDoesNotRecoverForMissingSIM(t *testing.T) {
 		getModemInfoFn: func(string) (*modem.State, error) {
 			return &modem.State{SIMState: modem.SIMStateMissing}, nil
 		},
+		probeHealthErrorFn: func() error { return nil },
 	}
 	s.Health.State = health.StatePermanentFailure
 	s.Health.RecoveryAttempts = health.MaxRecoveryAttempts
@@ -36,6 +37,46 @@ func TestCheckHealthDoesNotRecoverForMissingSIM(t *testing.T) {
 	}
 	if s.Health.State != health.StateNormal || s.Health.RecoveryAttempts != 0 {
 		t.Fatalf("missing SIM health = %+v, want normal with no recovery attempts", s.Health)
+	}
+}
+
+func TestMissingSIMDoesNotHideOtherHealthFailures(t *testing.T) {
+	s := &Service{
+		Health:             health.New(),
+		probeHealthErrorFn: func() error { return fmt.Errorf("primary port unavailable") },
+	}
+	s.simMissing.Store(true)
+	s.Health.State = health.StatePermanentFailure
+
+	if err := s.checkHealth(context.Background()); err == nil {
+		t.Fatal("missing SIM hid an unrelated modem health failure")
+	}
+	if s.Health.State != health.StatePermanentFailure {
+		t.Fatalf("health state = %q, want permanent failure", s.Health.State)
+	}
+}
+
+func TestModemReadinessIgnoresOnlyMissingSIM(t *testing.T) {
+	readinessErr := fmt.Errorf("modem not ready: failed")
+
+	missingSIM := &Service{
+		Config: &config.Config{Interface: "wwan0"},
+		getModemInfoFn: func(string) (*modem.State, error) {
+			return &modem.State{SIMState: modem.SIMStateMissing}, nil
+		},
+	}
+	if err := missingSIM.modemReadinessHealthError(readinessErr); err != nil {
+		t.Fatalf("missing SIM readiness error = %v, want nil", err)
+	}
+
+	presentSIM := &Service{
+		Config: &config.Config{Interface: "wwan0"},
+		getModemInfoFn: func(string) (*modem.State, error) {
+			return &modem.State{SIMState: modem.SIMStatePresent}, nil
+		},
+	}
+	if err := presentSIM.modemReadinessHealthError(readinessErr); err == nil {
+		t.Fatal("non-SIM readiness failure was suppressed")
 	}
 }
 
@@ -723,19 +764,18 @@ func TestGPSHealthCheck(t *testing.T) {
 	}
 
 	service.Location.SetLastDataReceived(time.Now())
-	service.GPSEnabledTime = time.Now().Add(-16 * time.Minute)
+	service.GPSEnabledTime = time.Now().Add(-24 * time.Hour)
 	service.Location.SetHasValidFix(false)
 	err = service.checkGPSHealth()
-	if err == nil {
-		t.Error("Expected error for GPS fix timeout, got nil")
-	} else {
-		t.Logf("Correctly detected GPS fix timeout: %v", err)
+	if err != nil {
+		t.Errorf("fresh no-fix GPS data was classified as unhealthy: %v", err)
 	}
 
-	service.GPSEnabledTime = time.Now().Add(-10 * time.Minute)
+	service.Location.SetLastDataReceived(time.Time{})
+	service.GPSEnabledTime = time.Now().Add(-(gpsNoDataTimeout + time.Second))
 	err = service.checkGPSHealth()
-	if err != nil {
-		t.Errorf("Expected no error 10 minutes into cold start, got: %v", err)
+	if err == nil {
+		t.Error("Expected error when GPS never produced data, got nil")
 	}
 }
 
