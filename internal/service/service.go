@@ -40,8 +40,17 @@ var modemOnlineStates = map[string]bool{
 	"ready-to-drive": true,
 }
 
-// clockSyncInterval paces GPS clock samples while NTP is unavailable.
-const clockSyncInterval = 60 * time.Second
+// clockValidationInterval paces GPS-vs-system clock checks.
+const clockValidationInterval = 5 * time.Minute
+
+// clockStepTolerance is the GPS/system disagreement beyond which the clock is
+// stepped. Smaller offsets are harmless; stepping for them fights NTP and
+// disturbs wall-clock deadlines.
+const clockStepTolerance = 30 * time.Second
+
+// clockStepConfirmations is how many consecutive checks must agree on a gross
+// disagreement before stepping, so one bad fix cannot move the clock.
+const clockStepConfirmations = 3
 
 // Require two identical failures so transient bring-up states do not trigger recovery.
 const remedyConfirmations = 2
@@ -113,8 +122,10 @@ type Service struct {
 	publishUsageFn func(map[string]interface{}) error
 	now            func() time.Time
 
-	lastClockSync  time.Time
-	gpsFaultActive atomic.Bool
+	lastClockSync    time.Time
+	lastClockCheck   time.Time
+	clockOffsetCount int
+	gpsFaultActive   atomic.Bool
 
 	// Settings (from Redis) — atomic so the Redis watcher goroutine can
 	// update them without racing the monitor goroutine that reads them.
@@ -569,6 +580,8 @@ func (s *Service) disableModem(ctx context.Context) {
 
 	// Force the first post-resume fix to bootstrap the potentially drifted clock.
 	s.lastClockSync = time.Time{}
+	s.lastClockCheck = time.Time{}
+	s.clockOffsetCount = 0
 
 	if err := s.powerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
@@ -1854,10 +1867,68 @@ func (s *Service) syncClockFromGPS(t time.Time) bool {
 		return false
 	}
 	s.Logger.Printf("System time set from GPS: %s", timeStr)
-	if err := s.Redis.PublishClockSync("gps", t); err != nil {
+	s.publishClockSync(t)
+	return true
+}
+
+// publishClockSync records a GPS clock validation for low-power consumers.
+func (s *Service) publishClockSync(at time.Time) {
+	if err := s.Redis.PublishClockSync("gps", at); err != nil {
 		s.Logger.Printf("Failed to publish clock sync state: %v", err)
 	}
-	return true
+}
+
+// nextClockOffsetCount advances the consecutive gross-disagreement counter. A
+// clock that has never been synced steps on the first gross offset; afterwards
+// it takes clockStepConfirmations consecutive samples.
+func nextClockOffsetCount(previous int, offset time.Duration, synced bool) (int, bool) {
+	if offset.Abs() <= clockStepTolerance {
+		return 0, false
+	}
+	if !synced {
+		return 0, true
+	}
+	previous++
+	return previous, previous >= clockStepConfirmations
+}
+
+// validateClock steps the system clock when a fresh GPS fix persistently
+// disagrees with it beyond clockStepTolerance. Runs online and offline, so an
+// already-synced clock is re-validated instead of trusted indefinitely.
+func (s *Service) validateClock() {
+	now := s.clock()
+	if !s.lastClockCheck.IsZero() && now.Sub(s.lastClockCheck) < clockValidationInterval {
+		return
+	}
+	s.lastClockCheck = now
+
+	gpsTime := s.Location.CurrentLoc().Timestamp
+	if gpsTime.IsZero() || gpsTime.Before(location.MinValidGPSDate) {
+		return
+	}
+
+	offset := gpsTime.Sub(now)
+	count, step := nextClockOffsetCount(s.clockOffsetCount, offset, !s.lastClockSync.IsZero())
+	s.clockOffsetCount = count
+	if !step {
+		if offset.Abs() <= clockStepTolerance && s.lastClockSync.IsZero() {
+			s.lastClockSync = now
+			s.publishClockSync(gpsTime)
+			return
+		}
+		if offset.Abs() > clockStepTolerance {
+			s.Logger.Printf("GPS clock offset %s, confirming (%d/%d)",
+				offset.Round(time.Second), s.clockOffsetCount, clockStepConfirmations)
+		}
+		return
+	}
+
+	if !s.syncClockFromGPS(gpsTime) {
+		return
+	}
+	s.lastClockSync = now
+	s.clockOffsetCount = 0
+	s.Logger.Printf("System clock stepped from GPS, offset was %s", offset.Round(time.Second))
 }
 
 // reachabilityField separates a silent restricted APN from a broken local path.
@@ -2453,15 +2524,7 @@ func (s *Service) monitorStatus(ctx context.Context) {
 				publishRecovery := false
 
 				if hasValidFix {
-					// Bootstrap once, then use GPS only while the more accurate NTP is unavailable.
-					needsClockSync := s.lastClockSync.IsZero() ||
-						(!hasInternet && time.Since(s.lastClockSync) >= clockSyncInterval)
-					if needsClockSync {
-						currentLoc := s.Location.CurrentLoc()
-						if s.syncClockFromGPS(currentLoc.Timestamp) {
-							s.lastClockSync = time.Now()
-						}
-					}
+					s.validateClock()
 
 					publishRecovery = s.Location.ShouldPublishRecovery(hasInternet)
 					if publishRecovery {

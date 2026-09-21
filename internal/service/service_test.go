@@ -727,6 +727,36 @@ func TestFormatHumanDuration(t *testing.T) {
 	}
 }
 
+func TestNextClockOffsetCount(t *testing.T) {
+	tests := []struct {
+		name     string
+		previous int
+		offset   time.Duration
+		synced   bool
+		wantN    int
+		wantStep bool
+	}{
+		{name: "within tolerance", offset: 10 * time.Second, synced: true, wantN: 0, wantStep: false},
+		{name: "exact tolerance is ignored", offset: clockStepTolerance, synced: true, wantN: 0, wantStep: false},
+		{name: "negative offset counts", offset: -2 * time.Hour, synced: true, previous: 0, wantN: 1, wantStep: false},
+		{name: "first gross sample after sync only confirms", offset: 2 * time.Hour, synced: true, previous: 0, wantN: 1, wantStep: false},
+		{name: "second gross sample only confirms", offset: 2 * time.Hour, synced: true, previous: 1, wantN: 2, wantStep: false},
+		{name: "third consecutive gross sample steps", offset: 2 * time.Hour, synced: true, previous: 2, wantN: 3, wantStep: true},
+		{name: "never synced steps immediately", offset: 2 * time.Hour, synced: false, wantN: 0, wantStep: true},
+		{name: "never synced within tolerance does not step", offset: 10 * time.Second, synced: false, wantN: 0, wantStep: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotN, gotStep := nextClockOffsetCount(tt.previous, tt.offset, tt.synced)
+			if gotN != tt.wantN || gotStep != tt.wantStep {
+				t.Fatalf("nextClockOffsetCount(%d, %v, %v) = (%d, %v), want (%d, %v)",
+					tt.previous, tt.offset, tt.synced, gotN, gotStep, tt.wantN, tt.wantStep)
+			}
+		})
+	}
+}
+
 func TestGPSHealthCheck(t *testing.T) {
 	cfg := &config.Config{
 		Interface:         "wwan0",
