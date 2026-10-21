@@ -136,14 +136,18 @@ func (c *Client) SendCommand(modemPath dbus.ObjectPath, command string, timeout 
 
 func (c *Client) SendCommandContext(ctx context.Context, modemPath dbus.ObjectPath, command string, timeout time.Duration) (string, error) {
 	obj := c.conn.Object(ModemManagerService, modemPath)
-
-	timeoutSec := uint32(timeout.Seconds())
-	if timeoutSec == 0 {
-		timeoutSec = 120
+	if timeout <= 0 {
+		timeout = 120 * time.Second
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < timeout {
+		timeout = time.Until(deadline)
+	}
+	timeoutSec := uint32(max(1, (timeout+time.Second-1)/time.Second))
 
 	label := command
-	sensitive := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(command)), "AT+CGAUTH=")
+	sensitive := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(command)), "AT+CGAUTH")
 	if sensitive {
 		label = "AT+CGAUTH=[REDACTED]"
 	}
@@ -162,6 +166,10 @@ func (c *Client) SendCommandContext(ctx context.Context, modemPath dbus.ObjectPa
 		return "", errors.Wrapf(err, "AT command failed: %s", label)
 	}
 
+	if result := atFailure(response); result != "" {
+		c.log("<< %s", result)
+		return "", fmt.Errorf("AT command failed: %s: %s", label, result)
+	}
 	if sensitive {
 		c.log("<< [REDACTED]")
 	} else {
@@ -260,7 +268,11 @@ func IsPukRequiredError(err error) bool {
 // "ip-type" (u), "allowed-auth" (u). Missing keys mean the modem has no
 // value set for that field — callers should treat them as empty/zero.
 func (c *Client) GetInitialEpsBearerSettings(modemPath dbus.ObjectPath) (map[string]dbus.Variant, error) {
-	variant, err := c.GetProperty(modemPath, Modem3gppInterface, "InitialEpsBearerSettings")
+	return c.GetInitialEpsBearerSettingsContext(context.Background(), modemPath)
+}
+
+func (c *Client) GetInitialEpsBearerSettingsContext(ctx context.Context, modemPath dbus.ObjectPath) (map[string]dbus.Variant, error) {
+	variant, err := c.GetPropertyContext(ctx, modemPath, Modem3gppInterface, "InitialEpsBearerSettings")
 	if err != nil {
 		return nil, err
 	}
@@ -275,9 +287,19 @@ func (c *Client) GetInitialEpsBearerSettings(modemPath dbus.ObjectPath) (map[str
 // Persists the LTE attach APN/credentials in the modem (survives reboot).
 // The password value is never logged.
 func (c *Client) SetInitialEpsBearerSettings(modemPath dbus.ObjectPath, settings map[string]dbus.Variant) error {
+	return c.SetInitialEpsBearerSettingsContext(context.Background(), modemPath, settings)
+}
+
+func (c *Client) SetInitialEpsBearerSettingsContext(ctx context.Context, modemPath dbus.ObjectPath, settings map[string]dbus.Variant) error {
 	obj := c.conn.Object(ModemManagerService, modemPath)
 	c.log("Call %s.SetInitialEpsBearerSettings([apn/user/password redacted])", Modem3gppInterface)
-	return obj.Call(Modem3gppInterface+".SetInitialEpsBearerSettings", 0, settings).Err
+	if err := obj.CallWithContext(ctx, Modem3gppInterface+".SetInitialEpsBearerSettings", 0, settings).Err; err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return errors.New("SetInitialEpsBearerSettings failed")
+	}
+	return nil
 }
 
 // SetupLocation configures location sources.

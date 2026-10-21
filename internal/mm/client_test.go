@@ -52,11 +52,15 @@ func privateBus(t *testing.T) (*Client, *dbus.Conn, *bytes.Buffer) {
 }
 
 type testModem struct {
-	entered chan struct{}
-	release chan struct{}
+	entered  chan struct{}
+	release  chan struct{}
+	response string
 }
 
 func (m *testModem) Command(command string, timeout uint32) (string, *dbus.Error) {
+	if m.response != "" {
+		return m.response, nil
+	}
 	if command == "AT+WAIT" {
 		close(m.entered)
 		<-m.release
@@ -136,6 +140,81 @@ func TestAPNCredentialsAreRedacted(t *testing.T) {
 	}
 	if strings.Contains(logs.String()+err.Error(), "secret-password") {
 		t.Fatalf("credential leaked: logs=%q error=%v", logs.String(), err)
+	}
+}
+
+func (m *testModem) SetInitialEpsBearerSettings(settings map[string]dbus.Variant) *dbus.Error {
+	return dbus.NewError("org.freedesktop.ModemManager1.Error.Core.Failed", []interface{}{settings["password"].Value()})
+}
+
+func TestATBodyErrorsAreFailures(t *testing.T) {
+	for _, body := range []string{"ERROR", "\r\nERROR\r\n", "+CME ERROR: 30", "+CMS ERROR: 500", "AT+CGAUTH=1,1,\"user\",\"secret-password\"\r\n+CME ERROR: secret-password"} {
+		t.Run(body, func(t *testing.T) {
+			c, server, logs := privateBus(t)
+			const path = dbus.ObjectPath("/Modem/0")
+			if err := server.Export(&testModem{response: body}, path, ModemInterface); err != nil {
+				t.Fatal(err)
+			}
+			response, err := c.SendCommandContext(context.Background(), path, `AT+CGAUTH=1,1,"user","secret-password"`, time.Second)
+			if err == nil || response != "" {
+				t.Fatalf("body-only failure accepted: response=%q err=%v", response, err)
+			}
+			if strings.Contains(logs.String()+err.Error(), "secret-password") {
+				t.Fatal("credentials leaked from AT failure")
+			}
+		})
+	}
+}
+
+func TestATSuccessAndCredentialQueryRedaction(t *testing.T) {
+	for _, command := range []string{"AT+CGAUTH?", "AT+CGDCONT?"} {
+		t.Run(command, func(t *testing.T) {
+			c, server, logs := privateBus(t)
+			const path = dbus.ObjectPath("/Modem/0")
+			body := `+CGDCONT: 1,"IP","ERROR.example"` + "\r\nOK"
+			if command == "AT+CGAUTH?" {
+				body = `+CGAUTH: 1,1,"user","secret-password"` + "\r\nOK"
+			}
+			if err := server.Export(&testModem{response: body}, path, ModemInterface); err != nil {
+				t.Fatal(err)
+			}
+			response, err := c.SendCommand(path, command, time.Second)
+			if err != nil || response != body {
+				t.Fatalf("response=%q err=%v", response, err)
+			}
+			if strings.Contains(logs.String(), "secret-password") {
+				t.Fatal("credentials logged from CGAUTH query")
+			}
+		})
+	}
+}
+
+func TestAttachSettingsErrorsCannotEchoPassword(t *testing.T) {
+	c, server, logs := privateBus(t)
+	const path = dbus.ObjectPath("/Modem/0")
+	if err := server.Export(&testModem{}, path, Modem3gppInterface); err != nil {
+		t.Fatal(err)
+	}
+	err := c.SetInitialEpsBearerSettingsContext(context.Background(), path, map[string]dbus.Variant{"password": dbus.MakeVariant("secret-password")})
+	if err == nil {
+		t.Fatal("missing failure")
+	}
+	if strings.Contains(logs.String()+err.Error(), "secret-password") {
+		t.Fatal("attach settings password leaked")
+	}
+}
+
+func TestATCallerTimeoutIsEnforced(t *testing.T) {
+	c, server, _ := privateBus(t)
+	m := &testModem{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(m.release)
+	const path = dbus.ObjectPath("/Modem/0")
+	if err := server.Export(m, path, ModemInterface); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.SendCommand(path, "AT+WAIT", 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v", err)
 	}
 }
 

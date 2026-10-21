@@ -50,6 +50,28 @@ SIM PIN and APN credentials are sensitive. Do not expose Redis to untrusted
 networks or users, and avoid enabling debug logging where SMS or modem
 information would be inappropriate for the journal.
 
+### APN reconciliation
+
+The service checks the actual CID1 context with `AT+CGDCONT?`, as well as the
+NetworkManager profile and ModemManager attach settings. Modem `ERROR`,
+`+CME ERROR` and `+CMS ERROR` responses fail the command even when D-Bus succeeds.
+Authentication commands, replies and settings errors do not log credentials.
+
+An APN change temporarily suspends profile autoconnect, disconnects the bearer
+and deregisters before writing settings. CID1 and the NM profile are read back
+before reattachment; CID1 is checked again after NM activation. NM changes are
+staged in memory and saved with the original autoconnect policy only after
+validation. Modem recovery and APN changes share the same operation lock.
+
+Failures attempt a bounded rollback to the prior profile and actual CID1.
+An incomplete rollback keeps the profile temporarily suspended and retains the
+original snapshot for retry. Disabling the modem cancels the transaction;
+rollback does not explicitly reattach after cancellation. `modem.apn-action`
+reports `error` until reconciliation succeeds. There are at most three apply
+attempts per settings/SIM/modem-path combination, with 30- and 60-second retry
+delays. A settings or identity change, successful modem recovery, or service
+restart permits a fresh attempt sequence.
+
 ## Build and test
 
 ```bash

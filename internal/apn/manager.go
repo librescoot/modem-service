@@ -1,8 +1,10 @@
-// Package apn reconciles both the modem's LTE attach context and
-// NetworkManager's data bearer. A SIM swap clears both until reconfigured.
+// Package apn reconciles the modem's LTE attach context and NetworkManager profile.
 package apn
 
 import (
+	"context"
+	"encoding/csv"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -14,18 +16,16 @@ import (
 	"modem-service/internal/mm"
 )
 
-// AT command timeouts. CGDCONT/CGAUTH are near-instant on SIM7100E.
-// COPS=2 (deregister) can take a few seconds; COPS=0 (auto-register) waits
-// for the modem to find and lock onto a cell, which is bounded by network
-// search time.
 const (
-	atQuickTimeout    = 5 * time.Second
-	atDeregisterTime  = 10 * time.Second
-	atAutoRegisterMax = 60 * time.Second
+	atQuickTimeout     = 5 * time.Second
+	atDeregisterTime   = 10 * time.Second
+	atAutoRegisterMax  = 60 * time.Second
+	transactionTimeout = 3 * time.Minute
+	rollbackTimeout    = 90 * time.Second
+	maxApplyAttempts   = 3
+	retryDelay         = 30 * time.Second
 )
 
-// Outcome describes the result of one Reconcile call. Published verbatim to
-// the modem.apn-action Redis field.
 type Outcome string
 
 const (
@@ -37,299 +37,493 @@ const (
 	OutcomeError             Outcome = "error"
 )
 
-// Config is the APN configuration on one side (settings, NM, or MM). Empty
-// strings and AuthNone are the "unset" representation.
 type Config struct {
 	APN      string
 	Username string
 	Password string
-	Auth     string // "none", "pap", "chap"; empty == "none"
+	Auth     string
 }
 
-// IsEmpty reports whether the config carries no meaningful APN values.
 func (c Config) IsEmpty() bool {
 	return c.APN == "" && c.Username == "" && c.Password == "" && (c.Auth == "" || c.Auth == "none")
 }
 
-// Equal compares two configs treating empty Auth as "none".
 func (c Config) EqualNM(o Config) bool {
 	return c.APN == o.APN && c.Username == o.Username && c.Password == o.Password
 }
 
 func (c Config) Equal(o Config) bool {
-	a := c.Auth
+	a, b := c.Auth, o.Auth
 	if a == "" {
 		a = "none"
 	}
-	b := o.Auth
 	if b == "" {
 		b = "none"
 	}
-	return c.APN == o.APN && c.Username == o.Username && c.Password == o.Password && a == b
+	return c.EqualNM(o) && a == b
 }
 
-// Input is the per-cycle snapshot passed to Reconcile.
 type Input struct {
 	ICCID     string
 	ModemPath dbus.ObjectPath
 	Desired   Config
 }
 
-// MMDBus is the narrow ModemManager surface the manager needs.
 type MMDBus interface {
-	GetInitialEpsBearerSettings(modemPath dbus.ObjectPath) (map[string]dbus.Variant, error)
-	SetInitialEpsBearerSettings(modemPath dbus.ObjectPath, settings map[string]dbus.Variant) error
-	// SendCommand is used for SIM7100E-specific belt-and-braces AT
-	// commands. MM's SetInitialEpsBearerSettings writes to CGDCONT=0,
-	// which simtech firmware ignores; the modem actually attaches with
-	// CGDCONT=1. We send both for portability.
-	SendCommand(modemPath dbus.ObjectPath, command string, timeout time.Duration) (string, error)
+	GetInitialEpsBearerSettingsContext(context.Context, dbus.ObjectPath) (map[string]dbus.Variant, error)
+	SetInitialEpsBearerSettingsContext(context.Context, dbus.ObjectPath, map[string]dbus.Variant) error
+	SendCommandContext(context.Context, dbus.ObjectPath, string, time.Duration) (string, error)
 }
 
-// NM is the narrow NetworkManager surface the manager needs. Concrete impl
-// shells out to nmcli; tests substitute a recorder.
 type NM interface {
-	GetGSM(connection string) (Config, error)
-	SetGSM(connection string, cfg Config) error
-	Reapply(connection string) error
+	GetGSM(context.Context, string) (Config, error)
+	SetGSM(context.Context, string, Config) error
+	State(context.Context, string) (ConnectionState, error)
+	SetAutoconnect(context.Context, string, bool) error
+	Disconnect(context.Context, string) error
+	Connect(context.Context, string) error
+	Commit(context.Context, string, bool) error
 }
 
-// Manager owns the reconcile loop. Single connection name, single modem.
+type attachContext struct {
+	Present bool
+	PDPType string
+	APN     string
+}
+
+func desiredContext(cfg Config) attachContext {
+	pdp := "IP"
+	if cfg.APN == "" {
+		pdp = "IPV4V6"
+	}
+	return attachContext{Present: true, PDPType: pdp, APN: cfg.APN}
+}
+
+type snapshot struct {
+	nm  Config
+	mm  map[string]dbus.Variant
+	cid attachContext
+}
+
+type pendingRollback struct {
+	before snapshot
+	state  ConnectionState
+	iccid  string
+}
+
 type Manager struct {
-	mm         MMDBus
-	nm         NM
-	logger     *log.Logger
-	connection string
-
-	mu               sync.Mutex
-	lastAppliedICCID string
-	blockedICCID     string
-	blockedConfig    Config
+	mm                MMDBus
+	nm                NM
+	logger            *log.Logger
+	connection        string
+	mu                sync.Mutex
+	pending           *pendingRollback
+	lastAppliedICCID  string
+	lastAppliedPath   dbus.ObjectPath
+	lastAppliedConfig Config
+	lastAppliedCID    attachContext
+	blockedICCID      string
+	blockedConfig     Config
+	retryInput        Input
+	attempts          int
+	retryAt           time.Time
+	now               func() time.Time
 }
 
-// New returns a manager bound to the given backends. connection is the NM
-// connection name (typically "wwan"). logger may be nil.
 func New(mmClient MMDBus, nm NM, connection string, logger *log.Logger) *Manager {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Manager{
-		mm:         mmClient,
-		nm:         nm,
-		logger:     logger,
-		connection: connection,
-	}
+	return &Manager{mm: mmClient, nm: nm, logger: logger, connection: connection, now: time.Now}
 }
 
-// Reconcile decides what (if anything) to do this cycle. At most one set of
-// SetGSM + SetInitialEpsBearerSettings calls per invocation.
-func (m *Manager) Reconcile(in Input) Outcome {
+// ResetRetry allows a fresh bounded attempt sequence after modem recovery.
+func (m *Manager) ResetRetry() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.attempts = 0
+	m.retryAt = time.Time{}
+	m.lastAppliedPath = ""
+}
+
+func (m *Manager) Reconcile(ctx context.Context, in Input) Outcome {
 	if in.ICCID == "" {
 		return OutcomeNoSIM
 	}
-
-	m.mu.Lock()
+	if !m.mu.TryLock() {
+		return OutcomeError
+	}
 	defer m.mu.Unlock()
-
-	// Never apply the previous SIM's credentials automatically to a new ICCID.
-	if m.lastAppliedICCID != "" && m.lastAppliedICCID != in.ICCID {
-		m.logger.Printf("apn: ICCID changed (%s -> %s), clearing NM + MM APN config",
-			m.lastAppliedICCID, in.ICCID)
-		empty := Config{}
-		if err := m.applyBoth(in.ModemPath, empty); err != nil {
-			m.logger.Printf("apn: clear after ICCID change failed: %v", err)
-			return OutcomeError
-		}
-		m.lastAppliedICCID = in.ICCID
-		m.blockedICCID = in.ICCID
-		m.blockedConfig = in.Desired
-		return OutcomeICCIDChangedClear
+	if ctx.Err() != nil || in.ModemPath == "" {
+		return OutcomeError
+	}
+	if err := validateConfig(in.Desired); err != nil {
+		m.logger.Printf("apn: invalid configuration: %v", err)
+		return OutcomeError
+	}
+	if in.ICCID != m.retryInput.ICCID || in.ModemPath != m.retryInput.ModemPath || !in.Desired.Equal(m.retryInput.Desired) {
+		m.retryInput, m.attempts, m.retryAt = in, 0, time.Time{}
 	}
 
-	if m.blockedICCID == in.ICCID {
+	clearSIM := m.lastAppliedICCID != "" && m.lastAppliedICCID != in.ICCID
+	cfg := in.Desired
+	if clearSIM {
+		cfg = Config{}
+	} else if m.blockedICCID == in.ICCID {
 		if m.blockedConfig.Equal(in.Desired) {
 			return OutcomeUnconfigured
 		}
 		m.blockedICCID = ""
 	}
 
-	if in.Desired.IsEmpty() {
-		// Clear stale values so operator defaults apply when unconfigured.
-		nmCur, mmCur, err := m.readCurrent(in.ModemPath)
-		if err != nil {
-			m.logger.Printf("apn: read current failed: %v", err)
-			return OutcomeError
-		}
-		if nmCur.IsEmpty() && mmCur.IsEmpty() {
-			m.lastAppliedICCID = in.ICCID
-			return OutcomeUnconfigured
-		}
-		m.logger.Printf("apn: no settings configured but NM/MM hold values, clearing")
-		if err := m.applyBoth(in.ModemPath, Config{}); err != nil {
-			m.logger.Printf("apn: clear failed: %v", err)
-			return OutcomeError
-		}
-		m.lastAppliedICCID = in.ICCID
-		return OutcomeApplied
-	}
-
-	nmCur, mmCur, err := m.readCurrent(in.ModemPath)
+	ctx, cancel := context.WithTimeout(ctx, transactionTimeout)
+	defer cancel()
+	before, err := m.readCurrent(ctx, in.ModemPath)
 	if err != nil {
 		m.logger.Printf("apn: read current failed: %v", err)
 		return OutcomeError
 	}
-	if nmCur.EqualNM(in.Desired) && mmCur.Equal(in.Desired) && m.lastAppliedICCID == in.ICCID {
+	mmCfg := parseMMSettings(before.mm)
+	verified := m.lastAppliedICCID == in.ICCID && m.lastAppliedPath == in.ModemPath && m.lastAppliedConfig.Equal(cfg)
+	cidMatches := before.cid == desiredContext(cfg) || cfg.IsEmpty() && (before.cid.APN == "" || verified && before.cid == m.lastAppliedCID)
+	if m.attempts == 0 && m.pending == nil && before.nm.EqualNM(cfg) && cidMatches && (mmCfg.Equal(cfg) || verified) {
+		m.lastAppliedCID = before.cid
+		m.recordSuccess(in, cfg)
+		if clearSIM {
+			m.blockedICCID, m.blockedConfig = in.ICCID, in.Desired
+			return OutcomeICCIDChangedClear
+		}
+		if cfg.IsEmpty() {
+			return OutcomeUnconfigured
+		}
 		return OutcomeOK
 	}
-
-	m.logger.Printf("apn: applying apn=%q user=%q auth=%q (nm-change=%v mm-change=%v)",
-		in.Desired.APN, in.Desired.Username, in.Desired.Auth,
-		!nmCur.EqualNM(in.Desired), !mmCur.Equal(in.Desired))
-
-	if err := m.applyBoth(in.ModemPath, in.Desired); err != nil {
-		m.logger.Printf("apn: apply failed: %v", err)
+	if m.attempts >= maxApplyAttempts || m.now().Before(m.retryAt) {
 		return OutcomeError
 	}
-	m.lastAppliedICCID = in.ICCID
+
+	m.logger.Printf("apn: reconciling NM profile and CID1 (attempt %d/%d)", m.attempts+1, maxApplyAttempts)
+	if err := m.apply(ctx, in, cfg, before, clearSIM); err != nil {
+		m.attempts++
+		m.retryAt = m.now().Add(retryDelay << (m.attempts - 1))
+		m.logger.Printf("apn: transaction failed: %v", err)
+		return OutcomeError
+	}
+	m.recordSuccess(in, cfg)
+	if clearSIM {
+		m.blockedICCID, m.blockedConfig = in.ICCID, in.Desired
+		return OutcomeICCIDChangedClear
+	}
 	return OutcomeApplied
 }
 
-func (m *Manager) readCurrent(modemPath dbus.ObjectPath) (nm, mmCfg Config, err error) {
-	nm, err = m.nm.GetGSM(m.connection)
-	if err != nil {
-		return Config{}, Config{}, fmt.Errorf("nm get: %w", err)
-	}
-	if modemPath == "" {
-		return nm, Config{}, nil
-	}
-	settings, err := m.mm.GetInitialEpsBearerSettings(modemPath)
-	if err != nil {
-		// Treat as empty rather than failing the whole cycle — some MM
-		// states (early enable, SIM locked) don't expose this property.
-		m.logger.Printf("apn: MM GetInitialEpsBearerSettings: %v (treating as empty)", err)
-		return nm, Config{}, nil
-	}
-	return nm, parseMMSettings(settings), nil
+func (m *Manager) recordSuccess(in Input, cfg Config) {
+	m.lastAppliedICCID, m.lastAppliedPath, m.lastAppliedConfig = in.ICCID, in.ModemPath, cfg
+	m.attempts, m.retryAt = 0, time.Time{}
 }
 
-func (m *Manager) applyBoth(modemPath dbus.ObjectPath, cfg Config) error {
-	if err := m.nm.SetGSM(m.connection, cfg); err != nil {
-		return fmt.Errorf("nm set: %w", err)
+func (m *Manager) readCurrent(ctx context.Context, path dbus.ObjectPath) (snapshot, error) {
+	var s snapshot
+	var err error
+	if s.nm, err = m.nm.GetGSM(ctx, m.connection); err != nil {
+		return s, fmt.Errorf("NM read: %w", err)
 	}
-	if err := m.nm.Reapply(m.connection); err != nil {
-		// Non-fatal: NM will use the new config on the next activation
-		// attempt anyway, and the modem-recovery loop will eventually
-		// re-establish.
-		m.logger.Printf("apn: nm reapply failed (will retry on next activation): %v", err)
+	queryCtx, cancel := context.WithTimeout(ctx, atQuickTimeout)
+	s.mm, err = m.mm.GetInitialEpsBearerSettingsContext(queryCtx, path)
+	cancel()
+	if err != nil {
+		return s, fmt.Errorf("MM read: %w", err)
 	}
-	if modemPath == "" {
-		return nil
+	s.cid, err = m.readCID(ctx, path)
+	return s, err
+}
+
+func (m *Manager) readCID(ctx context.Context, path dbus.ObjectPath) (attachContext, error) {
+	response, err := m.mm.SendCommandContext(ctx, path, "AT+CGDCONT?", atQuickTimeout)
+	if err != nil {
+		return attachContext{}, fmt.Errorf("CID1 read: %w", err)
 	}
-	if err := m.mm.SetInitialEpsBearerSettings(modemPath, encodeMMSettings(cfg)); err != nil {
-		// Don't bail — the AT fallback is what actually works on
-		// SIM7100E; SetInitialEpsBearerSettings can fail on simtech
-		// when the modem isn't in a state MM likes, but the raw AT
-		// commands still go through.
-		m.logger.Printf("apn: SetInitialEpsBearerSettings failed (will rely on AT fallback): %v", err)
+	return parseCID1(response)
+}
+
+func parseCID1(response string) (attachContext, error) {
+	var result attachContext
+	for _, line := range strings.Split(response, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "+CGDCONT:") {
+			continue
+		}
+		r := csv.NewReader(strings.NewReader(strings.TrimSpace(strings.TrimPrefix(line, "+CGDCONT:"))))
+		r.TrimLeadingSpace = true
+		fields, err := r.Read()
+		if err != nil || len(fields) < 3 {
+			return result, errors.New("malformed CGDCONT response")
+		}
+		if strings.TrimSpace(fields[0]) != "1" {
+			continue
+		}
+		if result.Present {
+			return result, errors.New("duplicate CID1 in CGDCONT response")
+		}
+		result = attachContext{Present: true, PDPType: strings.ToUpper(fields[1]), APN: fields[2]}
+		if err := validateATValue(result.APN); err != nil {
+			return attachContext{}, errors.New("invalid CID1 APN")
+		}
+		switch result.PDPType {
+		case "IP", "IPV6", "IPV4V6", "PPP":
+		default:
+			return attachContext{}, errors.New("unsupported CID1 PDP type")
+		}
 	}
-	if err := m.applyAT(modemPath, cfg); err != nil {
-		return fmt.Errorf("at fallback: %w", err)
+	return result, nil
+}
+
+func (m *Manager) setMM(ctx context.Context, path dbus.ObjectPath, settings map[string]dbus.Variant) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return m.mm.SetInitialEpsBearerSettingsContext(ctx, path, settings)
+}
+
+func (m *Manager) apply(ctx context.Context, in Input, cfg Config, before snapshot, clearSIM bool) (err error) {
+	path := in.ModemPath
+	state, err := m.nm.State(ctx, m.connection)
+	if err != nil {
+		return fmt.Errorf("NM state: %w", err)
 	}
+	changed, detached := m.pending != nil, m.pending != nil
+	if m.pending != nil {
+		state = m.pending.state
+		if m.pending.iccid == in.ICCID {
+			before = m.pending.before
+		} else {
+			clearSIM = true
+		}
+	}
+	if clearSIM {
+		// A SIM swap must never roll back to the previous SIM's credentials.
+		before = snapshot{nm: Config{}, mm: encodeMMSettings(Config{}), cid: desiredContext(Config{})}
+		changed = true
+	}
+	if err := validateConfig(parseMMSettings(before.mm)); err != nil {
+		return errors.New("cannot safely restore prior authentication settings")
+	}
+	m.pending = &pendingRollback{before: before, state: state, iccid: in.ICCID}
+	defer func() {
+		if err != nil {
+			limit := rollbackTimeout
+			if ctx.Err() != nil {
+				limit = 30 * time.Second
+			}
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), limit)
+			defer cancel()
+			if rollbackErr := m.rollback(cleanupCtx, ctx, path, before, state, changed, detached); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("rollback: %w", rollbackErr))
+			} else {
+				m.pending = nil
+			}
+		}
+	}()
+	// Block NM's own profile retry while the modem is deregistered.
+	if err = m.nm.SetAutoconnect(ctx, m.connection, false); err != nil {
+		return fmt.Errorf("NM suspend: %w", err)
+	}
+	detached = true
+	if err = m.nm.Disconnect(ctx, m.connection); err != nil {
+		return fmt.Errorf("NM disconnect: %w", err)
+	}
+	if _, err = m.mm.SendCommandContext(ctx, path, "AT+COPS=2", atDeregisterTime); err != nil {
+		return fmt.Errorf("deregister: %w", err)
+	}
+	changed = true
+	if err = m.nm.SetGSM(ctx, m.connection, cfg); err != nil {
+		return fmt.Errorf("NM write: %w", err)
+	}
+	if mmErr := m.setMM(ctx, path, encodeMMSettings(cfg)); mmErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// CID1 is authoritative when the plugin cannot update its attach settings.
+		m.logger.Printf("apn: MM attach settings unavailable; using CID1 fallback")
+	}
+	if err = m.writeCID(ctx, path, desiredContext(cfg)); err != nil {
+		return err
+	}
+	if err = m.writeAuth(ctx, path, cfg); err != nil {
+		return err
+	}
+	actual, err := m.readCID(ctx, path)
+	if err != nil {
+		return err
+	}
+	if actual != desiredContext(cfg) {
+		return errors.New("CID1 readback mismatch")
+	}
+	nmCfg, err := m.nm.GetGSM(ctx, m.connection)
+	if err != nil {
+		return fmt.Errorf("NM readback: %w", err)
+	}
+	if !nmCfg.EqualNM(cfg) {
+		return errors.New("NM readback mismatch")
+	}
+	if _, err = m.mm.SendCommandContext(ctx, path, "AT+COPS=0", atAutoRegisterMax); err != nil {
+		return fmt.Errorf("reattach: %w", err)
+	}
+	if err = m.nm.Connect(ctx, m.connection); err != nil {
+		return fmt.Errorf("NM connect: %w", err)
+	}
+	// NM activation can rewrite the modem's contexts too.
+	actual, err = m.readCID(ctx, path)
+	if err != nil {
+		return err
+	}
+	if !cfg.IsEmpty() && actual != desiredContext(cfg) {
+		return errors.New("CID1 changed during NM activation")
+	}
+	if err = m.nm.Commit(ctx, m.connection, state.Autoconnect); err != nil {
+		return fmt.Errorf("commit NM settings: %w", err)
+	}
+	m.lastAppliedCID = actual
+	m.pending = nil
 	return nil
 }
 
-// applyAT writes the LTE attach context (cid=1) and authentication via raw
-// AT commands. MM's generic 3GPP code writes CGDCONT=0 which simtech
-// firmware ignores at attach time — cid=1 is the slot the SIM7100E actually
-// reads. SIMCom firmware persists cid=1 in NVRAM automatically.
-func (m *Manager) applyAT(modemPath dbus.ObjectPath, cfg Config) error {
-	if err := validateATValue(cfg.APN); err != nil {
-		return fmt.Errorf("invalid APN: %w", err)
+func (m *Manager) rollback(ctx, operationCtx context.Context, path dbus.ObjectPath, before snapshot, state ConnectionState, changed, detached bool) error {
+	var failures []error
+	add := func(err error) {
+		if err != nil {
+			failures = append(failures, err)
+		}
 	}
-	if err := validateATValue(cfg.Username); err != nil {
-		return fmt.Errorf("invalid username: %w", err)
+	if changed {
+		// Activation or a partially completed commit may have resumed autoconnect.
+		err := m.nm.SetAutoconnect(ctx, m.connection, false)
+		add(err)
+		if err == nil {
+			err = m.nm.Disconnect(ctx, m.connection)
+			add(err)
+		}
+		if err == nil {
+			_, err = m.mm.SendCommandContext(ctx, path, "AT+COPS=2", atDeregisterTime)
+			add(err)
+		}
+		add(m.nm.SetGSM(ctx, m.connection, before.nm))
+		if err == nil {
+			if err := m.setMM(ctx, path, before.mm); err != nil {
+				m.logger.Printf("apn: MM rollback unavailable; restoring CID1 directly")
+			}
+			add(m.writeAuth(ctx, path, parseMMSettings(before.mm)))
+			add(m.writeCID(ctx, path, before.cid))
+			actual, readErr := m.readCID(ctx, path)
+			add(readErr)
+			if readErr == nil && actual != before.cid {
+				add(errors.New("rollback CID1 readback mismatch"))
+			}
+		}
 	}
-	if err := validateATValue(cfg.Password); err != nil {
-		return fmt.Errorf("invalid password: %w", err)
+	if changed {
+		actual, err := m.nm.GetGSM(ctx, m.connection)
+		add(err)
+		if err == nil && !actual.EqualNM(before.nm) {
+			add(errors.New("rollback NM readback mismatch"))
+		}
 	}
+	if len(failures) != 0 {
+		// Leave only the in-memory profile suspended; retain the original snapshot for retry.
+		return errors.Join(failures...)
+	}
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nmcliApplyTimeout)
+	defer cancel()
+	if err := m.nm.Commit(commitCtx, m.connection, state.Autoconnect); err != nil {
+		return err
+	}
+	// Cancellation can mean a power-off request: never explicitly reattach in that case.
+	if detached && operationCtx.Err() == nil {
+		deadline, _ := ctx.Deadline()
+		reconnectCtx, stop := context.WithDeadline(operationCtx, deadline)
+		defer stop()
+		_, err := m.mm.SendCommandContext(reconnectCtx, path, "AT+COPS=0", atAutoRegisterMax)
+		add(err)
+		if err == nil && state.Active {
+			add(m.nm.Connect(reconnectCtx, m.connection))
+		}
+	}
+	return errors.Join(failures...)
+}
 
-	pdpType := "IP"
-	if cfg.APN == "" {
-		// Clearing — IPV4V6 with empty APN tells the modem to use the
-		// SIM-derived default at attach.
-		pdpType = "IPV4V6"
+func (m *Manager) writeCID(ctx context.Context, path dbus.ObjectPath, cid attachContext) error {
+	command := "AT+CGDCONT=1"
+	if cid.Present {
+		command = fmt.Sprintf(`AT+CGDCONT=1,"%s","%s"`, cid.PDPType, cid.APN)
 	}
-	cgdcont := fmt.Sprintf(`AT+CGDCONT=1,"%s","%s"`, pdpType, cfg.APN)
-	if _, err := m.mm.SendCommand(modemPath, cgdcont, atQuickTimeout); err != nil {
-		return fmt.Errorf("CGDCONT: %w", err)
-	}
+	_, err := m.mm.SendCommandContext(ctx, path, command, atQuickTimeout)
+	return err
+}
 
-	authType := 0 // none
+func (m *Manager) writeAuth(ctx context.Context, path dbus.ObjectPath, cfg Config) error {
+	if err := validateConfig(cfg); err != nil {
+		return err
+	}
+	auth := 0
 	switch cfg.Auth {
 	case "pap":
-		authType = 1
+		auth = 1
 	case "chap":
-		authType = 2
+		auth = 2
 	}
-	var cgauth string
-	if authType == 0 || (cfg.Username == "" && cfg.Password == "") {
-		cgauth = `AT+CGAUTH=1,0`
-	} else {
-		cgauth = fmt.Sprintf(`AT+CGAUTH=1,%d,"%s","%s"`, authType, cfg.Username, cfg.Password)
+	command := "AT+CGAUTH=1,0"
+	if auth != 0 && (cfg.Username != "" || cfg.Password != "") {
+		command = fmt.Sprintf(`AT+CGAUTH=1,%d,"%s","%s"`, auth, cfg.Username, cfg.Password)
 	}
-	if _, err := m.mm.SendCommand(modemPath, cgauth, atQuickTimeout); err != nil {
-		// Some firmware rejects CGAUTH when context isn't activated.
-		// Log and continue — CGDCONT alone is the critical piece for
-		// the Vodafone/Telekom "stuck on EDGE" symptom.
-		m.logger.Printf("apn: CGAUTH failed (continuing): %v", err)
-	}
-	return nil
+	_, err := m.mm.SendCommandContext(ctx, path, command, atQuickTimeout)
+	return err
 }
 
-// Reattach forces the modem to deregister from the carrier and reattach,
-// which makes a freshly-written CGDCONT=1 actually take effect. Blocks for
-// up to ~atDeregisterTime + atAutoRegisterMax. Intended to be called from a
-// goroutine by the caller — Reconcile does not invoke it directly.
-func (m *Manager) Reattach(modemPath dbus.ObjectPath) error {
-	if modemPath == "" {
-		return fmt.Errorf("empty modem path")
+// Reattach shares the APN operation lock; service callers also hold the lifecycle lock.
+func (m *Manager) Reattach(ctx context.Context, path dbus.ObjectPath) error {
+	if path == "" {
+		return errors.New("empty modem path")
 	}
-	m.logger.Printf("apn: triggering LTE reattach (AT+COPS=2 then AT+COPS=0)")
-	if _, err := m.mm.SendCommand(modemPath, "AT+COPS=2", atDeregisterTime); err != nil {
-		return fmt.Errorf("COPS=2: %w", err)
+	if !m.mu.TryLock() {
+		return errors.New("APN transaction in progress")
 	}
-	if _, err := m.mm.SendCommand(modemPath, "AT+COPS=0", atAutoRegisterMax); err != nil {
-		return fmt.Errorf("COPS=0: %w", err)
+	defer m.mu.Unlock()
+	if _, err := m.mm.SendCommandContext(ctx, path, "AT+COPS=2", atDeregisterTime); err != nil {
+		return err
 	}
-	m.logger.Printf("apn: reattach complete")
-	return nil
+	_, err := m.mm.SendCommandContext(ctx, path, "AT+COPS=0", atAutoRegisterMax)
+	return err
 }
 
-// validateATValue rejects command separators because SIMCom string literals
-// provide no escaping.
 func validateATValue(s string) error {
-	if strings.ContainsAny(s, "\"\r\n") {
-		return fmt.Errorf("contains quote or newline")
+	if strings.ContainsAny(s, "\"\r\n,\x00") {
+		return errors.New("contains AT command delimiters")
 	}
 	return nil
+}
+
+func validateConfig(c Config) error {
+	for _, value := range []string{c.APN, c.Username, c.Password} {
+		if err := validateATValue(value); err != nil {
+			return err
+		}
+	}
+	switch c.Auth {
+	case "", "none", "pap", "chap":
+		return nil
+	}
+	return errors.New("unsupported authentication type")
 }
 
 func parseMMSettings(s map[string]dbus.Variant) Config {
 	var c Config
 	if v, ok := s["apn"]; ok {
-		if str, ok := v.Value().(string); ok {
-			c.APN = str
-		}
+		c.APN, _ = v.Value().(string)
 	}
 	if v, ok := s["user"]; ok {
-		if str, ok := v.Value().(string); ok {
-			c.Username = str
-		}
+		c.Username, _ = v.Value().(string)
 	}
 	if v, ok := s["password"]; ok {
-		if str, ok := v.Value().(string); ok {
-			c.Password = str
-		}
+		c.Password, _ = v.Value().(string)
 	}
 	if v, ok := s["allowed-auth"]; ok {
 		if u, ok := v.Value().(uint32); ok {
@@ -341,11 +535,8 @@ func parseMMSettings(s map[string]dbus.Variant) Config {
 
 func encodeMMSettings(c Config) map[string]dbus.Variant {
 	return map[string]dbus.Variant{
-		"apn":          dbus.MakeVariant(c.APN),
-		"user":         dbus.MakeVariant(c.Username),
-		"password":     dbus.MakeVariant(c.Password),
-		"allowed-auth": dbus.MakeVariant(encodeAuth(c.Auth)),
-		"ip-type":      dbus.MakeVariant(mm.BearerIPv4),
+		"apn": dbus.MakeVariant(c.APN), "user": dbus.MakeVariant(c.Username), "password": dbus.MakeVariant(c.Password),
+		"allowed-auth": dbus.MakeVariant(encodeAuth(c.Auth)), "ip-type": dbus.MakeVariant(mm.BearerIPv4),
 	}
 }
 
@@ -355,9 +546,8 @@ func encodeAuth(s string) uint32 {
 		return mm.BearerAuthPAP
 	case "chap":
 		return mm.BearerAuthCHAP
-	default:
-		return mm.BearerAuthNone
 	}
+	return mm.BearerAuthNone
 }
 
 func decodeAuth(u uint32) string {
@@ -366,7 +556,6 @@ func decodeAuth(u uint32) string {
 		return "pap"
 	case u&mm.BearerAuthCHAP != 0:
 		return "chap"
-	default:
-		return "none"
 	}
+	return "none"
 }

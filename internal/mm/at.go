@@ -7,6 +7,22 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
+// atFailure never returns the modem's error detail, which can echo credentials.
+func atFailure(response string) string {
+	for _, line := range strings.FieldsFunc(response, func(r rune) bool { return r == '\r' || r == '\n' }) {
+		line = strings.ToUpper(strings.TrimSpace(line))
+		if line == "ERROR" {
+			return "ERROR"
+		}
+		for _, prefix := range []string{"+CME ERROR", "+CMS ERROR"} {
+			if line == prefix || strings.HasPrefix(line, prefix+":") {
+				return prefix
+			}
+		}
+	}
+	return ""
+}
+
 // GetIMEI returns the modem IMEI.
 func (c *Client) GetIMEI(modemPath dbus.ObjectPath) (string, error) {
 	resp, err := c.SendCommand(modemPath, "AT+GSN", 5*time.Second)

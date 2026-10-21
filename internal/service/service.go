@@ -154,6 +154,7 @@ type Service struct {
 	handleSMSAddedFn     func(dbus.ObjectPath, dbus.ObjectPath)
 	raiseFaultFn         func(int, string)
 	recoveryBackoffFn    func(context.Context) error
+	reconcileAPNFn       func(context.Context, apn.Input) apn.Outcome
 
 	ctx context.Context
 
@@ -1227,6 +1228,9 @@ func (s *Service) probeHealth() bool {
 
 func (s *Service) recoverySucceeded(ctx context.Context, strategy string) {
 	s.Logger.Printf("Modem recovery successful via %s", strategy)
+	if s.Apn != nil {
+		s.Apn.ResetRetry()
+	}
 	s.Health.MarkNormal()
 	s.GPSRecoveryCount = 0
 	s.resetGPSAfterModemRecovery()
@@ -2041,6 +2045,19 @@ func (s *Service) handleAssessment(a link.Assessment) {
 // applyRemedy performs the action. Split from handleAssessment so the policy,
 // meaning the cooldowns and the logging, is testable without a modem.
 func (s *Service) applyRemedy(r link.Remedy) {
+	ctx := s.durableContext(context.Background())
+	if r != link.RemedyModemReset {
+		if !s.recoveryRunMu.TryLock() {
+			return
+		}
+		defer s.recoveryRunMu.Unlock()
+		var finish func()
+		ctx, finish = s.startModemOperation(ctx)
+		defer finish()
+		if !s.modemEnabled.Load() {
+			return
+		}
+	}
 	switch r {
 	case link.RemedyReattach:
 		modemPath, err := s.Modem.FindModem()
@@ -2048,15 +2065,15 @@ func (s *Service) applyRemedy(r link.Remedy) {
 			s.Logger.Printf("link: reattach skipped, no modem: %v", err)
 			return
 		}
-		if err := s.Apn.Reattach(modemPath); err != nil {
+		if err := s.Apn.Reattach(ctx, modemPath); err != nil {
 			s.Logger.Printf("link: reattach failed: %v", err)
 		}
 	case link.RemedyBearerBounce:
-		if err := apn.NewNMCli().Reapply(nmWWANConnection); err != nil {
+		if err := apn.NewNMCli().Reapply(ctx, nmWWANConnection); err != nil {
 			s.Logger.Printf("link: bearer bounce failed: %v", err)
 		}
 	case link.RemedyModemReset:
-		if err := s.handleModemFailure(s.ctx, "link_layer_failure"); err != nil {
+		if err := s.handleModemFailure(ctx, "link_layer_failure"); err != nil {
 			s.Logger.Printf("link: modem reset failed: %v", err)
 		}
 	}
@@ -2093,6 +2110,22 @@ func (s *Service) assignedResolvers() []string {
 		func() []string { return health.ResolvectlSource(s.Config.Interface) },
 		health.ResolvConfSource,
 	}}.Resolvers()
+}
+
+func (s *Service) reconcileAPN(ctx context.Context, in apn.Input) apn.Outcome {
+	if !s.recoveryRunMu.TryLock() {
+		return apn.OutcomeError
+	}
+	defer s.recoveryRunMu.Unlock()
+	opCtx, finish := s.startModemOperation(ctx)
+	defer finish()
+	if !s.modemEnabled.Load() || opCtx.Err() != nil {
+		return apn.OutcomeError
+	}
+	if s.reconcileAPNFn != nil {
+		return s.reconcileAPNFn(opCtx, in)
+	}
+	return s.Apn.Reconcile(opCtx, in)
 }
 
 func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
@@ -2132,9 +2165,10 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	// runs once we have an ICCID — apn.Manager handles the no-SIM case
 	// itself but skipping here avoids a redundant log line on every tick
 	// before the SIM comes up.
+	apnSettling := false
 	if currentState.ICCID != "" && currentState.SIMLockStatus == "" {
 		modemPath, _ := s.Modem.FindModem()
-		outcome := s.Apn.Reconcile(apn.Input{
+		outcome := s.reconcileAPN(ctx, apn.Input{
 			ICCID:     currentState.ICCID,
 			ModemPath: modemPath,
 			Desired: apn.Config{
@@ -2144,21 +2178,22 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 				Auth:     s.apnAuth.Load().(string),
 			},
 		})
-		currentState.ApnAction = string(outcome)
-		// Force LTE reattach when we actually wrote something — a new
-		// CGDCONT=1 only takes effect on the next attach. Done in a
-		// goroutine because COPS=2/0 can block for tens of seconds; we
-		// don't want to stall the monitor loop. modemPath is captured
-		// by value so a concurrent modem rebind doesn't race us.
-		if outcome == apn.OutcomeApplied || outcome == apn.OutcomeICCIDChangedClear {
-			if modemPath != "" {
-				go func(p dbus.ObjectPath) {
-					if err := s.Apn.Reattach(p); err != nil {
-						s.Logger.Printf("apn: reattach failed: %v", err)
-					}
-				}(modemPath)
-			}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
+		if !s.modemEnabled.Load() {
+			return context.Canceled
+		}
+		apnSettling = outcome == apn.OutcomeError || outcome == apn.OutcomeApplied || outcome == apn.OutcomeICCIDChangedClear
+		if apnSettling {
+			fresh, err := s.getModemInfo()
+			if err != nil {
+				return err
+			}
+			fresh.PinAction = currentState.PinAction
+			currentState = fresh
+		}
+		currentState.ApnAction = string(outcome)
 	}
 
 	// Only these local layers may trigger modem action.
@@ -2220,7 +2255,12 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	//
 	// Deliberately not passed the probe result: reachability may never
 	// trigger a remedy.
-	defer s.handleAssessment(assessment)
+	if apnSettling {
+		// Do not turn a failed APN transaction or its reconnect into a reset loop.
+		s.pendingRepeat = 0
+	} else {
+		defer s.handleAssessment(assessment)
+	}
 
 	if err := s.publishModemState(ctx, currentState, internetStatus); err != nil {
 		s.Logger.Printf("Failed to publish state: %v", err)
