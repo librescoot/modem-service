@@ -2112,6 +2112,18 @@ func (s *Service) assignedResolvers() []string {
 	}}.Resolvers()
 }
 
+func apnSIMReady(state *modem.State) bool {
+	if state.ICCID == "" || !state.SIMLockStatusKnown {
+		return false
+	}
+	// PIN2/PUK2 protect supplementary SIM functions, not cellular attachment.
+	switch state.SIMLockStatus {
+	case "", "none", "sim-pin2", "sim-puk2":
+		return true
+	}
+	return false
+}
+
 func (s *Service) reconcileAPN(ctx context.Context, in apn.Input) apn.Outcome {
 	if !s.recoveryRunMu.TryLock() {
 		return apn.OutcomeError
@@ -2166,7 +2178,7 @@ func (s *Service) checkAndPublishModemStatus(ctx context.Context) error {
 	// itself but skipping here avoids a redundant log line on every tick
 	// before the SIM comes up.
 	apnSettling := false
-	if currentState.ICCID != "" && currentState.SIMLockStatus == "" {
+	if apnSIMReady(currentState) {
 		modemPath, _ := s.Modem.FindModem()
 		outcome := s.reconcileAPN(ctx, apn.Input{
 			ICCID:     currentState.ICCID,

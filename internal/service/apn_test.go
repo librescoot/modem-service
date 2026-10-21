@@ -9,7 +9,31 @@ import (
 	"time"
 
 	"modem-service/internal/apn"
+	"modem-service/internal/modem"
 )
+
+func TestAPNSIMReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		lock  string
+		ready bool
+	}{
+		{"", true}, {"none", true}, {"sim-pin2", true}, {"sim-puk2", true},
+		{"sim-pin", false}, {"sim-puk", false}, {"ph-net-pin", false}, {"unknown", false},
+	} {
+		state := &modem.State{ICCID: "test-sim", SIMLockStatusKnown: true, SIMLockStatus: tc.lock}
+		if apnSIMReady(state) != tc.ready {
+			t.Errorf("lock=%q readiness mismatch", tc.lock)
+		}
+		state.SIMLockStatusKnown = false
+		if apnSIMReady(state) {
+			t.Errorf("unknown lock state allowed: %q", tc.lock)
+		}
+		state.SIMLockStatusKnown, state.ICCID = true, ""
+		if apnSIMReady(state) {
+			t.Errorf("missing SIM allowed: %q", tc.lock)
+		}
+	}
+}
 
 func TestAPNTransactionExcludesRecoveryAndCancelsOnDisable(t *testing.T) {
 	entered := make(chan struct{})
