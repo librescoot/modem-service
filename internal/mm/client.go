@@ -182,7 +182,11 @@ func (c *Client) SendCommandContext(ctx context.Context, modemPath dbus.ObjectPa
 func (c *Client) CallMethod(modemPath dbus.ObjectPath, iface, method string, args ...interface{}) *dbus.Call {
 	obj := c.conn.Object(ModemManagerService, modemPath)
 	fullMethod := iface + "." + method
-	c.log("Call %s(%v)", fullMethod, args)
+	if iface == ModemMessagingInterface && method == "Create" {
+		c.log("Call %s([REDACTED])", fullMethod)
+	} else {
+		c.log("Call %s(%v)", fullMethod, args)
+	}
 	return obj.Call(fullMethod, 0, args...)
 }
 
