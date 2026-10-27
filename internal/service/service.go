@@ -150,6 +150,7 @@ type Service struct {
 	powerOffModemFn      func(context.Context) error
 	removeInhibitorFn    func() error
 	publishLocationFn    func(map[string]interface{}, bool) error
+	publishGPSModeFn     func(string) error
 	watchSMSAddedFn      func(context.Context, dbus.ObjectPath, func(dbus.ObjectPath, bool)) error
 	handleSMSAddedFn     func(dbus.ObjectPath, dbus.ObjectPath)
 	raiseFaultFn         func(int, string)
@@ -167,6 +168,7 @@ type Service struct {
 	// modePubMu protects publication from overlapping mode-change goroutines.
 	modePubMu      sync.Mutex
 	lastPubGPSMode location.GPSMode
+	havePubGPSMode bool
 
 	// monitorDone prevents transports closing during an in-flight monitor call.
 	monitorDone chan struct{}
@@ -1617,21 +1619,26 @@ func (s *Service) requestGPSModeForConnectivity(ctx context.Context, conn connec
 }
 
 func (s *Service) publishGPSMode() {
-	mode := s.Location.CurrentGPSMode()
+	s.publishGPSModeValue(s.Location.CurrentGPSMode())
+}
 
+func (s *Service) publishGPSModeValue(mode location.GPSMode) {
 	s.modePubMu.Lock()
 	defer s.modePubMu.Unlock()
 
-	if mode == s.lastPubGPSMode {
+	if s.havePubGPSMode && mode == s.lastPubGPSMode {
 		return
 	}
-	if err := s.Redis.PublishLocationState(map[string]interface{}{
-		"mode": mode.String(),
-	}, false); err != nil {
+	publish := s.publishGPSModeFn
+	if publish == nil {
+		publish = s.Redis.PublishGPSMode
+	}
+	if err := publish(mode.String()); err != nil {
 		s.Logger.Printf("Failed to publish gps mode: %v", err)
 		return
 	}
 	s.lastPubGPSMode = mode
+	s.havePubGPSMode = true
 }
 
 // publishModemState publishes modem details and derived internet state.

@@ -264,6 +264,31 @@ func TestPublishModemState(t *testing.T) {
 	}
 }
 
+func TestPublishGPSMode(t *testing.T) {
+	client, cleanup := setupTestClient(t)
+	defer cleanup()
+
+	if err := client.PublishGPSMode("standalone"); err != nil {
+		t.Fatal(err)
+	}
+	value, err := client.client.Do("HGET", "gps", "mode")
+	if err != nil || value != "standalone" {
+		t.Fatalf("gps mode = %v, error = %v", value, err)
+	}
+	if _, err := client.client.Do("DEL", "gps"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.client.Do("SET", "gps", "wrong-type"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.PublishGPSMode("ue-based"); err == nil {
+		t.Error("wrong-type GPS key did not return a write error")
+	}
+	if _, err := client.client.Do("DEL", "gps"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPublishLocationState(t *testing.T) {
 	client, cleanup := setupTestClient(t)
 	defer cleanup()

@@ -5,12 +5,77 @@ import (
 	"errors"
 	"io"
 	"log"
+	"reflect"
 	"testing"
 
 	"modem-service/internal/health"
+	"modem-service/internal/location"
 	"modem-service/internal/modem"
 	"modem-service/internal/modem/connectivity"
 )
+
+func TestPublishGPSMode(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		modes []location.GPSMode
+		want  []string
+	}{
+		{"initial standalone and duplicate", []location.GPSMode{location.ModeStandalone, location.ModeStandalone}, []string{"standalone"}},
+		{"initial nonzero and duplicate", []location.GPSMode{location.ModeUEBased, location.ModeUEBased}, []string{"ue-based"}},
+		{"transitions", []location.GPSMode{location.ModeStandalone, location.ModeUEBased, location.ModeStandalone, location.ModeStandalone}, []string{"standalone", "ue-based", "standalone"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var writes []string
+			s := &Service{Logger: log.New(io.Discard, "", 0), Location: &location.Service{}}
+			s.publishGPSModeFn = func(mode string) error {
+				writes = append(writes, mode)
+				return nil
+			}
+			for i, mode := range tc.modes {
+				if i == 0 && mode == location.ModeStandalone {
+					s.publishGPSMode()
+				} else {
+					s.publishGPSModeValue(mode)
+				}
+			}
+			if !reflect.DeepEqual(writes, tc.want) {
+				t.Errorf("writes = %v, want %v", writes, tc.want)
+			}
+		})
+	}
+}
+
+func TestPublishGPSModeRetriesFailedWrite(t *testing.T) {
+	for _, initial := range []bool{true, false} {
+		t.Run(map[bool]string{true: "initial", false: "transition"}[initial], func(t *testing.T) {
+			var writes []string
+			fail := false
+			s := &Service{Logger: log.New(io.Discard, "", 0), Location: &location.Service{}}
+			s.publishGPSModeFn = func(mode string) error {
+				writes = append(writes, mode)
+				if fail {
+					fail = false
+					return errors.New("redis unavailable")
+				}
+				return nil
+			}
+			if !initial {
+				s.publishGPSModeValue(location.ModeUEBased)
+			}
+			fail = true
+			s.publishGPSMode()
+			s.publishGPSMode()
+			s.publishGPSMode()
+			want := []string{"standalone", "standalone"}
+			if !initial {
+				want = append([]string{"ue-based"}, want...)
+			}
+			if !reflect.DeepEqual(writes, want) {
+				t.Errorf("writes = %v, want %v", writes, want)
+			}
+		})
+	}
+}
 
 func TestPublishModemStateClearsUnavailableIdentityFields(t *testing.T) {
 	current := modem.NewState()

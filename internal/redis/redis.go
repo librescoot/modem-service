@@ -128,6 +128,18 @@ func (c *Client) PublishModemState(field, value string) error {
 	return nil
 }
 
+// PublishGPSMode confirms the write before the service caches the mode.
+func (c *Client) PublishGPSMode(mode string) error {
+	err := c.client.Hash("gps").SetMany(map[string]interface{}{
+		"mode":    mode,
+		"updated": time.Now().Format(time.RFC3339),
+	}, ipc.NoPublish(), ipc.Sync())
+	if err != nil {
+		return fmt.Errorf("cannot write gps mode to redis: %w", err)
+	}
+	return nil
+}
+
 // PublishLocationState updates the GPS hash, publishing only recovery timestamps.
 func (c *Client) PublishLocationState(data map[string]interface{}, publishRecovery bool) error {
 	data["updated"] = time.Now().Format(time.RFC3339)
