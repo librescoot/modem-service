@@ -126,11 +126,11 @@ func (m *Manager) Send(modemPath dbus.ObjectPath, req SendRequest) (Outcome, err
 	}()
 
 	if err := m.dbus.SendSMS(smsPath); err != nil {
-		m.logger.Printf("sms: send to %s failed: %v", req.To, err)
+		m.logger.Printf("sms: send failed: %v", err)
 		return OutcomeError, fmt.Errorf("send sms: %w", err)
 	}
 
-	m.logger.Printf("sms: sent to %s (%d chars)", req.To, len(req.Text))
+	m.logger.Printf("sms: sent (%d bytes)", len(req.Text))
 	return OutcomeOK, nil
 }
 
@@ -233,8 +233,8 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) {
 			Text:      props.Text,
 			Timestamp: parseTimestamp(props.Timestamp),
 		}
-		m.logger.Printf("sms: received from %s (%d chars, pdu=%s state=%s)",
-			msg.Number, len(msg.Text), mm.SmsPduTypeToString(props.PduType), mm.SmsStateToString(props.State))
+		m.logger.Printf("sms: received (%d bytes, pdu=%s state=%s)",
+			len(msg.Text), mm.SmsPduTypeToString(props.PduType), mm.SmsStateToString(props.State))
 		if err := m.deliver(msg); err != nil {
 			// Keep the modem copy as the retry buffer until delivery commits.
 			m.logger.Printf("sms: delivery of %s failed, leaving in modem storage: %v", smsPath, err)

@@ -121,6 +121,19 @@ func TestContextCallsCancelInFlight(t *testing.T) {
 	}
 }
 
+func TestSMSCreateArgumentsAreRedacted(t *testing.T) {
+	c, _, logs := privateBus(t)
+	_, _ = c.CreateSMS("/Modem/0", "+491234567890", "private message")
+	if !strings.Contains(logs.String(), "[REDACTED]") {
+		t.Fatal("SMS create call was not logged as redacted")
+	}
+	for _, sensitive := range []string{"+491234567890", "private message"} {
+		if strings.Contains(logs.String(), sensitive) {
+			t.Fatalf("SMS create log contains sensitive value %q", sensitive)
+		}
+	}
+}
+
 func TestAPNCredentialsAreRedacted(t *testing.T) {
 	c, server, logs := privateBus(t)
 	const path = dbus.ObjectPath("/Modem/0")

@@ -643,7 +643,7 @@ func (s *Service) handleSMSCommand(payload string) error {
 	s.touchCSActivity()
 
 	s.recordSendResult(req, "")
-	s.Logger.Printf("sms: sent to %s", req.To)
+	s.Logger.Printf("sms: sent")
 	return nil
 }
 
@@ -763,7 +763,7 @@ func (s *Service) startSMSWatch(ctx context.Context) {
 	if s.ownNumber() == "" {
 		if msisdn := s.queryOwnMSISDN(modemPath); msisdn != "" {
 			s.ownMSISDN.Store(msisdn)
-			s.Logger.Printf("sms: own MSISDN: %s", msisdn)
+			s.Logger.Printf("sms: own MSISDN available")
 		}
 	}
 
