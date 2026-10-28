@@ -84,6 +84,7 @@ type Service struct {
 	inboxMu               sync.Mutex
 	forwardMu             sync.Mutex
 	forwardDestination    atomic.Value
+	forwardActivatedAt    atomic.Int64
 	forwardDone           chan struct{}
 	smsWatchMu            sync.Mutex         // guards smsWatchCancel; startSMSWatch runs from the Run, monitor, and watchdog goroutines
 	smsWatchCancel        context.CancelFunc // cancels the active inbound-SMS watch; re-armed on modem recovery
@@ -343,10 +344,12 @@ func (s *Service) Run(ctx context.Context) error {
 		defer s.forwardMu.Unlock()
 		s.inboxMu.Lock()
 		defer s.inboxMu.Unlock()
-		if err := s.inbox.CancelForwardExcept(value); err != nil {
+		activatedAt, err := s.inbox.ConfigureForward(value, time.Now())
+		if err != nil {
 			s.forwardDestination.Store("off")
 			return err
 		}
+		s.forwardActivatedAt.Store(activatedAt)
 		s.forwardDestination.Store(value)
 		return s.publishInboxLocked()
 	})
@@ -875,7 +878,7 @@ func (s *Service) deliverIncomingSMS(msg *sms.Message) error {
 	s.inboxMu.Lock()
 	defer s.inboxMu.Unlock()
 	destination, _ := s.forwardDestination.Load().(string)
-	_, created, err := s.inbox.RecordWithForward(*msg, time.Now(), destination)
+	_, created, err := s.inbox.RecordWithForwardSince(*msg, time.Now(), destination, s.forwardActivatedAt.Load())
 	if err != nil {
 		return err
 	}

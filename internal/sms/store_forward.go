@@ -18,9 +18,30 @@ func (s *Store) RecoverForward() error {
 	return err
 }
 
-func (s *Store) CancelForwardExcept(destination string) error {
-	_, err := s.db.Exec(`UPDATE forward_jobs SET state='cancelled' WHERE state='queued' AND destination<>?`, destination)
-	return err
+func (s *Store) ConfigureForward(destination string, now time.Time) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var previous string
+	var activatedAt int64
+	if err = tx.QueryRow(`SELECT destination,activated_at FROM forward_config WHERE id=1`).Scan(&previous, &activatedAt); err != nil {
+		return 0, err
+	}
+	if previous != destination {
+		activatedAt = now.Truncate(time.Second).UnixMilli()
+		if _, err = tx.Exec(`UPDATE forward_config SET destination=?,activated_at=? WHERE id=1`, destination, activatedAt); err != nil {
+			return 0, err
+		}
+	}
+	if _, err = tx.Exec(`UPDATE forward_jobs SET state='cancelled' WHERE state='queued' AND destination<>?`, destination); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return activatedAt, nil
 }
 
 // ReserveForward commits both the attempt and its daily segment budget before

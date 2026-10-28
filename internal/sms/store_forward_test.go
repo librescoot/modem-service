@@ -61,6 +61,52 @@ func TestForwardBudgetSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestForwardOnlyMessagesAfterActivation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sms.db")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 1, 12, 0, 0, 500000000, time.UTC)
+	activated, err := store.ConfigureForward(testForwardTo, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	restored, err := store.ConfigureForward(testForwardTo, now.Add(time.Hour))
+	if err != nil || restored != activated {
+		t.Fatalf("activation changed on restart: %d %d %v", activated, restored, err)
+	}
+	for _, tc := range []struct {
+		timestamp time.Time
+		raw       string
+		expected  bool
+	}{
+		{now.Add(-time.Hour), "old", false},
+		{now.Add(time.Second), "", false},
+		{now.Truncate(time.Second), "new", true},
+	} {
+		msg := Message{Number: testSender, Text: tc.raw, Timestamp: tc.timestamp, SourceTimestamp: tc.raw}
+		if _, _, err := store.RecordWithForwardSince(msg, now, testForwardTo, activated); err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM forward_jobs WHERE body LIKE ?`, "%"+tc.raw+"%").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if (count > 0) != tc.expected {
+			t.Fatalf("timestamp=%v raw=%q count=%d", tc.timestamp, tc.raw, count)
+		}
+	}
+}
+
 func TestForwardCancelAndExpire(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "sms.db"))
 	if err != nil {
@@ -72,7 +118,7 @@ func TestForwardCancelAndExpire(t *testing.T) {
 	if _, _, err := store.RecordWithForward(msg, now, testForwardTo); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CancelForwardExcept("off"); err != nil {
+	if _, err := store.ConfigureForward("off", now); err != nil {
 		t.Fatal(err)
 	}
 	job, err := store.ReserveForward(now, testForwardTo, testOwn)
