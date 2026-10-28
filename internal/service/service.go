@@ -832,6 +832,8 @@ func (s *Service) configureAndDiagnoseSMS(modemPath dbus.ObjectPath) {
 		s.Logger.Printf("sms: MM supported-storages=%v", v.Value())
 	}
 
+	recoverFullSMSStorage(s.MMClient, modemPath, s.Logger)
+
 	if _, err := s.MMClient.SendCommand(modemPath, "AT+CNMI=2,1,0,0,0", 5*time.Second); err != nil {
 		s.Logger.Printf("sms: enabling new-message indications (CNMI) failed: %v", err)
 	} else {
