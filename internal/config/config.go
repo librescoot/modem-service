@@ -30,6 +30,7 @@ type Config struct {
 	// DataUsageFile is where the cellular byte totals are persisted. Empty
 	// keeps the counters in memory only, which is what a dev box wants.
 	DataUsageFile string
+	SMSStoreFile  string
 }
 
 func New() *Config {
@@ -62,6 +63,7 @@ func New() *Config {
 	// /data survives OTA; persistence occurs at power transitions and shutdown.
 	flag.StringVar(&cfg.DataUsageFile, "data-usage-file", "/data/internet-usage.json",
 		"Where to persist cellular byte totals; empty keeps them in memory only")
+	flag.StringVar(&cfg.SMSStoreFile, "sms-store-file", "/data/sms/inbox.db", "Persistent SMS inbox path")
 
 	return cfg
 }

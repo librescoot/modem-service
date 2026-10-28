@@ -1,6 +1,7 @@
 [Unit]
 Description=librescoot modem service
 After=network.target
+RequiresMountsFor=/data
 
 [Service]
 Type=simple
