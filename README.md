@@ -26,7 +26,8 @@ JSON on `gps:tpv`.
 It consumes `enable` and `disable` commands from `scooter:modem` and watches
 `vehicle.state`. It also reads these `settings` fields at startup and when they
 change: `modem.gps`, `modem.cell-location`, `cellular.sim-pin`,
-`cellular.apn`, `cellular.username`, `cellular.password`, and `cellular.auth`.
+`cellular.apn`, `cellular.username`, `cellular.password`, `cellular.auth`, and
+`sms.forward-to`.
 
 Outbound SMS requests are JSON values on `scooter:sms` with `to` and `text`,
 and may include an `id` correlation value. Terminal results are appended to the
@@ -34,6 +35,29 @@ capped `sms:sent` stream and published as JSON on the `sms:sent` channel.
 Inbound messages use the corresponding `sms:received` stream and channel. The
 `sms` hash carries latest-value state such as send state and the most recent
 message metadata; it is not a message archive.
+
+The received inbox is stored in `/data/sms/inbox.db`, with at most 100 messages
+and a 30-day retention period. `sms:inbox[snapshot]` is its JSON projection,
+containing `version`, `unread`, `forward-to`, and `messages`. Each message has
+an ID, sender, text, timestamp, receipt time, shared read state, and optional
+forwarding status. Publish read or delete actions by pushing JSON such as
+`{"action":"read","id":"<id>"}` to `sms:inbox:commands`. The snapshot is
+republished on changes and periodically, including after Redis reconnects.
+Binary SMS remain in the modem store rather than being treated as empty text.
+
+`sms.forward-to` is `off` by default, or a valid international mobile or
+landline number. Only new text SMS are forwarded. Forwarding is paused outside
+home registration, limited to 10 SMS segments per UTC day, and queued messages
+expire after 24 hours. Changing or disabling the destination cancels pending
+jobs. Sender/destination checks and a forwarding marker help prevent loops.
+An interrupted or failed send is recorded as `unknown` and is not retried
+automatically. A successful send reports modem acceptance, not recipient
+delivery. Forwarding can incur carrier charges. Multi-SIM subscriptions may
+route incoming SMS to another device, and forwarding to the same subscriber
+number is blocked when the modem reports that number.
+
+When the selected receive store is full, the service attempts to select another
+supported store with free space. It does not delete messages to free space.
 
 While the modem is powered, the service creates the `modem-active` block
 inhibitor in `power:inhibits` and removes it after power-down or clean shutdown.
@@ -43,7 +67,7 @@ inhibitor in `power:inhibits` and removes it after power-down or clean shutdown.
 Run `bin/modem-service -help` after building for the authoritative flag list.
 The principal options configure the Redis URL, network interface, GPSD and SUPL
 servers, connectivity-check timing and fallback targets, debug logging, SMS
-keepalive, and the data-usage file. The default data-usage file is
+keepalive, SMS inbox path, and the data-usage file. The default data-usage file is
 `/data/internet-usage.json`; an empty value keeps totals in memory only.
 
 SIM PIN and APN credentials are sensitive. Do not expose Redis to untrusted
@@ -80,6 +104,10 @@ make build-host   # local-development binary: bin/modem-service
 make test
 make lint         # requires golangci-lint
 ```
+
+Redis integration tests delete fixed keys. Set `REDIS_TEST_URL` and
+`SMS_TEST_REDIS_URL` only to an isolated scratch Redis instance; tests requiring
+them skip when the corresponding variable is absent.
 
 ## Deployment and operations
 
