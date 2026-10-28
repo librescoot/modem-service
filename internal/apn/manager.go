@@ -117,8 +117,6 @@ type Manager struct {
 	logger            *log.Logger
 	connection        string
 	mu                sync.Mutex
-	observer          OperationObserver
-	operation         *OperationStatus
 	pending           *pendingRollback
 	lastAppliedICCID  string
 	lastAppliedPath   dbus.ObjectPath
@@ -148,7 +146,7 @@ func (m *Manager) ResetRetry() {
 	m.lastAppliedPath = ""
 }
 
-func (m *Manager) Reconcile(ctx context.Context, in Input) (outcome Outcome) {
+func (m *Manager) Reconcile(ctx context.Context, in Input) Outcome {
 	if in.ICCID == "" {
 		return OutcomeNoSIM
 	}
@@ -180,16 +178,6 @@ func (m *Manager) Reconcile(ctx context.Context, in Input) (outcome Outcome) {
 
 	ctx, cancel := context.WithTimeout(ctx, transactionTimeout)
 	defer cancel()
-	if err := m.beginOperation(ctx, in, cfg); err != nil {
-		m.logger.Printf("apn: transaction status unavailable")
-		return OutcomeError
-	}
-	defer func() {
-		if err := m.finishOperation(ctx, outcome); err != nil {
-			m.logger.Printf("apn: transaction completion status unavailable")
-			outcome = OutcomeError
-		}
-	}()
 	before, err := m.readCurrent(ctx, in.ModemPath)
 	if err != nil {
 		m.logger.Printf("apn: read current failed: %v", err)
@@ -214,10 +202,6 @@ func (m *Manager) Reconcile(ctx context.Context, in Input) (outcome Outcome) {
 		return OutcomeError
 	}
 
-	if err := m.observeOperation(ctx, PhaseApplying); err != nil {
-		m.logger.Printf("apn: transaction status unavailable")
-		return OutcomeError
-	}
 	m.logger.Printf("apn: reconciling NM profile and CID1 (attempt %d/%d)", m.attempts+1, maxApplyAttempts)
 	if err := m.apply(ctx, in, cfg, before, clearSIM); err != nil {
 		m.attempts++
@@ -332,9 +316,6 @@ func (m *Manager) apply(ctx context.Context, in Input, cfg Config, before snapsh
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), limit)
 			defer cancel()
-			if statusErr := m.observeOperation(cleanupCtx, PhaseRollingBack); statusErr != nil {
-				m.logger.Printf("apn: rollback status unavailable")
-			}
 			if rollbackErr := m.rollback(cleanupCtx, ctx, path, before, state, changed, detached); rollbackErr != nil {
 				err = errors.Join(err, fmt.Errorf("rollback: %w", rollbackErr))
 			} else {
