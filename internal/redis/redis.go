@@ -59,6 +59,7 @@ type Client struct {
 	faults        *ipc.FaultReporter
 	modemHandler  *ipc.QueueHandler[string]
 	smsHandler    *ipc.QueueHandler[string]
+	inboxHandler  *ipc.QueueHandler[string]
 	vehicleWatch  *ipc.HashWatcher
 	settingsWatch *ipc.HashWatcher
 	smsReceived   *ipc.StreamPublisher
@@ -312,6 +313,16 @@ func (c *Client) PublishSMSSendResult(res SMSSendResult) error {
 	return nil
 }
 
+// PublishSMSInbox replaces the inbox snapshot and notifies its subscribers.
+func (c *Client) PublishSMSInbox(snapshot string) error {
+	return c.client.Hash("sms:inbox").Set("snapshot", snapshot, ipc.Sync())
+}
+
+// StartSMSInboxHandler receives read/delete requests as JSON.
+func (c *Client) StartSMSInboxHandler(handler SMSCommandHandler) {
+	c.inboxHandler = ipc.HandleRequests(c.client, "sms:inbox:commands", handler)
+}
+
 // StartModemCommandHandler consumes modem commands from scooter:modem.
 func (c *Client) StartModemCommandHandler(handler ModemCommandHandler) error {
 	c.modemHandler = ipc.HandleRequests(c.client, "scooter:modem", func(cmd string) error {
@@ -457,6 +468,9 @@ func (c *Client) Close() error {
 	}
 	if c.smsHandler != nil {
 		c.smsHandler.Stop()
+	}
+	if c.inboxHandler != nil {
+		c.inboxHandler.Stop()
 	}
 	if c.vehicleWatch != nil {
 		c.vehicleWatch.Stop()

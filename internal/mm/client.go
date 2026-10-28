@@ -416,6 +416,7 @@ func (c *Client) DeleteCall(modemPath, callPath dbus.ObjectPath) error {
 type SMSProperties struct {
 	Number    string // sender (inbound) or recipient (outbound) number
 	Text      string // message body
+	Data      []byte // binary message data, when present
 	State     uint32 // MMSmsState
 	PduType   uint32 // MMSmsPduType
 	Timestamp string // network timestamp (ISO 8601); empty for locally-created
@@ -480,6 +481,9 @@ func (c *Client) GetSMSProperties(smsPath dbus.ObjectPath) (SMSProperties, error
 	}
 	if v, ok := props["Text"]; ok {
 		p.Text, _ = v.Value().(string)
+	}
+	if v, ok := props["Data"]; ok {
+		p.Data, _ = v.Value().([]byte)
 	}
 	if v, ok := props["State"]; ok {
 		p.State, _ = v.Value().(uint32)

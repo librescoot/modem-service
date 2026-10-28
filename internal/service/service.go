@@ -80,6 +80,11 @@ type Service struct {
 	apnPassword           atomic.Value // string; cellular.password
 	apnAuth               atomic.Value // string; cellular.auth ("none"|"pap"|"chap")
 	SMS                   *sms.Manager
+	inbox                 *sms.Store
+	inboxMu               sync.Mutex
+	forwardMu             sync.Mutex
+	forwardDestination    atomic.Value
+	forwardDone           chan struct{}
 	smsWatchMu            sync.Mutex         // guards smsWatchCancel; startSMSWatch runs from the Run, monitor, and watchdog goroutines
 	smsWatchCancel        context.CancelFunc // cancels the active inbound-SMS watch; re-armed on modem recovery
 	smsSIMPresent         atomic.Bool
@@ -224,8 +229,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	}
 	// Let the location service re-resolve the modem D-Bus path when MM
 	// rebinds the modem (e.g. after mmcli --reset or AT+CFUN=0/1).
-	// The SMS manager delivers inbound messages through the service so a
-	// failed Redis write keeps the message in modem storage for retry.
+	// Inbox persistence commits before the manager deletes a modem copy.
 	service.SMS = sms.New(mmClient, logger, service.deliverIncomingSMS)
 	service.Location.ResolveModemPath = modemMgr.FindModem
 	service.gpsEnabled.Store(true)           // default: GPS on
@@ -236,6 +240,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 	service.apnUsername.Store("")
 	service.apnPassword.Store("")
 	service.apnAuth.Store("")
+	service.forwardDestination.Store("off")
 
 	cell.SetVersion(version)
 	service.Logger.Printf("modem-service %s", version)
@@ -250,6 +255,21 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("redis connection failed: %v", err)
 	}
 	s.Redis.ClearFault(redisClient.FaultCodeGPSUnavailable)
+
+	inbox, err := sms.OpenStore(s.Config.SMSStoreFile)
+	if err != nil {
+		return fmt.Errorf("open SMS inbox: %w", err)
+	}
+	s.inbox = inbox
+	defer inbox.Close()
+	if err := inbox.RecoverForward(); err != nil {
+		return fmt.Errorf("recover SMS forwarding: %w", err)
+	}
+	s.SMS.SetDeleteCallback(inbox.ForgetModem)
+	if err := s.publishInbox(); err != nil {
+		s.Logger.Printf("sms: initial inbox projection failed: %v", err)
+	}
+	s.Redis.StartSMSInboxHandler(s.handleInboxCommand)
 
 	if err := s.Redis.StartModemCommandHandler(s.handleModemCommand); err != nil {
 		s.Logger.Printf("Failed to start modem command handler: %v", err)
@@ -315,6 +335,21 @@ func (s *Service) Run(ctx context.Context) error {
 		s.Logger.Printf("APN auth set: %q", value)
 		return nil
 	})
+	s.Redis.StartSettingsWatcher("sms.forward-to", func(value string) error {
+		if !sms.ValidForwardDestination(value) {
+			value = "off"
+		}
+		s.forwardMu.Lock()
+		defer s.forwardMu.Unlock()
+		s.inboxMu.Lock()
+		defer s.inboxMu.Unlock()
+		if err := s.inbox.CancelForwardExcept(value); err != nil {
+			s.forwardDestination.Store("off")
+			return err
+		}
+		s.forwardDestination.Store(value)
+		return s.publishInboxLocked()
+	})
 	s.Redis.StartSettingsWatching()
 
 	if s.modemEnabled.Load() {
@@ -345,9 +380,12 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.Logger.Printf("Starting modem service on interface %s", s.Config.Interface)
+	s.forwardDone = make(chan struct{})
+	go s.forwardLoop(ctx)
 	go s.monitorStatus(ctx)
 
 	<-ctx.Done()
+	<-s.forwardDone
 
 	// Give the monitor goroutine a chance to exit its current tick before
 	// we tear down MMClient/Modem/Redis. Without this, an AT command or
@@ -828,20 +866,26 @@ func (s *Service) drainSMS(modemPath dbus.ObjectPath) {
 	}
 }
 
-// deliverIncomingSMS is the SMS manager's delivery callback: it commits one
-// received message to the sms:received stream (with a channel notification
-// and hash convenience fields). An error return makes the manager keep the
-// message in modem storage, so the periodic drain retries the delivery.
+// deliverIncomingSMS commits to the durable inbox before projecting to Redis.
+// An inbox error leaves stored modem messages available for a later retry.
 func (s *Service) deliverIncomingSMS(msg *sms.Message) error {
 	s.touchCSActivity()
-	count := s.unreadSMS.Add(1)
-	if err := s.Redis.PublishIncomingSMS(redisClient.IncomingSMS{
-		From:      msg.Number,
-		Text:      msg.Text,
-		Timestamp: msg.Timestamp.Format(time.RFC3339),
-	}, count); err != nil {
-		s.unreadSMS.Add(-1)
+	s.inboxMu.Lock()
+	defer s.inboxMu.Unlock()
+	destination, _ := s.forwardDestination.Load().(string)
+	_, created, err := s.inbox.RecordWithForward(*msg, time.Now(), destination)
+	if err != nil {
 		return err
+	}
+	if err := s.publishInboxLocked(); err != nil {
+		s.Logger.Printf("sms: inbox projection failed: %v", err)
+	}
+	if created {
+		if err := s.Redis.PublishIncomingSMS(redisClient.IncomingSMS{
+			From: msg.Number, Text: msg.Text, Timestamp: msg.Timestamp.Format(time.RFC3339),
+		}, s.unreadSMS.Load()); err != nil {
+			s.Logger.Printf("sms: event publication failed: %v", err)
+		}
 	}
 	return nil
 }
@@ -2514,6 +2558,9 @@ func (s *Service) monitorStatus(ctx context.Context) {
 				s.Logger.Printf("Event-driven modem status check failed: %v", err)
 			}
 		case <-ticker.C:
+			if err := s.publishInbox(); err != nil {
+				s.Logger.Printf("sms: inbox refresh failed: %v", err)
+			}
 			if !s.modemEnabled.Load() {
 				continue
 			}

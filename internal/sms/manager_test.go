@@ -193,6 +193,22 @@ func TestDrain_IncomingReceived(t *testing.T) {
 	}
 }
 
+func TestDrain_BinaryMessageIsNotDeleted(t *testing.T) {
+	d := &fakeDBus{
+		listPaths: []dbus.ObjectPath{"/sms/1"},
+		props: map[dbus.ObjectPath]mm.SMSProperties{
+			"/sms/1": {Number: "+4930", Data: []byte{1, 2}, State: mm.MMSmsStateReceived, PduType: mm.MMSmsPduTypeDeliver},
+		},
+	}
+	m, rec := newManager(d)
+	if err := m.DrainReceived(testModemPath); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.msgs) != 0 || len(d.deleted) != 0 {
+		t.Fatal("binary message was delivered as text or deleted")
+	}
+}
+
 func TestDrain_DeliveryFailureLeavesInStorage(t *testing.T) {
 	// If the deliver callback fails (Redis down), the message must stay in
 	// modem storage so a later drain can retry — and that retry must deliver.

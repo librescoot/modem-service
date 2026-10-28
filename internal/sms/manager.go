@@ -34,9 +34,11 @@ type SendRequest struct {
 
 // Message is a parsed inbound SMS handed to the deliver callback.
 type Message struct {
-	Number    string    // sender's number
-	Text      string    // message body
-	Timestamp time.Time // network timestamp, or receive time if unavailable
+	Number          string    // sender's number
+	Text            string    // message body
+	Timestamp       time.Time // network timestamp, or receive time if unavailable
+	SourcePath      string    // ModemManager object path until the modem copy is deleted
+	SourceTimestamp string    // raw timestamp for stable duplicate detection
 }
 
 // DeliverFunc hands one inbound message to the service. Returning an error
@@ -55,9 +57,10 @@ const (
 
 // Manager performs SMS send/receive over a MessagingDBus.
 type Manager struct {
-	dbus    MessagingDBus
-	logger  *log.Logger
-	deliver DeliverFunc
+	dbus        MessagingDBus
+	logger      *log.Logger
+	deliver     DeliverFunc
+	afterDelete func(string) error
 
 	// mu serializes Send with the drain/handle paths so they never race on the
 	// modem's shared message store. Because Send holds mu for its whole
@@ -93,6 +96,20 @@ func New(d MessagingDBus, logger *log.Logger, deliver DeliverFunc) *Manager {
 		logger:             logger,
 		deliver:            deliver,
 		deliveredUndeleted: make(map[dbus.ObjectPath]messageIdentity),
+	}
+}
+
+// SetDeleteCallback releases durable delivery identities after modem deletion.
+// It must be configured before the manager starts processing messages.
+func (m *Manager) SetDeleteCallback(callback func(string) error) {
+	m.afterDelete = callback
+}
+
+func (m *Manager) forgetDeleted(path dbus.ObjectPath) {
+	if m.afterDelete != nil {
+		if err := m.afterDelete(string(path)); err != nil {
+			m.logger.Printf("sms: failed to release delivery identity: %v", err)
+		}
 	}
 }
 
@@ -215,6 +232,10 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) {
 		}
 
 	default:
+		if len(props.Data) != 0 {
+			m.logger.Printf("sms: binary message %s left in modem storage", smsPath)
+			return
+		}
 		identity := messageIdentity{number: props.Number, text: props.Text, timestamp: props.Timestamp}
 		if m.deliveredUndeleted[smsPath] == identity {
 			// Already delivered in an earlier round; the object just wouldn't
@@ -223,15 +244,18 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) {
 				m.logger.Printf("sms: delete retry for already-delivered %s failed: %v", smsPath, err)
 			} else {
 				delete(m.deliveredUndeleted, smsPath)
+				m.forgetDeleted(smsPath)
 				m.logger.Printf("sms: delete retry for already-delivered %s succeeded", smsPath)
 			}
 			return
 		}
 
 		msg := &Message{
-			Number:    props.Number,
-			Text:      props.Text,
-			Timestamp: parseTimestamp(props.Timestamp),
+			Number:          props.Number,
+			Text:            props.Text,
+			Timestamp:       parseTimestamp(props.Timestamp),
+			SourcePath:      string(smsPath),
+			SourceTimestamp: props.Timestamp,
 		}
 		m.logger.Printf("sms: received (%d bytes, pdu=%s state=%s)",
 			len(msg.Text), mm.SmsPduTypeToString(props.PduType), mm.SmsStateToString(props.State))
@@ -245,6 +269,7 @@ func (m *Manager) processOne(modemPath, smsPath dbus.ObjectPath) {
 			m.deliveredUndeleted[smsPath] = identity
 		} else {
 			delete(m.deliveredUndeleted, smsPath)
+			m.forgetDeleted(smsPath)
 		}
 	}
 }
