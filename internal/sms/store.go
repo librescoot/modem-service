@@ -64,6 +64,8 @@ func OpenStore(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS pending_modem (path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, entry_id TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS forward_jobs (id TEXT PRIMARY KEY, sender TEXT NOT NULL, destination TEXT NOT NULL, body TEXT NOT NULL, segments INTEGER NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, budget_day TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS forward_budget (day TEXT PRIMARY KEY, segments INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS forward_config (id INTEGER PRIMARY KEY CHECK(id=1), destination TEXT NOT NULL, activated_at INTEGER NOT NULL)`,
+		`INSERT OR IGNORE INTO forward_config(id,destination,activated_at) VALUES(1,'off',0)`,
 	} {
 		if _, err = db.Exec(statement); err != nil {
 			db.Close()
@@ -87,6 +89,10 @@ func (s *Store) Record(msg Message, now time.Time) (StoredMessage, bool, error) 
 }
 
 func (s *Store) RecordWithForward(msg Message, now time.Time, destination string) (StoredMessage, bool, error) {
+	return s.RecordWithForwardSince(msg, now, destination, 0)
+}
+
+func (s *Store) RecordWithForwardSince(msg Message, now time.Time, destination string, activatedAt int64) (StoredMessage, bool, error) {
 	identity, err := json.Marshal([]string{msg.Number, msg.Text, msg.SourceTimestamp})
 	if err != nil {
 		return StoredMessage{}, false, err
@@ -122,7 +128,8 @@ func (s *Store) RecordWithForward(msg Message, now time.Time, destination string
 			return StoredMessage{}, false, err
 		}
 	}
-	if body, segments, ok := ForwardText(msg, destination); ok {
+	eligible := activatedAt == 0 || (msg.SourceTimestamp != "" && !msg.Timestamp.Before(time.UnixMilli(activatedAt)))
+	if body, segments, ok := ForwardText(msg, destination); ok && eligible {
 		if _, err = tx.Exec(`INSERT INTO forward_jobs(id,sender,destination,body,segments,state,created_at,expires_at) VALUES(?,?,?,?,?,'queued',?,?)`, entry.ID, msg.Number, destination, body, segments, now.UnixMilli(), now.Add(24*time.Hour).UnixMilli()); err != nil {
 			return StoredMessage{}, false, err
 		}
