@@ -434,6 +434,11 @@ func (c *Client) ListSMS(modemPath dbus.ObjectPath) ([]dbus.ObjectPath, error) {
 	return paths, err
 }
 
+// SetSMSDefaultStorage selects ModemManager's default receive storage.
+func (c *Client) SetSMSDefaultStorage(modemPath dbus.ObjectPath, storage uint32) error {
+	return c.CallMethod(modemPath, ModemMessagingInterface, "SetDefaultStorage", storage).Err
+}
+
 // CreateSMS creates a new outbound SMS object and returns its D-Bus path.
 // Messaging.Create takes a properties dict; "number" and "text" are the only
 // keys we set. The object is not transmitted until SendSMS is called on it.
