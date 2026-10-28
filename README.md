@@ -49,7 +49,9 @@ Binary SMS remain in the modem store rather than being treated as empty text.
 landline number. Only new text SMS are forwarded. Forwarding is paused outside
 home registration, limited to 10 SMS segments per UTC day, and queued messages
 expire after 24 hours. Changing or disabling the destination cancels pending
-jobs. Sender/destination checks and a forwarding marker help prevent loops.
+jobs. Messages without a usable network timestamp are stored but not forwarded,
+so older messages of unknown age are not sent after enablement. Sender/destination
+checks and a forwarding marker help prevent loops.
 An interrupted or failed send is recorded as `unknown` and is not retried
 automatically. A successful send reports modem acceptance, not recipient
 delivery. Forwarding can incur carrier charges. Multi-SIM subscriptions may
