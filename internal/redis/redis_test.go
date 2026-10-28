@@ -8,10 +8,11 @@ import (
 	"time"
 )
 
-func getTestRedisURL() string {
-	url := os.Getenv("REDIS_URL")
+func getTestRedisURL(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("REDIS_TEST_URL")
 	if url == "" {
-		url = "redis://localhost:6379"
+		t.Skip("set REDIS_TEST_URL to a dedicated scratch Redis; these tests delete keys")
 	}
 	return url
 }
@@ -20,7 +21,7 @@ func setupTestClient(t *testing.T) (*Client, func()) {
 	t.Helper()
 
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	client, err := New(getTestRedisURL(), logger)
+	client, err := New(getTestRedisURL(t), logger)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -540,7 +541,7 @@ func TestPing(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	client, err := New(getTestRedisURL(), logger)
+	client, err := New(getTestRedisURL(t), logger)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
