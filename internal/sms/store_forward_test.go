@@ -85,20 +85,22 @@ func TestForwardOnlyMessagesAfterActivation(t *testing.T) {
 		t.Fatalf("activation changed on restart: %d %d %v", activated, restored, err)
 	}
 	for _, tc := range []struct {
+		text      string
 		timestamp time.Time
 		raw       string
 		expected  bool
 	}{
-		{now.Add(-time.Hour), "old", false},
-		{now.Add(time.Second), "", false},
-		{now.Truncate(time.Second), "new", true},
+		{"old", now.Add(-time.Hour), now.Add(-time.Hour).Format(time.RFC3339), false},
+		{"missing", now.Add(time.Second), "", false},
+		{"invalid", now.Add(time.Second), "invalid", false},
+		{"new", now.Truncate(time.Second), now.Truncate(time.Second).Format(time.RFC3339), true},
 	} {
-		msg := Message{Number: testSender, Text: tc.raw, Timestamp: tc.timestamp, SourceTimestamp: tc.raw}
+		msg := Message{Number: testSender, Text: tc.text, Timestamp: tc.timestamp, SourceTimestamp: tc.raw}
 		if _, _, err := store.RecordWithForwardSince(msg, now, testForwardTo, activated); err != nil {
 			t.Fatal(err)
 		}
 		var count int
-		if err := store.db.QueryRow(`SELECT COUNT(*) FROM forward_jobs WHERE body LIKE ?`, "%"+tc.raw+"%").Scan(&count); err != nil {
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM forward_jobs WHERE body LIKE ?`, "%"+tc.text+"%").Scan(&count); err != nil {
 			t.Fatal(err)
 		}
 		if (count > 0) != tc.expected {

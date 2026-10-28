@@ -128,7 +128,8 @@ func (s *Store) RecordWithForwardSince(msg Message, now time.Time, destination s
 			return StoredMessage{}, false, err
 		}
 	}
-	eligible := activatedAt == 0 || (msg.SourceTimestamp != "" && !msg.Timestamp.Before(time.UnixMilli(activatedAt)))
+	sourceTime, timestampErr := time.Parse(time.RFC3339, msg.SourceTimestamp)
+	eligible := activatedAt == 0 || (timestampErr == nil && !sourceTime.Before(time.UnixMilli(activatedAt)))
 	if body, segments, ok := ForwardText(msg, destination); ok && eligible {
 		if _, err = tx.Exec(`INSERT INTO forward_jobs(id,sender,destination,body,segments,state,created_at,expires_at) VALUES(?,?,?,?,?,'queued',?,?)`, entry.ID, msg.Number, destination, body, segments, now.UnixMilli(), now.Add(24*time.Hour).UnixMilli()); err != nil {
 			return StoredMessage{}, false, err
