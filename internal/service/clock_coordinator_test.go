@@ -16,6 +16,7 @@ func TestGPSProgressionRejectsReplayAndSuspend(t *testing.T) {
 		{"normal", time.Second, time.Second, time.Second, true},
 		{"frozen", 0, time.Second, time.Second, false},
 		{"replay", -time.Second, time.Second, time.Second, false},
+		{"progressing replay burst", time.Second, 100 * time.Millisecond, 100 * time.Millisecond, false},
 		{"delayed", time.Second, 10 * time.Second, 10 * time.Second, false},
 		{"suspend", time.Second, time.Second, 100 * time.Millisecond, false},
 	} {

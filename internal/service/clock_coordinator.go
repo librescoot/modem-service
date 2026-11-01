@@ -88,7 +88,7 @@ func gpsProgresses(a, b location.Location) bool {
 	elapsed := time.Duration(b.ReceiptBootNS - a.ReceiptBootNS)
 	active := time.Duration(b.ReceiptMonoNS - a.ReceiptMonoNS)
 	delta := b.Timestamp.Sub(a.Timestamp)
-	return elapsed <= 5*time.Second && elapsed-active < 500*time.Millisecond && delta > 0 && (delta-elapsed).Abs() < 2*time.Second
+	return elapsed >= 500*time.Millisecond && elapsed <= 5*time.Second && elapsed-active < 500*time.Millisecond && delta > 0 && (delta-elapsed).Abs() <= 750*time.Millisecond
 }
 func gpsReceiptFresh(loc location.Location, nowBoot, nowMono int64) bool {
 	bootAge, monoAge := nowBoot-loc.ReceiptBootNS, nowMono-loc.ReceiptMonoNS
