@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"modem-service/internal/mm"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -201,6 +202,7 @@ func TestCloseClearsFixState(t *testing.T) {
 	s.stateMutex.Lock()
 	s.currentLoc = Location{Latitude: 52.5, Longitude: 13.4, Timestamp: time.Now()}
 	s.lastFix = time.Now()
+	s.lastDataReceived = time.Now().Add(-time.Hour)
 	s.stateMutex.Unlock()
 
 	s.Close()
@@ -211,9 +213,57 @@ func TestCloseClearsFixState(t *testing.T) {
 	if ts := s.CurrentLoc().Timestamp; !ts.IsZero() {
 		t.Errorf("CurrentLoc().Timestamp = %v after Close(), want zero", ts)
 	}
+	if ts := s.LastDataReceived(); !ts.IsZero() {
+		t.Errorf("LastDataReceived() = %v after Close(), want zero", ts)
+	}
 	// Last known position is deliberately kept for last-known consumers.
 	if loc := s.CurrentLoc(); loc.Latitude == 0 || loc.Longitude == 0 {
 		t.Errorf("CurrentLoc() lat/lng cleared = %+v, want preserved", loc)
+	}
+}
+
+func TestCloseClearsGPSDDataAfterReaderStops(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		fmt.Fprintln(conn, `{"class":"VERSION"}`)
+		buf := make([]byte, 256)
+		if _, err := conn.Read(buf); err != nil {
+			return
+		}
+		fmt.Fprintln(conn, `{"class":"SKY","satellites":[]}`)
+		_, _ = conn.Read(buf)
+	}()
+	s := NewService(log.New(io.Discard, "", 0), listener.Addr().String(), nil, "")
+	if err := s.connectToGPSD(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for s.LastDataReceived().IsZero() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if s.LastDataReceived().IsZero() {
+		s.Close()
+		t.Fatal("no GPS report received")
+	}
+	s.Close()
+	if !s.LastDataReceived().IsZero() {
+		t.Fatal("old GPS data survived Close")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("GPS connection not closed")
 	}
 }
 

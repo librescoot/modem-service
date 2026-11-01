@@ -779,6 +779,24 @@ func TestGPSHealthCheck(t *testing.T) {
 	}
 }
 
+func TestGPSHealthAfterModemRestart(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	loc := location.NewService(logger, "", nil, "")
+	service := &Service{Logger: logger, Location: loc}
+
+	loc.SetLastDataReceived(time.Now().Add(-time.Hour))
+	loc.Close()
+	service.GPSEnabledTime = time.Now()
+	if err := service.checkGPSHealth(); err != nil {
+		t.Fatalf("GPS restart used stale data timestamp: %v", err)
+	}
+
+	service.GPSEnabledTime = time.Now().Add(-gpsNoDataTimeout - time.Second)
+	if err := service.checkGPSHealth(); err == nil {
+		t.Fatal("GPS restart without data must still time out")
+	}
+}
+
 func TestHealthStateInitialization(t *testing.T) {
 	h := health.New()
 

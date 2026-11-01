@@ -1306,22 +1306,30 @@ func (s *Service) Close() {
 	s.gpsdConnected.Store(false)
 	s.state.Store("off")
 
-	// Clear fix timestamps so resume cannot feed stale GPS time to chrony.
-	// Monotonic staleness cannot detect suspend because that clock also stops;
-	// last coordinates remain available only as an explicitly inactive fix.
+	s.configMutex.Lock()
+	if s.GpsdConn != nil {
+		s.GpsdConn.Close()
+		s.GpsdConn = nil
+		if s.Done != nil {
+			select {
+			case <-s.Done:
+			case <-time.After(2 * time.Second):
+				s.Logger.Printf("Warning: gpsd Watch goroutine did not exit within 2s")
+			}
+			s.Done = nil
+		}
+	}
+	s.configMutex.Unlock()
+
+	// Clear the old session's timestamps after stopping its reader so they
+	// cannot be mistaken for current GPS data or replayed to the clock.
 	s.hasValidFix.Store(false)
 	s.stateMutex.Lock()
 	s.currentLoc.Timestamp = time.Time{}
 	s.currentLoc.TimeFromGPS = false
 	s.lastFix = time.Time{}
+	s.lastDataReceived = time.Time{}
 	s.stateMutex.Unlock()
-
-	s.configMutex.Lock()
-	if s.GpsdConn != nil {
-		s.GpsdConn.Close()
-		s.GpsdConn = nil
-	}
-	s.configMutex.Unlock()
 	s.lifecycleMu.Unlock()
 }
 
