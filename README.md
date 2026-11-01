@@ -131,3 +131,23 @@ Original Librescoot code in this repository is available, at your option, under
 Third-party code retains its existing license.
 
 Made with ❤️ by the Librescoot community
+
+### GPS clock samples
+
+Corrected GPS receiver timestamps are submitted to the local clock coordinator;
+a position timestamp substituted from the system clock is not a clock sample.
+The producer requires successive, progressing TPV timestamps in the same GPSD
+session and rejects stale receipts, replay bursts and suspend crossings. Receipt
+is measured at the TPV callback with CLOCK_BOOTTIME. Post-receipt processing and
+IPC time are accounted for by the coordinator; submissions expire two seconds
+after receipt. Submission is not clock confirmation: only selected, converged
+GPS coordinator quality is published as GPS confirmation.
+
+The uncertainty includes one second for timestamp quantization, the receiver's
+reported time precision, and a one-second allowance for local receiver/GPSD
+delivery. This assumes that delay before the callback stays within that bound.
+A continuously progressing stream delayed by a fixed amount before receipt is
+not distinguishable from a fresh one while bootstrapping without another trusted
+clock. Verify the receiver and GPSD delivery bound on target hardware before
+rollout. Once independently trusted NTP is available, the coordinator rejects
+GPS samples that disagree beyond their combined uncertainty.

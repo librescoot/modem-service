@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"modem-service/internal/mm"
 	"os/exec"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 	"github.com/stratoberry/go-gpsd"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -38,6 +40,10 @@ const (
 	// SIMCom GPS firmwares with a stale rollover epoch report timestamps this much
 	// behind the real time, e.g. April 2026 → April 2006.
 	gpsWeekRollover = 1024 * 7 * 24 * time.Hour
+
+	// GPSD is a local stream; receiver and transport delay is assumed bounded by one second.
+	gpsTransportAllowance    = time.Second
+	gpsTimestampQuantization = time.Second
 )
 
 // GPSMode selects standalone or SUPL-assisted satellite acquisition.
@@ -113,13 +119,17 @@ type Config struct {
 }
 
 type Location struct {
-	Latitude    float64   `json:"latitude"`
-	Longitude   float64   `json:"longitude"`
-	Altitude    float64   `json:"altitude"`
-	Speed       float64   `json:"speed"`
-	Course      float64   `json:"course"`
-	Timestamp   time.Time `json:"timestamp"`
-	TimeFromGPS bool      `json:"-"`
+	Latitude          float64   `json:"latitude"`
+	Longitude         float64   `json:"longitude"`
+	Altitude          float64   `json:"altitude"`
+	Speed             float64   `json:"speed"`
+	Course            float64   `json:"course"`
+	Timestamp         time.Time `json:"timestamp"`
+	TimeFromGPS       bool      `json:"-"`
+	ReceiptBootNS     int64     `json:"-"`
+	ReceiptMonoNS     int64     `json:"-"`
+	TimeUncertaintyNS int64     `json:"-"`
+	GPSSession        uint64    `json:"-"`
 }
 
 // ModemPathResolver finds the current modem after ModemManager rebinds it.
@@ -153,6 +163,7 @@ type Service struct {
 
 	stateMutex       sync.RWMutex
 	currentLoc       Location
+	gpsSession       atomic.Uint64
 	lastFix          time.Time
 	lastDataReceived time.Time // includes reports without a fix
 
@@ -1120,6 +1131,7 @@ func (s *Service) connectToGPSD() error {
 	}
 
 	s.GpsdConn = conn
+	session := s.gpsSession.Add(1)
 
 	s.GpsdConn.AddFilter("SKY", func(r interface{}) {
 		report, ok := r.(*gpsd.SKYReport)
@@ -1168,6 +1180,9 @@ func (s *Service) connectToGPSD() error {
 	})
 
 	s.GpsdConn.AddFilter("TPV", func(r interface{}) {
+		var bt, mono unix.Timespec
+		bootErr := unix.ClockGettime(unix.CLOCK_BOOTTIME, &bt)
+		monoErr := unix.ClockGettime(unix.CLOCK_MONOTONIC, &mono)
 		report, ok := r.(*gpsd.TPVReport)
 		if !ok {
 			s.Logger.Printf("Error: Could not cast TPV report")
@@ -1246,7 +1261,11 @@ func (s *Service) connectToGPSD() error {
 			})
 		}
 		rawLocation.Timestamp = gpsTime
-		rawLocation.TimeFromGPS = fromGPS
+		rawLocation.TimeFromGPS = fromGPS && bootErr == nil && monoErr == nil && !math.IsNaN(report.Ept) && !math.IsInf(report.Ept, 0) && report.Ept >= 0 && report.Ept <= 1
+		rawLocation.ReceiptBootNS = bt.Nano()
+		rawLocation.ReceiptMonoNS = mono.Nano()
+		rawLocation.TimeUncertaintyNS = int64(gpsTransportAllowance+gpsTimestampQuantization) + int64(math.Ceil(report.Ept*float64(time.Second)))
+		rawLocation.GPSSession = session
 
 		s.stateMutex.Lock()
 		s.currentLoc = rawLocation

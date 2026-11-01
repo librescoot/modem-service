@@ -159,10 +159,8 @@ func (c *Client) PublishLocationState(data map[string]interface{}, publishRecove
 	return nil
 }
 
-// PublishClockSync records that the system clock was set from an authoritative
-// source. Consumers (pm-service) gate low-power decisions on a confirmed clock
-// step rather than inferring one from a GPS fix, which can exist while
-// `chronyc settime` fails. No publish: consumers poll the hash.
+// PublishClockSync records selected, converged external clock quality.
+// The hash is updated without publishing an event.
 func (c *Client) PublishClockSync(source string, at time.Time) error {
 	data := map[string]interface{}{
 		"source":    source,

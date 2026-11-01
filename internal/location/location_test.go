@@ -753,3 +753,9 @@ func TestGPSTimestampPreservesSourceAndRollover(t *testing.T) {
 		t.Fatalf("normal GPS timestamp: got %v fromGPS=%v corrected=%v", got, fromGPS, corrected)
 	}
 }
+
+func TestGPSClockUncertaintyIncludesTransportAllowance(t *testing.T) {
+	if gpsTransportAllowance != time.Second || gpsTimestampQuantization != time.Second {
+		t.Fatal("unexpected GPS uncertainty assumptions")
+	}
+}

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,18 +38,6 @@ var modemOnlineStates = map[string]bool{
 	"parked":         true,
 	"ready-to-drive": true,
 }
-
-// clockValidationInterval paces GPS-vs-system clock checks.
-const clockValidationInterval = 5 * time.Minute
-
-// clockStepTolerance is the GPS/system disagreement beyond which the clock is
-// stepped. Smaller offsets are harmless; stepping for them fights NTP and
-// disturbs wall-clock deadlines.
-const clockStepTolerance = 30 * time.Second
-
-// clockStepConfirmations is how many consecutive checks must agree on a gross
-// disagreement before stepping, so one bad fix cannot move the clock.
-const clockStepConfirmations = 3
 
 // Require two identical failures so transient bring-up states do not trigger recovery.
 const remedyConfirmations = 2
@@ -129,8 +116,7 @@ type Service struct {
 	now            func() time.Time
 
 	lastClockSync    time.Time
-	lastClockCheck   time.Time
-	clockOffsetCount int
+	gpsClockPrevious location.Location
 	gpsFaultActive   atomic.Bool
 
 	// Settings (from Redis) — atomic so the Redis watcher goroutine can
@@ -624,8 +610,7 @@ func (s *Service) disableModem(ctx context.Context) {
 
 	// Force the first post-resume fix to bootstrap the potentially drifted clock.
 	s.lastClockSync = time.Time{}
-	s.lastClockCheck = time.Time{}
-	s.clockOffsetCount = 0
+	s.gpsClockPrevious = location.Location{}
 
 	if err := s.powerOffModem(ctx); err != nil {
 		s.Logger.Printf("Failed to disable modem via GPIO: %v", err)
@@ -1903,55 +1888,6 @@ func (s *Service) publishLocationState(ctx context.Context, loc location.Locatio
 	return nil
 }
 
-// syncClockFromGPS feeds chrony a single time sample via `chronyc settime`.
-// Returns true if chrony accepted the sample, false if the timestamp was
-// rejected or the command failed (so the caller can retry on the next tick
-// instead of waiting a full clockSyncInterval).
-func (s *Service) syncClockFromGPS(t time.Time) bool {
-	if t.IsZero() {
-		return false
-	}
-	// Defense in depth against GPS week-rollover bugs: refuse to set the
-	// system clock to a timestamp before the current rollover epoch. The TPV
-	// callback already corrects rollover, but we never want a stray bad
-	// value to roll a working system clock back ~20 years.
-	if t.Before(location.MinValidGPSDate) {
-		s.Logger.Printf("Refusing to set system time from GPS: %s is before the current GPS rollover epoch (%s)",
-			t.Format(time.RFC3339), location.MinValidGPSDate.Format(time.RFC3339))
-		return false
-	}
-	timeStr := t.Local().Format("02 Jan 2006 15:04:05")
-	out, err := exec.Command("chronyc", "settime", timeStr).CombinedOutput()
-	if err != nil {
-		s.Logger.Printf("Failed to set system time from GPS: %v: %s", err, out)
-		return false
-	}
-	s.Logger.Printf("System time set from GPS: %s", timeStr)
-	s.publishClockSync(t)
-	return true
-}
-
-// publishClockSync records a GPS clock validation for low-power consumers.
-func (s *Service) publishClockSync(at time.Time) {
-	if err := s.Redis.PublishClockSync("gps", at); err != nil {
-		s.Logger.Printf("Failed to publish clock sync state: %v", err)
-	}
-}
-
-// nextClockOffsetCount advances the consecutive gross-disagreement counter. A
-// clock that has never been synced steps on the first gross offset; afterwards
-// it takes clockStepConfirmations consecutive samples.
-func nextClockOffsetCount(previous int, offset time.Duration, synced bool) (int, bool) {
-	if offset.Abs() <= clockStepTolerance {
-		return 0, false
-	}
-	if !synced {
-		return 0, true
-	}
-	previous++
-	return previous, previous >= clockStepConfirmations
-}
-
 func gpsClockTime(loc location.Location) (time.Time, bool) {
 	if !loc.TimeFromGPS || loc.Timestamp.IsZero() || loc.Timestamp.Before(location.MinValidGPSDate) {
 		return time.Time{}, false
@@ -1959,43 +1895,23 @@ func gpsClockTime(loc location.Location) (time.Time, bool) {
 	return loc.Timestamp, true
 }
 
-// validateClock steps the system clock when a fresh GPS fix persistently
-// disagrees with it beyond clockStepTolerance. Runs online and offline, so an
-// already-synced clock is re-validated instead of trusted indefinitely.
 func (s *Service) validateClock() {
-	now := s.clock()
-	if !s.lastClockCheck.IsZero() && now.Sub(s.lastClockCheck) < clockValidationInterval {
+	loc := s.Location.CurrentLoc()
+	if _, ok := gpsClockTime(loc); !ok {
+		s.gpsClockPrevious = location.Location{}
 		return
 	}
-
-	gpsTime, valid := gpsClockTime(s.Location.CurrentLoc())
-	if !valid {
+	previous := s.gpsClockPrevious
+	if loc.ReceiptBootNS == previous.ReceiptBootNS {
 		return
 	}
-	s.lastClockCheck = now
-
-	offset := gpsTime.Sub(now)
-	count, step := nextClockOffsetCount(s.clockOffsetCount, offset, !s.lastClockSync.IsZero())
-	s.clockOffsetCount = count
-	if !step {
-		if offset.Abs() <= clockStepTolerance && s.lastClockSync.IsZero() {
-			s.lastClockSync = now
-			s.publishClockSync(gpsTime)
-			return
-		}
-		if offset.Abs() > clockStepTolerance {
-			s.Logger.Printf("GPS clock offset %s, confirming (%d/%d)",
-				offset.Round(time.Second), s.clockOffsetCount, clockStepConfirmations)
-		}
+	s.gpsClockPrevious = loc
+	if !gpsProgresses(previous, loc) {
 		return
 	}
-
-	if !s.syncClockFromGPS(gpsTime) {
-		return
+	if err := s.submitGPSClock(loc); err != nil {
+		s.Logger.Printf("GPS clock submission: %v", err)
 	}
-	s.lastClockSync = now
-	s.clockOffsetCount = 0
-	s.Logger.Printf("System clock stepped from GPS, offset was %s", offset.Round(time.Second))
 }
 
 // reachabilityField separates a silent restricted APN from a broken local path.
