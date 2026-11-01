@@ -736,3 +736,20 @@ func TestStartStandaloneReceiverRequiresPostStartQuery(t *testing.T) {
 		})
 	}
 }
+
+func TestGPSTimestampPreservesSourceAndRollover(t *testing.T) {
+	fallback := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	got, fromGPS, corrected := gpsTimestamp(time.Time{}, fallback)
+	if !got.Equal(fallback) || fromGPS || corrected {
+		t.Fatalf("missing GPS timestamp: got %v fromGPS=%v corrected=%v", got, fromGPS, corrected)
+	}
+	old := fallback.Add(-gpsWeekRollover)
+	got, fromGPS, corrected = gpsTimestamp(old, fallback)
+	if !got.Equal(fallback) || !fromGPS || !corrected {
+		t.Fatalf("rollover: got %v fromGPS=%v corrected=%v", got, fromGPS, corrected)
+	}
+	got, fromGPS, corrected = gpsTimestamp(fallback, fallback.Add(time.Hour))
+	if !got.Equal(fallback) || !fromGPS || corrected {
+		t.Fatalf("normal GPS timestamp: got %v fromGPS=%v corrected=%v", got, fromGPS, corrected)
+	}
+}

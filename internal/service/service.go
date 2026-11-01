@@ -1952,6 +1952,13 @@ func nextClockOffsetCount(previous int, offset time.Duration, synced bool) (int,
 	return previous, previous >= clockStepConfirmations
 }
 
+func gpsClockTime(loc location.Location) (time.Time, bool) {
+	if !loc.TimeFromGPS || loc.Timestamp.IsZero() || loc.Timestamp.Before(location.MinValidGPSDate) {
+		return time.Time{}, false
+	}
+	return loc.Timestamp, true
+}
+
 // validateClock steps the system clock when a fresh GPS fix persistently
 // disagrees with it beyond clockStepTolerance. Runs online and offline, so an
 // already-synced clock is re-validated instead of trusted indefinitely.
@@ -1960,12 +1967,12 @@ func (s *Service) validateClock() {
 	if !s.lastClockCheck.IsZero() && now.Sub(s.lastClockCheck) < clockValidationInterval {
 		return
 	}
-	s.lastClockCheck = now
 
-	gpsTime := s.Location.CurrentLoc().Timestamp
-	if gpsTime.IsZero() || gpsTime.Before(location.MinValidGPSDate) {
+	gpsTime, valid := gpsClockTime(s.Location.CurrentLoc())
+	if !valid {
 		return
 	}
+	s.lastClockCheck = now
 
 	offset := gpsTime.Sub(now)
 	count, step := nextClockOffsetCount(s.clockOffsetCount, offset, !s.lastClockSync.IsZero())

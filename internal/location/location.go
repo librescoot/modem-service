@@ -86,6 +86,14 @@ func correctGPSWeekRollover(t time.Time) (time.Time, bool) {
 	return corrected, !corrected.Equal(t)
 }
 
+func gpsTimestamp(reportTime, fallback time.Time) (timestamp time.Time, fromGPS, corrected bool) {
+	if reportTime.IsZero() {
+		return fallback, false, false
+	}
+	timestamp, corrected = correctGPSWeekRollover(reportTime)
+	return timestamp, true, corrected
+}
+
 func configRetryDelay(attempt int) time.Duration {
 	delay := GPSRetryInterval
 	for range attempt {
@@ -105,12 +113,13 @@ type Config struct {
 }
 
 type Location struct {
-	Latitude  float64   `json:"latitude"`
-	Longitude float64   `json:"longitude"`
-	Altitude  float64   `json:"altitude"`
-	Speed     float64   `json:"speed"`
-	Course    float64   `json:"course"`
-	Timestamp time.Time `json:"timestamp"`
+	Latitude    float64   `json:"latitude"`
+	Longitude   float64   `json:"longitude"`
+	Altitude    float64   `json:"altitude"`
+	Speed       float64   `json:"speed"`
+	Course      float64   `json:"course"`
+	Timestamp   time.Time `json:"timestamp"`
+	TimeFromGPS bool      `json:"-"`
 }
 
 // ModemPathResolver finds the current modem after ModemManager rebinds it.
@@ -1229,19 +1238,15 @@ func (s *Service) connectToGPSD() error {
 			rawLocation.Course = report.Track
 		}
 
-		if !report.Time.IsZero() {
-			gpsTime, corrected := correctGPSWeekRollover(report.Time)
-			if corrected {
-				s.rolloverLogged.Do(func() {
-					s.Logger.Printf("GPS week-rollover correction active: receiver reports %s, using %s",
-						report.Time.Format(time.RFC3339),
-						gpsTime.Format(time.RFC3339))
-				})
-			}
-			rawLocation.Timestamp = gpsTime
-		} else {
-			rawLocation.Timestamp = time.Now()
+		gpsTime, fromGPS, corrected := gpsTimestamp(report.Time, time.Now())
+		if corrected {
+			s.rolloverLogged.Do(func() {
+				s.Logger.Printf("GPS week-rollover correction active: receiver reports %s, using %s",
+					report.Time.Format(time.RFC3339), gpsTime.Format(time.RFC3339))
+			})
 		}
+		rawLocation.Timestamp = gpsTime
+		rawLocation.TimeFromGPS = fromGPS
 
 		s.stateMutex.Lock()
 		s.currentLoc = rawLocation
@@ -1288,6 +1293,7 @@ func (s *Service) Close() {
 	s.hasValidFix.Store(false)
 	s.stateMutex.Lock()
 	s.currentLoc.Timestamp = time.Time{}
+	s.currentLoc.TimeFromGPS = false
 	s.lastFix = time.Time{}
 	s.stateMutex.Unlock()
 
