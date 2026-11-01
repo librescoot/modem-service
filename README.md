@@ -141,7 +141,9 @@ session and rejects stale receipts, replay bursts and suspend crossings. Receipt
 is measured at the TPV callback with CLOCK_BOOTTIME. Post-receipt processing and
 IPC time are accounted for by the coordinator; submissions expire two seconds
 after receipt. Submission is not clock confirmation: only selected, converged
-GPS coordinator quality is published as GPS confirmation.
+GPS coordinator quality is published as GPS confirmation. The MDB chrony
+configuration requires multiple GPS samples before selecting GPS, and the
+coordinator treats its configured precision as part of chrony's uncertainty.
 
 The uncertainty includes one second for timestamp quantization, the receiver's
 reported time precision, and a one-second allowance for local receiver/GPSD
