@@ -61,6 +61,11 @@ number is blocked when the modem reports that number.
 When the selected receive store is full, the service attempts to select another
 supported store with free space. It does not delete messages to free space.
 
+GPS status and location are processed every second in `parked`, `ready-to-drive`,
+and `shutting-down`, and every 10 seconds in other known vehicle states. The
+service returns to the one-second interval when the state is unknown. This
+changes the service's processing cadence, not the GPS receiver or gpsd stream.
+
 While the modem is powered, the service creates the `modem-active` block
 inhibitor in `power:inhibits` and removes it after power-down or clean shutdown.
 

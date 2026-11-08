@@ -122,6 +122,8 @@ type Service struct {
 	// Settings (from Redis) — atomic so the Redis watcher goroutine can
 	// update them without racing the monitor goroutine that reads them.
 	gpsEnabled          atomic.Bool
+	gpsSlow             atomic.Bool
+	gpsIntervalChanged  chan struct{}
 	cellLocationEnabled atomic.Bool
 	lastCellTower       *cell.CellTower
 	lastCellLoc         *cell.CellLocation
@@ -202,6 +204,7 @@ func New(cfg *config.Config, logger *log.Logger, version string) (*Service, erro
 		connClassifier:      connectivity.New(),
 		monitorDone:         make(chan struct{}),
 		modemStateChange:    make(chan struct{}, 1),
+		gpsIntervalChanged:  make(chan struct{}, 1),
 		smsRefreshRequest:   make(chan chan struct{}),
 
 		link: link.New(),
@@ -547,8 +550,24 @@ func (s *Service) handleModemCommand(command string) error {
 	return nil
 }
 
+const gpsLowPowerInterval = 10 * time.Second
+
+func (s *Service) gpsUpdateInterval() time.Duration {
+	if s.gpsSlow.Load() {
+		return gpsLowPowerInterval
+	}
+	return location.GPSUpdateInterval
+}
+
 // handleVehicleState enables the modem in online vehicle states.
 func (s *Service) handleVehicleState(state string) error {
+	slow := state != "" && state != "parked" && state != "ready-to-drive" && state != "shutting-down"
+	if s.gpsSlow.Swap(slow) != slow {
+		select {
+		case s.gpsIntervalChanged <- struct{}{}:
+		default:
+		}
+	}
 	if modemOnlineStates[state] {
 		if s.modemEnabled.CompareAndSwap(false, true) {
 			s.Logger.Printf("Vehicle state '%s' - enabling modem", state)
@@ -2426,7 +2445,7 @@ func (s *Service) reconcileModemTarget(ctx context.Context, applied *bool) bool 
 func (s *Service) monitorStatus(ctx context.Context) {
 	defer close(s.monitorDone)
 	ticker := time.NewTicker(s.Config.InternetCheckTime)
-	gpsTimer := time.NewTicker(location.GPSUpdateInterval)
+	gpsTimer := time.NewTicker(s.gpsUpdateInterval())
 	cellTimer := time.NewTicker(location.CellLocationUpdateInterval)
 	defer ticker.Stop()
 	defer gpsTimer.Stop()
@@ -2510,6 +2529,8 @@ func (s *Service) monitorStatus(ctx context.Context) {
 			if s.cellLocationEnabled.Load() && !s.Location.HasValidFix() && s.LastState.Status == "connected" {
 				s.queryCellLocation(ctx, s.LastState)
 			}
+		case <-s.gpsIntervalChanged:
+			gpsTimer.Reset(s.gpsUpdateInterval())
 		case <-gpsTimer.C:
 			if !s.modemEnabled.Load() {
 				continue
