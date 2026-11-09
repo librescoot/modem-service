@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/godbus/dbus/v5 v5.2.2
-	github.com/librescoot/redis-ipc v0.15.3
+	github.com/librescoot/redis-ipc v0.15.4
 	github.com/nyaruka/phonenumbers v1.8.0
 	github.com/pkg/errors v0.9.1
 	github.com/stratoberry/go-gpsd v1.3.0
