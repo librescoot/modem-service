@@ -65,6 +65,10 @@ GPS status and location are processed every second in `parked`, `ready-to-drive`
 and `shutting-down`, and every 10 seconds in other non-empty vehicle states. The
 service returns to the one-second interval when the state is missing. This
 changes the service's processing cadence, not the GPS receiver or gpsd stream.
+In those other states the satellite list (gpsd `SKY` reports) is decoded at most
+every 10 seconds; the skipped reports still count as receiver activity. Position
+reports (`TPV`) are always decoded, because the GPS clock submission needs a
+receipt that is at most two seconds old.
 
 While the modem is powered, the service creates the `modem-active` block
 inhibitor in `power:inhibits` and removes it after power-down or clean shutdown.

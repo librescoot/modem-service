@@ -3,6 +3,8 @@ package service
 import (
 	"testing"
 	"time"
+
+	"modem-service/internal/location"
 )
 
 func TestGPSIntervalFollowsVehicleState(t *testing.T) {
@@ -38,6 +40,25 @@ func TestGPSIntervalFollowsVehicleState(t *testing.T) {
 			if tc.changed {
 				t.Errorf("state %q: missing change", tc.state)
 			}
+		}
+	}
+}
+
+// The gpsd stream is decoded at the cadence the results are used at.
+func TestGPSStreamDecodeIntervalFollowsVehicleState(t *testing.T) {
+	s := &Service{gpsIntervalChanged: make(chan struct{}, 1), Location: &location.Service{}}
+	s.modemEnabled.Store(true)
+	for state, want := range map[string]time.Duration{
+		"stand-by":       gpsLowPowerInterval,
+		"parked":         0,
+		"hibernating":    gpsLowPowerInterval,
+		"ready-to-drive": 0,
+	} {
+		if err := s.handleVehicleState(state); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.Location.ReportInterval(); got != want {
+			t.Errorf("state %q: decode interval %v, want %v", state, got, want)
 		}
 	}
 }

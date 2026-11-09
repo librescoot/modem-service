@@ -567,6 +567,14 @@ func (s *Service) handleVehicleState(state string) error {
 		case s.gpsIntervalChanged <- struct{}{}:
 		default:
 		}
+		// The satellite list is only used when the status is published.
+		if s.Location != nil {
+			interval := time.Duration(0)
+			if slow {
+				interval = gpsLowPowerInterval
+			}
+			s.Location.SetReportInterval(interval)
+		}
 	}
 	if modemOnlineStates[state] {
 		if s.modemEnabled.CompareAndSwap(false, true) {

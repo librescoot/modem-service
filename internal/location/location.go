@@ -141,25 +141,26 @@ type Service struct {
 	MMClient         *mm.Client
 	Config           Config
 	Logger           *log.Logger
-	GpsdConn         *gpsd.Session
+	GpsdConn         *gpsdSession
 	GpsdServer       string
 	Done             chan bool
 
 	// GPS state fields — written by gpsd callbacks, read by monitorStatus.
 	// Simple scalars use atomics; compound types (Location, time.Time) use stateMutex.
-	hasValidFix   atomic.Bool
-	fixMode       atomic.Value // string: "none", "2d", "3d"
-	snr           atomic.Value // float64: average SNR of used satellites (dBHz)
-	hdop          atomic.Value // float64
-	vdop          atomic.Value // float64
-	pdop          atomic.Value // float64
-	eph           atomic.Value // float64: horizontal position error (m)
-	eps           atomic.Value // float64: speed error (m/s)
-	ept           atomic.Value // float64: time precision (s)
-	satsUsed      atomic.Int32
-	satsVisible   atomic.Int32
-	gpsdConnected atomic.Bool
-	state         atomic.Value // string: "off", "searching", "fix-established", "error"
+	hasValidFix    atomic.Bool
+	reportInterval atomic.Int64
+	fixMode        atomic.Value // string: "none", "2d", "3d"
+	snr            atomic.Value // float64: average SNR of used satellites (dBHz)
+	hdop           atomic.Value // float64
+	vdop           atomic.Value // float64
+	pdop           atomic.Value // float64
+	eph            atomic.Value // float64: horizontal position error (m)
+	eps            atomic.Value // float64: speed error (m/s)
+	ept            atomic.Value // float64: time precision (s)
+	satsUsed       atomic.Int32
+	satsVisible    atomic.Int32
+	gpsdConnected  atomic.Bool
+	state          atomic.Value // string: "off", "searching", "fix-established", "error"
 
 	stateMutex       sync.RWMutex
 	currentLoc       Location
@@ -217,18 +218,35 @@ func NewService(logger *log.Logger, gpsdServer string, mmClient *mm.Client, supl
 	return s
 }
 
-func (s *Service) HasValidFix() bool        { return s.hasValidFix.Load() }
-func (s *Service) FixMode() string          { return s.fixMode.Load().(string) }
-func (s *Service) SNR() float64             { return s.snr.Load().(float64) }
-func (s *Service) HDOP() float64            { return s.hdop.Load().(float64) }
-func (s *Service) VDOP() float64            { return s.vdop.Load().(float64) }
-func (s *Service) PDOP() float64            { return s.pdop.Load().(float64) }
-func (s *Service) EPH() float64             { return s.eph.Load().(float64) }
-func (s *Service) EPS() float64             { return s.eps.Load().(float64) }
-func (s *Service) EPT() float64             { return s.ept.Load().(float64) }
-func (s *Service) SatsUsed() int32          { return s.satsUsed.Load() }
-func (s *Service) SatsVisible() int32       { return s.satsVisible.Load() }
-func (s *Service) GpsdConnected() bool      { return s.gpsdConnected.Load() }
+func (s *Service) HasValidFix() bool   { return s.hasValidFix.Load() }
+func (s *Service) FixMode() string     { return s.fixMode.Load().(string) }
+func (s *Service) SNR() float64        { return s.snr.Load().(float64) }
+func (s *Service) HDOP() float64       { return s.hdop.Load().(float64) }
+func (s *Service) VDOP() float64       { return s.vdop.Load().(float64) }
+func (s *Service) PDOP() float64       { return s.pdop.Load().(float64) }
+func (s *Service) EPH() float64        { return s.eph.Load().(float64) }
+func (s *Service) EPS() float64        { return s.eps.Load().(float64) }
+func (s *Service) EPT() float64        { return s.ept.Load().(float64) }
+func (s *Service) SatsUsed() int32     { return s.satsUsed.Load() }
+func (s *Service) SatsVisible() int32  { return s.satsVisible.Load() }
+func (s *Service) GpsdConnected() bool { return s.gpsdConnected.Load() }
+
+// SetReportInterval limits how often gpsd SKY reports (the satellite list) are
+// decoded; zero decodes every report. TPV reports are always decoded. Reports
+// that are not decoded still count as receiver activity, so the staleness
+// checks are unaffected.
+func (s *Service) SetReportInterval(d time.Duration) {
+	s.reportInterval.Store(int64(d))
+}
+
+// ReportInterval returns the interval set by SetReportInterval.
+func (s *Service) ReportInterval() time.Duration { return time.Duration(s.reportInterval.Load()) }
+
+func (s *Service) noteSkippedReport(string) {
+	s.stateMutex.Lock()
+	s.lastDataReceived = time.Now()
+	s.stateMutex.Unlock()
+}
 func (s *Service) State() string            { return s.state.Load().(string) }
 func (s *Service) GPSFreshInit() bool       { return s.gpsFreshInit.Load() }
 func (s *Service) IsEnabled() bool          { return s.monitoringActive.Load() }
@@ -1122,7 +1140,7 @@ func (s *Service) connectToGPSD() error {
 	}
 
 	s.Logger.Printf("Connecting to gpsd on %s", s.GpsdServer)
-	conn, err := gpsd.Dial(s.GpsdServer)
+	conn, err := dialGPSD(s.GpsdServer, func() time.Duration { return time.Duration(s.reportInterval.Load()) }, s.noteSkippedReport)
 	if err != nil {
 		return fmt.Errorf("failed to connect to gpsd: %v", err)
 	}
