@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
-
-	"github.com/nyaruka/phonenumbers"
 )
 
 var e164 = regexp.MustCompile(`^\+[1-9][0-9]{7,14}$`)
@@ -15,22 +13,7 @@ var e164 = regexp.MustCompile(`^\+[1-9][0-9]{7,14}$`)
 const forwardMarker = "[Librescoot SMS]"
 
 func ValidForwardDestination(value string) bool {
-	if value == "off" {
-		return true
-	}
-	if !e164.MatchString(value) {
-		return false
-	}
-	number, err := phonenumbers.Parse(value, "")
-	if err != nil || !phonenumbers.IsValidNumber(number) {
-		return false
-	}
-	switch phonenumbers.GetNumberType(number) {
-	case phonenumbers.MOBILE, phonenumbers.FIXED_LINE, phonenumbers.FIXED_LINE_OR_MOBILE:
-		return true
-	default:
-		return false
-	}
+	return value == "off" || e164.MatchString(value)
 }
 
 // ForwardText uses a marker to avoid forwarding our own forwarded messages.

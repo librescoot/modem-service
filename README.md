@@ -45,8 +45,9 @@ forwarding status. Publish read or delete actions by pushing JSON such as
 republished on changes and periodically, including after Redis reconnects.
 Binary SMS remain in the modem store rather than being treated as empty text.
 
-`sms.forward-to` is `off` by default, or a valid international mobile or
-landline number. Only new text SMS are forwarded. Forwarding is paused outside
+`sms.forward-to` is `off` by default, or an international number in `+` and
+8 to 15 digit format. Number assignment and type are not checked. Only new text
+SMS are forwarded. Forwarding is paused outside
 home registration, limited to 10 SMS segments per UTC day, and queued messages
 expire after 24 hours. Changing or disabling the destination cancels pending
 jobs. Messages without a usable network timestamp are stored but not forwarded,

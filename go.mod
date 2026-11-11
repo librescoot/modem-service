@@ -5,10 +5,10 @@ go 1.24.0
 require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/librescoot/redis-ipc v0.15.4
-	github.com/nyaruka/phonenumbers v1.8.0
 	github.com/pkg/errors v0.9.1
 	github.com/stratoberry/go-gpsd v1.3.0
 	github.com/warthog618/go-gpiocdev v0.9.1
+	golang.org/x/sys v0.41.0
 	modernc.org/sqlite v1.37.1
 )
 
@@ -23,9 +23,6 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 	modernc.org/libc v1.65.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
