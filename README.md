@@ -74,6 +74,15 @@ receipt that is at most two seconds old.
 While the modem is powered, the service creates the `modem-active` block
 inhibitor in `power:inhibits` and removes it after power-down or clean shutdown.
 
+### SIM status
+
+`modem[sim-state]=locked` and `error-state=sim-locked` mean a primary SIM or
+personalization code is required. ModemManager's `sim-pin2` and `sim-puk2` restrict
+auxiliary SIM functions, not cellular access: they remain visible in `sim-lock`
+but do not turn a present SIM into `locked` or produce `sim-locked`. SIM presence
+and network connectivity are reported separately. The enabled PIN facility flag
+indicates configured PIN protection, not that a PIN is currently required.
+
 ## Configuration
 
 Run `bin/modem-service -help` after building for the authoritative flag list.

@@ -208,12 +208,20 @@ func LockReasonToString(lock uint32) string {
 		return "ph-sim-pin"
 	case MMLockPhFsimPin:
 		return "ph-fsim-pin"
+	case MMLockPhFsimPuk:
+		return "ph-fsim-puk"
 	case MMLockPhNetPin:
 		return "ph-net-pin"
+	case MMLockPhNetPuk:
+		return "ph-net-puk"
 	case MMLockPhSpPin:
 		return "ph-sp-pin"
+	case MMLockPhSpPuk:
+		return "ph-sp-puk"
 	case MMLockPhCorpPin:
 		return "ph-corp-pin"
+	case MMLockPhCorpPuk:
+		return "ph-corp-puk"
 	default:
 		return "unknown"
 	}

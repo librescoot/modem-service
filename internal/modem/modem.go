@@ -219,7 +219,10 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 				state.SIMLockStatusKnown = true
 				if lockStr != "none" {
 					state.SIMLockStatus = lockStr
-					state.SIMState = SIMStateLocked
+					// PIN2/PUK2 restrict auxiliary SIM functions, not cellular access.
+					if lock != mm.MMLockSimPin2 && lock != mm.MMLockSimPuk2 {
+						state.SIMState = SIMStateLocked
+					}
 				}
 			}
 		}
@@ -297,7 +300,7 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 			state.ErrorState = "sim-missing"
 		} else if state.SIMState == SIMStateInactive {
 			state.ErrorState = "sim-inactive"
-		} else if state.SIMLockStatus != "" && state.SIMLockStatus != "none" {
+		} else if state.SIMState == SIMStateLocked {
 			state.ErrorState = "sim-locked"
 		} else if state.Registration == RegistrationDenied {
 			state.ErrorState = "registration-denied"
