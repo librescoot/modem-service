@@ -118,6 +118,48 @@ func TestPublishModemStateClearsUnavailableIdentityFields(t *testing.T) {
 	}
 }
 
+func TestPublishOperatorSourcesAndClearOnRestart(t *testing.T) {
+	current := modem.NewState()
+	last := *current
+	classifier := connectivity.New()
+	classifier.Force(connectivity.Disconnected)
+	s := &Service{Logger: log.New(io.Discard, "", 0), Health: health.New(), LastState: &last, connClassifier: classifier, lastPubConn: connectivity.Disconnected}
+	s.modemEnabled.Store(true)
+	writes := map[string]string{}
+	s.publishFn = func(key, value string) error { return nil }
+	s.publishModemFn = func(key, value string) error { writes[key] = value; return nil }
+	if err := s.publishModemState(context.Background(), current, current.Status); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"sim-operator-name", "sim-operator-code", "network-operator-name", "network-operator-code"}
+	for _, key := range keys {
+		if v, ok := writes[key]; !ok || v != "" {
+			t.Errorf("initial %s = %q, present %v", key, v, ok)
+		}
+	}
+	current.SIMOperatorName, current.SIMOperatorCode = "Lebara", "26214"
+	current.NetworkOperatorName, current.NetworkOperatorCode = "E-Plus", "26203"
+	writes = map[string]string{}
+	if err := s.publishModemState(context.Background(), current, current.Status); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"Lebara", "26214", "E-Plus", "26203"} {
+		if writes[keys[i]] != want {
+			t.Errorf("%s = %q, want %q", keys[i], writes[keys[i]], want)
+		}
+	}
+	current.NetworkOperatorName, current.NetworkOperatorCode = "", ""
+	writes = map[string]string{}
+	if err := s.publishModemState(context.Background(), current, current.Status); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys[2:] {
+		if v, ok := writes[key]; !ok || v != "" {
+			t.Errorf("cleared %s = %q, present %v", key, v, ok)
+		}
+	}
+}
+
 func TestPublishModemStateRetriesFailedFields(t *testing.T) {
 	for _, field := range []string{"modem-state", "registration", "error-state", "connectivity"} {
 		t.Run(field, func(t *testing.T) {
@@ -134,6 +176,7 @@ func TestPublishModemStateRetriesFailedFields(t *testing.T) {
 				LastState: &last, connClassifier: classifier,
 				lastPubConn: connectivity.Disconnected,
 			}
+			s.operatorFieldsPublished = [4]bool{true, true, true, true}
 			s.modemEnabled.Store(true)
 			var cached func() string
 			var want string

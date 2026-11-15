@@ -23,6 +23,13 @@ location in `cell-location`. Hash updates follow the Librescoot field-change
 notification convention. Full GPS TPV snapshots are additionally published as
 JSON on `gps:tpv`.
 
+The `modem` hash exposes SIM home provider fields `sim-operator-name` and
+`sim-operator-code` from the SIM, and registered network fields
+`network-operator-name` and `network-operator-code` from the 3GPP modem.
+Codes are MCC/MNC strings. Empty values mean unavailable; network fields are
+empty unless registration is home or roaming. The legacy `operator-name` and
+`operator-code` fields retain their SIM-first, network-fallback behavior.
+
 It consumes `enable` and `disable` commands from `scooter:modem` and watches
 `vehicle.state`. It also reads these `settings` fields at startup and when they
 change: `modem.gps`, `modem.cell-location`, `cellular.sim-pin`,

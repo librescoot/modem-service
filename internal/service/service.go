@@ -52,41 +52,42 @@ const (
 )
 
 type Service struct {
-	Config                *config.Config
-	Redis                 *redisClient.Client
-	Logger                *log.Logger
-	Health                *health.Health
-	Location              *location.Service
-	Modem                 *modem.Manager
-	MMClient              *mm.Client
-	Sim                   *sim.Manager
-	simPin                atomic.Value // string; PIN configured via cellular.sim-pin setting
-	Apn                   *apn.Manager
-	apnAPN                atomic.Value // string; cellular.apn
-	apnUsername           atomic.Value // string; cellular.username
-	apnPassword           atomic.Value // string; cellular.password
-	apnAuth               atomic.Value // string; cellular.auth ("none"|"pap"|"chap")
-	SMS                   *sms.Manager
-	inbox                 *sms.Store
-	inboxMu               sync.Mutex
-	forwardMu             sync.Mutex
-	forwardDestination    atomic.Value
-	forwardActivatedAt    atomic.Int64
-	forwardDone           chan struct{}
-	smsWatchMu            sync.Mutex         // guards smsWatchCancel; startSMSWatch runs from the Run, monitor, and watchdog goroutines
-	smsWatchCancel        context.CancelFunc // cancels the active inbound-SMS watch; re-armed on modem recovery
-	smsSIMPresent         atomic.Bool
-	unreadSMS             atomic.Int64 // inbound messages since start; published as sms.unread-count
-	ownMSISDN             atomic.Value // string; own phone number for the voice-call keepalive, resolved via AT+CNUM
-	lastCSActivity        atomic.Int64 // UnixNano of last confirmed CS event (any SMS sent/received)
-	LastState             *modem.State
-	WaitingForGPSLogged   bool
-	GPSEnabledTime        time.Time
-	GPSRecoveryCount      int
-	LastGPSQualityLog     time.Time
-	gpsRecoveryMutex      sync.Mutex // serializes GPS recovery and configuration
-	gpsRecoveryInProgress bool
-	gpsRecoveryUntil      time.Time // Protected by gpsRecoveryMutex; monitor skips EnableGPS until this passes
+	Config                  *config.Config
+	Redis                   *redisClient.Client
+	Logger                  *log.Logger
+	Health                  *health.Health
+	Location                *location.Service
+	Modem                   *modem.Manager
+	MMClient                *mm.Client
+	Sim                     *sim.Manager
+	simPin                  atomic.Value // string; PIN configured via cellular.sim-pin setting
+	Apn                     *apn.Manager
+	apnAPN                  atomic.Value // string; cellular.apn
+	apnUsername             atomic.Value // string; cellular.username
+	apnPassword             atomic.Value // string; cellular.password
+	apnAuth                 atomic.Value // string; cellular.auth ("none"|"pap"|"chap")
+	SMS                     *sms.Manager
+	inbox                   *sms.Store
+	inboxMu                 sync.Mutex
+	forwardMu               sync.Mutex
+	forwardDestination      atomic.Value
+	forwardActivatedAt      atomic.Int64
+	forwardDone             chan struct{}
+	smsWatchMu              sync.Mutex         // guards smsWatchCancel; startSMSWatch runs from the Run, monitor, and watchdog goroutines
+	smsWatchCancel          context.CancelFunc // cancels the active inbound-SMS watch; re-armed on modem recovery
+	smsSIMPresent           atomic.Bool
+	unreadSMS               atomic.Int64 // inbound messages since start; published as sms.unread-count
+	ownMSISDN               atomic.Value // string; own phone number for the voice-call keepalive, resolved via AT+CNUM
+	lastCSActivity          atomic.Int64 // UnixNano of last confirmed CS event (any SMS sent/received)
+	LastState               *modem.State
+	operatorFieldsPublished [4]bool
+	WaitingForGPSLogged     bool
+	GPSEnabledTime          time.Time
+	GPSRecoveryCount        int
+	LastGPSQualityLog       time.Time
+	gpsRecoveryMutex        sync.Mutex // serializes GPS recovery and configuration
+	gpsRecoveryInProgress   bool
+	gpsRecoveryUntil        time.Time // Protected by gpsRecoveryMutex; monitor skips EnableGPS until this passes
 	// Only local link assessments may trigger recovery; remote reachability
 	// can be permanently false on a restricted APN.
 	link           *link.Assessor
@@ -1816,6 +1817,38 @@ func (s *Service) publishModemState(ctx context.Context, currentState *modem.Sta
 		}
 		modemChanges = append(modemChanges, fmt.Sprintf("apn-action=%s", currentState.ApnAction))
 		s.LastState.ApnAction = currentState.ApnAction
+	}
+
+	if !s.operatorFieldsPublished[0] || s.LastState.SIMOperatorName != currentState.SIMOperatorName {
+		if err := publishModem("sim-operator-name", currentState.SIMOperatorName); err != nil {
+			return err
+		}
+		s.LastState.SIMOperatorName = currentState.SIMOperatorName
+		s.operatorFieldsPublished[0] = true
+	}
+
+	if !s.operatorFieldsPublished[1] || s.LastState.SIMOperatorCode != currentState.SIMOperatorCode {
+		if err := publishModem("sim-operator-code", currentState.SIMOperatorCode); err != nil {
+			return err
+		}
+		s.LastState.SIMOperatorCode = currentState.SIMOperatorCode
+		s.operatorFieldsPublished[1] = true
+	}
+
+	if !s.operatorFieldsPublished[2] || s.LastState.NetworkOperatorName != currentState.NetworkOperatorName {
+		if err := publishModem("network-operator-name", currentState.NetworkOperatorName); err != nil {
+			return err
+		}
+		s.LastState.NetworkOperatorName = currentState.NetworkOperatorName
+		s.operatorFieldsPublished[2] = true
+	}
+
+	if !s.operatorFieldsPublished[3] || s.LastState.NetworkOperatorCode != currentState.NetworkOperatorCode {
+		if err := publishModem("network-operator-code", currentState.NetworkOperatorCode); err != nil {
+			return err
+		}
+		s.LastState.NetworkOperatorCode = currentState.NetworkOperatorCode
+		s.operatorFieldsPublished[3] = true
 	}
 
 	if s.LastState.OperatorName != currentState.OperatorName {

@@ -48,31 +48,35 @@ const (
 
 // State is the current modem snapshot.
 type State struct {
-	Status             string // Raw status from modem: "off", "connected", "disconnected", "no-modem", "UNKNOWN"
-	LastRawModemStatus string // Used by service layer to cache last published raw modem status
-	AccessTech         string
-	SignalQuality      uint8
-	IPAddr             string
-	IfIPAddr           string
-	Registration       string
-	IMEI               string
-	IMSI               string
-	ICCID              string
-	PowerState         string
-	SIMState           string
-	SIMLockStatus      string
-	SIMLockStatusKnown bool
-	SIMPath            dbus.ObjectPath // SIM D-Bus object path; "" if no SIM
-	SIMPinLockEnabled  bool            // sim-pin facility enabled in EnabledFacilityLocks
-	SIMPinLockKnown    bool
-	UnlockRetriesPin   uint32 // remaining sim-pin attempts; 0 means unknown/exhausted
-	OperatorName       string
-	OperatorCode       string
-	IsRoaming          bool
-	RegistrationFail   string
-	ErrorState         string
-	PinAction          string // outcome of last SIM PIN reconcile (see internal/sim)
-	ApnAction          string // outcome of last APN reconcile (see internal/apn)
+	Status              string // Raw status from modem: "off", "connected", "disconnected", "no-modem", "UNKNOWN"
+	LastRawModemStatus  string // Used by service layer to cache last published raw modem status
+	AccessTech          string
+	SignalQuality       uint8
+	IPAddr              string
+	IfIPAddr            string
+	Registration        string
+	IMEI                string
+	IMSI                string
+	ICCID               string
+	PowerState          string
+	SIMState            string
+	SIMLockStatus       string
+	SIMLockStatusKnown  bool
+	SIMPath             dbus.ObjectPath // SIM D-Bus object path; "" if no SIM
+	SIMPinLockEnabled   bool            // sim-pin facility enabled in EnabledFacilityLocks
+	SIMPinLockKnown     bool
+	UnlockRetriesPin    uint32 // remaining sim-pin attempts; 0 means unknown/exhausted
+	SIMOperatorName     string
+	SIMOperatorCode     string
+	NetworkOperatorName string
+	NetworkOperatorCode string
+	OperatorName        string
+	OperatorCode        string
+	IsRoaming           bool
+	RegistrationFail    string
+	ErrorState          string
+	PinAction           string // outcome of last SIM PIN reconcile (see internal/sim)
+	ApnAction           string // outcome of last APN reconcile (see internal/apn)
 }
 
 // Manager controls modem operations through D-Bus and hardware recovery.
@@ -199,11 +203,13 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 
 			if opVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "OperatorName"); err == nil {
 				if op, ok := opVar.Value().(string); ok {
+					state.SIMOperatorName = op
 					state.OperatorName = op
 				}
 			}
 			if opCodeVar, err := m.client.GetProperty(simPath, "org.freedesktop.ModemManager1.Sim", "OperatorIdentifier"); err == nil {
 				if opCode, ok := opCodeVar.Value().(string); ok {
+					state.SIMOperatorCode = opCode
 					state.OperatorCode = opCode
 				}
 			}
@@ -269,19 +275,25 @@ func (m *Manager) GetModemInfo(interfaceName string) (*State, error) {
 		}
 	}
 
-	if state.OperatorName == "" {
-		if opVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "OperatorName"); err == nil {
-			if op, ok := opVar.Value().(string); ok {
+	if opVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "OperatorName"); err == nil {
+		if op, ok := opVar.Value().(string); ok {
+			state.NetworkOperatorName = op
+			if state.OperatorName == "" {
 				state.OperatorName = op
 			}
 		}
 	}
-	if state.OperatorCode == "" {
-		if opVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "OperatorCode"); err == nil {
-			if op, ok := opVar.Value().(string); ok {
+	if opVar, err := m.client.GetProperty(modemPath, mm.Modem3gppInterface, "OperatorCode"); err == nil {
+		if op, ok := opVar.Value().(string); ok {
+			state.NetworkOperatorCode = op
+			if state.OperatorCode == "" {
 				state.OperatorCode = op
 			}
 		}
+	}
+	if state.Registration != RegistrationHome && state.Registration != RegistrationRoaming {
+		state.NetworkOperatorName = ""
+		state.NetworkOperatorCode = ""
 	}
 
 	if state.Status == "connected" {
