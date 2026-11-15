@@ -60,6 +60,7 @@ func TestGetModemInfoOperatorSources(t *testing.T) {
 		check(t, SIMStatePresent, RegistrationRoaming, "Lebara", "26214", "E-Plus", "26203", "Lebara", "26214")
 	})
 	run("registration loss clears network even when modem retains properties", func(t *testing.T) {
+		check(t, SIMStatePresent, RegistrationRoaming, "Lebara", "26214", "E-Plus", "26203", "Lebara", "26214")
 		modemProps.mu.Lock()
 		modemProps.values[mm.Modem3gppInterface]["RegistrationState"] = dbus.MakeVariant(mm.MMModem3gppRegistrationStateSearching)
 		modemProps.mu.Unlock()
