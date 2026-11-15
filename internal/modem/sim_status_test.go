@@ -35,7 +35,8 @@ func (simStatusObjects) GetManagedObjects() (map[dbus.ObjectPath]map[string]map[
 	}, nil
 }
 
-func TestGetModemInfoDistinguishesSecondarySIMLocks(t *testing.T) {
+func privateModemManager(t *testing.T) (*Manager, *dbus.Conn, *simStatusProperties) {
+	t.Helper()
 	daemon, err := exec.LookPath("dbus-daemon")
 	if err != nil {
 		t.Skip("dbus-daemon is required for the isolated ModemManager fixture")
@@ -87,6 +88,11 @@ func TestGetModemInfoDistinguishesSecondarySIMLocks(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	manager := &Manager{client: client, logger: log.New(io.Discard, "", 0)}
+	return manager, server, props
+}
+
+func TestGetModemInfoDistinguishesSecondarySIMLocks(t *testing.T) {
+	manager, _, props := privateModemManager(t)
 	const sim = "/org/freedesktop/ModemManager1/SIM/0"
 	tests := []struct {
 		name      string
