@@ -43,16 +43,29 @@ func TestGetModemInfoOperatorSources(t *testing.T) {
 				wantSIMState, wantRegistration, simName, simCode, networkName, networkCode, legacyName, legacyCode)
 		}
 	}
-	t.Run("roaming distinguishes SIM and network", func(t *testing.T) {
+	run := func(name string, fn func(*testing.T)) {
+		t.Run(name, func(t *testing.T) {
+			modemProps.mu.Lock()
+			modemProps.values[mm.ModemInterface]["Sim"] = dbus.MakeVariant(simPath)
+			modemProps.values[mm.Modem3gppInterface]["RegistrationState"] = dbus.MakeVariant(mm.MMModem3gppRegistrationStateRoaming)
+			modemProps.mu.Unlock()
+			simProps.mu.Lock()
+			simProps.values[mm.SimInterface]["OperatorName"] = dbus.MakeVariant("Lebara")
+			simProps.values[mm.SimInterface]["OperatorIdentifier"] = dbus.MakeVariant("26214")
+			simProps.mu.Unlock()
+			fn(t)
+		})
+	}
+	run("roaming distinguishes SIM and network", func(t *testing.T) {
 		check(t, SIMStatePresent, RegistrationRoaming, "Lebara", "26214", "E-Plus", "26203", "Lebara", "26214")
 	})
-	t.Run("registration loss clears network even when modem retains properties", func(t *testing.T) {
+	run("registration loss clears network even when modem retains properties", func(t *testing.T) {
 		modemProps.mu.Lock()
 		modemProps.values[mm.Modem3gppInterface]["RegistrationState"] = dbus.MakeVariant(mm.MMModem3gppRegistrationStateSearching)
 		modemProps.mu.Unlock()
 		check(t, SIMStatePresent, "searching", "Lebara", "26214", "", "", "Lebara", "26214")
 	})
-	t.Run("unavailable SIM properties never inherit network values", func(t *testing.T) {
+	run("unavailable SIM properties never inherit network values", func(t *testing.T) {
 		modemProps.mu.Lock()
 		modemProps.values[mm.Modem3gppInterface]["RegistrationState"] = dbus.MakeVariant(mm.MMModem3gppRegistrationStateHome)
 		modemProps.mu.Unlock()
@@ -62,20 +75,26 @@ func TestGetModemInfoOperatorSources(t *testing.T) {
 		simProps.mu.Unlock()
 		check(t, SIMStatePresent, RegistrationHome, "", "", "E-Plus", "26203", "E-Plus", "26203")
 	})
-	t.Run("legacy fallback remains independent for partial SIM data", func(t *testing.T) {
+	run("legacy fallback remains independent for partial SIM data", func(t *testing.T) {
 		simProps.mu.Lock()
-		simProps.values[mm.SimInterface]["OperatorName"] = dbus.MakeVariant("Lebara")
+		delete(simProps.values[mm.SimInterface], "OperatorIdentifier")
 		simProps.mu.Unlock()
+		modemProps.mu.Lock()
+		modemProps.values[mm.Modem3gppInterface]["RegistrationState"] = dbus.MakeVariant(mm.MMModem3gppRegistrationStateHome)
+		modemProps.mu.Unlock()
 		check(t, SIMStatePresent, RegistrationHome, "Lebara", "", "E-Plus", "26203", "Lebara", "26203")
 	})
-	t.Run("unregistered legacy fallback remains compatible", func(t *testing.T) {
+	run("unregistered legacy fallback remains compatible", func(t *testing.T) {
 		modemProps.mu.Lock()
 		modemProps.values[mm.Modem3gppInterface]["RegistrationState"] = dbus.MakeVariant(mm.MMModem3gppRegistrationStateSearching)
 		modemProps.mu.Unlock()
+		simProps.mu.Lock()
+		delete(simProps.values[mm.SimInterface], "OperatorIdentifier")
+		simProps.mu.Unlock()
 		check(t, SIMStatePresent, "searching", "Lebara", "", "", "", "Lebara", "26203")
 	})
 
-	t.Run("missing SIM never inherits network values", func(t *testing.T) {
+	run("missing SIM never inherits network values", func(t *testing.T) {
 		modemProps.mu.Lock()
 		modemProps.values[mm.ModemInterface]["Sim"] = dbus.MakeVariant(dbus.ObjectPath("/"))
 		modemProps.values[mm.Modem3gppInterface]["RegistrationState"] = dbus.MakeVariant(mm.MMModem3gppRegistrationStateHome)
