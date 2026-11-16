@@ -72,7 +72,11 @@ func clockRequest(request any) (clockResponse, error) {
 		return response, err
 	}
 	elapsed := finished.Nano() - started.Nano()
-	if elapsed < 0 || elapsed > int64(30*time.Second) || response.Quality.AgeNS < 0 || response.Quality.AgeNS > int64(30*time.Second)-elapsed {
+	maxAge := int64(30 * time.Second)
+	if response.Quality.Source == "ntp" {
+		maxAge = int64(2048 * time.Second)
+	}
+	if elapsed < 0 || elapsed > int64(30*time.Second) || response.Quality.AgeNS < 0 || response.Quality.AgeNS > maxAge-elapsed {
 		return response, fmt.Errorf("stale coordinator response")
 	}
 	response.Quality.AgeNS += elapsed
